@@ -1,0 +1,46 @@
+rules:
+  - id: dockerfile.run-as-root
+    pattern: "USER root"
+    message: "Container runs as root. Use a non-root user."
+    severity: WARNING
+    languages: [dockerfile]
+    metadata: { cwe: CWE-250, category: security, confidence: HIGH }
+
+  - id: dockerfile.latest-tag
+    pattern-regex: "FROM\\s+\\S+:latest"
+    message: "Using :latest tag is unpinned. Pin to a specific version."
+    severity: WARNING
+    languages: [dockerfile]
+    metadata: { cwe: CWE-829, category: security, confidence: MEDIUM }
+
+  - id: dockerfile.add-instead-of-copy
+    pattern: "ADD $SRC $DST"
+    message: "Use COPY instead of ADD unless extracting archives. ADD has implicit behaviors."
+    severity: INFO
+    languages: [dockerfile]
+    metadata: { cwe: CWE-829, category: security, confidence: LOW }
+
+  - id: dockerfile.curl-pipe-bash
+    pattern-regex: "RUN.*curl.*\\|.*sh"
+    message: "Piping curl to shell is insecure. Download, verify checksum, then execute."
+    severity: ERROR
+    languages: [dockerfile]
+    metadata: { cwe: CWE-829, category: security, confidence: HIGH }
+
+  - id: dockerfile.secrets-in-env
+    pattern-regex: "ENV\\s+(PASSWORD|SECRET|API_KEY|TOKEN|PRIVATE_KEY)\\s*="
+    message: "Secrets exposed in Dockerfile ENV. Use build args or secrets mount."
+    severity: ERROR
+    languages: [dockerfile]
+    metadata: { cwe: CWE-798, category: security, confidence: MEDIUM }
+
+  - id: dockerfile.no-healthcheck
+    pattern: "FROM $BASE"
+    pattern-not-inside: |
+      ...
+      HEALTHCHECK ...
+      ...
+    message: "No HEALTHCHECK defined. Add one for production readiness."
+    severity: INFO
+    languages: [dockerfile]
+    metadata: { category: security, confidence: LOW }

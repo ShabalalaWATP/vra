@@ -1,0 +1,93 @@
+rules:
+  - id: php.sqli.string-concat
+    patterns:
+      - pattern-either:
+          - pattern: mysqli_query($CONN, "..." . $VAR . "...")
+          - pattern: $PDO->query("..." . $VAR . "...")
+          - pattern: mysql_query("..." . $VAR . "...")
+    message: "SQL injection via string concatenation. Use prepared statements."
+    severity: ERROR
+    languages: [php]
+    metadata: { cwe: CWE-89, category: security, confidence: HIGH }
+
+  - id: php.command-injection.exec
+    patterns:
+      - pattern-either:
+          - pattern: exec($CMD)
+          - pattern: system($CMD)
+          - pattern: passthru($CMD)
+          - pattern: shell_exec($CMD)
+          - pattern: popen($CMD, ...)
+          - pattern: proc_open($CMD, ...)
+    message: "Command execution. Use escapeshellarg() on user input."
+    severity: ERROR
+    languages: [php]
+    metadata: { cwe: CWE-78, category: security, confidence: MEDIUM }
+
+  - id: php.xss.echo-unescaped
+    patterns:
+      - pattern-either:
+          - pattern: echo $_GET[...]
+          - pattern: echo $_POST[...]
+          - pattern: echo $_REQUEST[...]
+    message: "XSS via direct echo of user input. Use htmlspecialchars()."
+    severity: ERROR
+    languages: [php]
+    metadata: { cwe: CWE-79, category: security, confidence: HIGH }
+
+  - id: php.deserialization.unserialize
+    pattern: unserialize($INPUT)
+    message: "Deserialization of untrusted data allows RCE. Use json_decode()."
+    severity: ERROR
+    languages: [php]
+    metadata: { cwe: CWE-502, category: security, confidence: HIGH }
+
+  - id: php.file-inclusion.include
+    patterns:
+      - pattern-either:
+          - pattern: include($_GET[...])
+          - pattern: include($_POST[...])
+          - pattern: require($_GET[...])
+          - pattern: include($VAR)
+    message: "File inclusion with user input enables LFI/RFI."
+    severity: ERROR
+    languages: [php]
+    metadata: { cwe: CWE-98, category: security, confidence: MEDIUM }
+
+  - id: php.eval
+    pattern: eval($EXPR)
+    message: "eval() executes arbitrary code."
+    severity: ERROR
+    languages: [php]
+    metadata: { cwe: CWE-94, category: security, confidence: HIGH }
+
+  - id: php.path-traversal
+    patterns:
+      - pattern-either:
+          - pattern: file_get_contents($_GET[...])
+          - pattern: file_get_contents($_POST[...])
+          - pattern: fopen($_GET[...], ...)
+    message: "File operation with user-controlled path."
+    severity: ERROR
+    languages: [php]
+    metadata: { cwe: CWE-22, category: security, confidence: MEDIUM }
+
+  - id: php.ssrf
+    patterns:
+      - pattern-either:
+          - pattern: file_get_contents($_GET[...])
+          - pattern: curl_setopt($CH, CURLOPT_URL, $_GET[...])
+    message: "SSRF via user-controlled URL."
+    severity: ERROR
+    languages: [php]
+    metadata: { cwe: CWE-918, category: security, confidence: MEDIUM }
+
+  - id: php.crypto.weak-hash
+    patterns:
+      - pattern-either:
+          - pattern: md5($PASS)
+          - pattern: sha1($PASS)
+    message: "Weak hash for passwords. Use password_hash() with PASSWORD_BCRYPT."
+    severity: WARNING
+    languages: [php]
+    metadata: { cwe: CWE-328, category: security, confidence: MEDIUM }

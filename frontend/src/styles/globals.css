@@ -1,0 +1,478 @@
+/* ── Bundled Fonts (offline / air-gapped safe) ────────────────── */
+
+/* Inter — Primary sans-serif */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url("/fonts/inter/Inter-Light.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/inter/Inter-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/inter/Inter-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/inter/Inter-SemiBold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/inter/Inter-Bold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 800;
+  font-display: swap;
+  src: url("/fonts/inter/Inter-ExtraBold.woff2") format("woff2");
+}
+
+/* JetBrains Mono — Monospace for code, terminal, data */
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono/JetBrainsMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono/JetBrainsMono-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono/JetBrainsMono-Bold.woff2") format("woff2");
+}
+
+/* ── Tailwind ─────────────────────────────────────────────────── */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-bg-primary text-text-primary antialiased;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-bg-secondary;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border-light rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-text-muted;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-accent-primary text-bg-primary font-semibold px-5 py-2.5 rounded-lg
+           hover:bg-accent-primary/90 hover:shadow-lg hover:shadow-accent-primary/20
+           transition-all duration-200 ease-out
+           disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:shadow-none;
+  }
+
+  .btn-secondary {
+    @apply bg-bg-tertiary text-text-primary border border-border px-4 py-2 rounded-lg
+           hover:bg-bg-hover hover:border-border-light transition-all duration-150
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-danger {
+    @apply bg-accent-danger/10 text-accent-danger border border-accent-danger/20 px-4 py-2 rounded-lg
+           hover:bg-accent-danger/20 hover:border-accent-danger/40 transition-all duration-150;
+  }
+
+  .card {
+    @apply bg-bg-card border border-border rounded-xl p-6
+           transition-all duration-200;
+  }
+
+  .card-glow {
+    @apply bg-bg-card rounded-xl p-6
+           border border-border
+           shadow-lg shadow-black/20;
+    background: linear-gradient(135deg, rgba(26, 26, 62, 1) 0%, rgba(22, 33, 62, 0.8) 100%);
+  }
+
+  .card-glow:hover {
+    border-color: rgba(0, 212, 255, 0.15);
+    box-shadow: 0 0 30px rgba(0, 212, 255, 0.05), 0 8px 32px rgba(0, 0, 0, 0.3);
+  }
+
+  .card-interactive {
+    @apply card cursor-pointer;
+  }
+  .card-interactive:hover {
+    @apply border-border-light bg-bg-hover/30;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  }
+
+  .input {
+    @apply bg-bg-secondary border border-border rounded-lg px-3 py-2.5 text-text-primary
+           placeholder:text-text-muted focus:outline-none focus:border-accent-primary
+           focus:ring-2 focus:ring-accent-primary/20 transition-all duration-200 w-full;
+  }
+
+  .label {
+    @apply text-sm font-medium text-text-secondary mb-1.5 block;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  .badge-critical { @apply bg-accent-danger/20 text-accent-danger; }
+  .badge-high { @apply bg-orange-500/20 text-orange-400; }
+  .badge-medium { @apply bg-accent-warning/20 text-accent-warning; }
+  .badge-low { @apply bg-accent-success/20 text-accent-success; }
+  .badge-info { @apply bg-accent-primary/20 text-accent-primary; }
+
+  /* Glow ring for active/focused elements */
+  .glow-ring {
+    box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.3),
+                0 0 20px rgba(0, 212, 255, 0.1);
+  }
+
+  /* ── Terminal / Console styling ───────────────────────────── */
+  .terminal {
+    @apply bg-[#0c0c14] rounded-xl border border-[#1a1a2e] overflow-hidden;
+    box-shadow: inset 0 0 30px rgba(0, 0, 0, 0.5);
+  }
+
+  .terminal-header {
+    @apply flex items-center gap-2 px-4 py-2 bg-[#111120] border-b border-[#1a1a2e];
+  }
+
+  .terminal-dot {
+    @apply w-2.5 h-2.5 rounded-full;
+  }
+
+  .terminal-body {
+    @apply p-4 font-mono text-[12px] leading-relaxed overflow-y-auto;
+    color: #7fef7f;
+  }
+
+  .terminal-body .log-error { color: #ff4444; }
+  .terminal-body .log-warn { color: #ffbb33; }
+  .terminal-body .log-info { color: #7fef7f; }
+  .terminal-body .log-debug { color: #4a4a6a; }
+  .terminal-body .log-prefix { color: #00d4ff; opacity: 0.5; }
+
+  /* ── Animated rotating gradient border ───────────────────── */
+  .border-animated {
+    position: relative;
+    z-index: 0;
+  }
+  .border-animated::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    padding: 1px;
+    background: conic-gradient(
+      from var(--border-angle, 0deg),
+      transparent 25%,
+      rgba(0, 212, 255, 0.4) 30%,
+      rgba(100, 255, 218, 0.3) 35%,
+      transparent 40%
+    );
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+    -webkit-mask-composite: xor;
+    pointer-events: none;
+    animation: rotate-border 4s linear infinite;
+  }
+}
+
+@layer utilities {
+  /* ── Circuit-trace background ─────────────────────────────── */
+  .bg-circuit {
+    background-image:
+      /* Horizontal traces */
+      linear-gradient(90deg, transparent 0%, transparent 45%, rgba(0,212,255,0.035) 45%, rgba(0,212,255,0.035) 45.5%, transparent 45.5%, transparent 100%),
+      linear-gradient(90deg, transparent 0%, transparent 72%, rgba(0,212,255,0.025) 72%, rgba(0,212,255,0.025) 72.3%, transparent 72.3%, transparent 100%),
+      /* Vertical traces */
+      linear-gradient(0deg, transparent 0%, transparent 30%, rgba(0,212,255,0.03) 30%, rgba(0,212,255,0.03) 30.3%, transparent 30.3%, transparent 100%),
+      linear-gradient(0deg, transparent 0%, transparent 65%, rgba(0,212,255,0.02) 65%, rgba(0,212,255,0.02) 65.3%, transparent 65.3%, transparent 100%),
+      /* Grid dots at intersections */
+      radial-gradient(circle 1px at 45% 30%, rgba(0,212,255,0.08) 0%, transparent 100%),
+      radial-gradient(circle 1px at 72% 65%, rgba(0,212,255,0.06) 0%, transparent 100%),
+      radial-gradient(circle 1px at 45% 65%, rgba(0,212,255,0.07) 0%, transparent 100%),
+      /* Base grid */
+      linear-gradient(rgba(0, 212, 255, 0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 212, 255, 0.02) 1px, transparent 1px);
+    background-size:
+      100% 100%,
+      100% 100%,
+      100% 100%,
+      100% 100%,
+      100% 100%,
+      100% 100%,
+      100% 100%,
+      60px 60px,
+      60px 60px;
+  }
+
+  /* Keep simple grid as fallback */
+  .bg-grid {
+    background-image:
+      linear-gradient(rgba(0, 212, 255, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 212, 255, 0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  /* Radial glow behind hero elements */
+  .bg-radial-glow {
+    background: radial-gradient(
+      ellipse 600px 400px at 50% 0%,
+      rgba(0, 212, 255, 0.08) 0%,
+      transparent 70%
+    );
+  }
+
+  /* Animated pulse for active scan indicator */
+  .pulse-dot {
+    @apply relative;
+  }
+  .pulse-dot::before {
+    content: '';
+    @apply absolute inset-0 rounded-full;
+    animation: pulse-ring 2s ease-out infinite;
+    background: inherit;
+  }
+
+  /* Gradient text */
+  .text-gradient {
+    background: linear-gradient(135deg, #00d4ff 0%, #64ffda 50%, #00d4ff 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  /* Gradient border via pseudo-element trick */
+  .border-gradient {
+    position: relative;
+  }
+  .border-gradient::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(135deg, rgba(0, 212, 255, 0.3), rgba(100, 255, 218, 0.1), rgba(187, 134, 252, 0.2));
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+    -webkit-mask-composite: xor;
+    pointer-events: none;
+  }
+
+  /* Scanline flicker for the cyber feel */
+  .scanline {
+    position: relative;
+    overflow: hidden;
+  }
+  .scanline::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      transparent 50%,
+      rgba(0, 212, 255, 0.012) 50%
+    );
+    background-size: 100% 4px;
+    pointer-events: none;
+  }
+
+  /* Mono label — small uppercase monospace label */
+  .mono-label {
+    @apply text-[10px] uppercase tracking-[0.15em] font-mono font-medium text-text-muted;
+  }
+
+  /* Hex severity dot — small hexagonal indicator */
+  .hex-dot {
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+    @apply inline-block w-3 h-3.5 shrink-0;
+  }
+  .hex-dot-critical { @apply hex-dot bg-accent-danger; }
+  .hex-dot-high { @apply hex-dot bg-orange-400; }
+  .hex-dot-medium { @apply hex-dot bg-accent-warning; }
+  .hex-dot-low { @apply hex-dot bg-accent-success; }
+  .hex-dot-info { @apply hex-dot bg-accent-primary; }
+
+  /* Data readout styling — monospace labeled value */
+  .readout {
+    @apply font-mono tabular-nums;
+  }
+
+  /* Blinking cursor */
+  .blink-cursor::after {
+    content: '|';
+    animation: blink 1s step-end infinite;
+    @apply text-accent-primary ml-px;
+  }
+}
+
+/* ── Mermaid dark-theme overrides ──────────────────────────── */
+/* Force light text / dark fills on all mermaid elements so
+   diagrams are readable on the app's dark background.        */
+
+.mermaid-dark svg {
+  color: #e2e8f0;
+}
+
+/* Node text — flowchart, sequence, class, etc. */
+.mermaid-dark .nodeLabel,
+.mermaid-dark .label,
+.mermaid-dark .edgeLabel,
+.mermaid-dark .cluster-label,
+.mermaid-dark .labelText,
+.mermaid-dark .loopText,
+.mermaid-dark .noteText,
+.mermaid-dark .messageText,
+.mermaid-dark .actor,
+.mermaid-dark .taskText,
+.mermaid-dark .titleText,
+.mermaid-dark .sectionTitle,
+.mermaid-dark text,
+.mermaid-dark tspan {
+  fill: #e2e8f0 !important;
+  color: #e2e8f0 !important;
+}
+
+/* Node backgrounds */
+.mermaid-dark .node rect,
+.mermaid-dark .node circle,
+.mermaid-dark .node ellipse,
+.mermaid-dark .node polygon,
+.mermaid-dark .node path {
+  fill: #1e293b !important;
+  stroke: #38bdf8 !important;
+  stroke-width: 1.5px;
+}
+
+/* Special styling for nodes with class assignments (red/orange markers) */
+.mermaid-dark .node.danger rect,
+.mermaid-dark .node.danger circle,
+.mermaid-dark .node.danger polygon {
+  fill: #3b1219 !important;
+  stroke: #f87171 !important;
+}
+
+.mermaid-dark .node.warning rect,
+.mermaid-dark .node.warning circle,
+.mermaid-dark .node.warning polygon {
+  fill: #3b2a14 !important;
+  stroke: #fb923c !important;
+}
+
+/* Subgraph / cluster backgrounds */
+.mermaid-dark .cluster rect {
+  fill: rgba(15, 23, 42, 0.6) !important;
+  stroke: #475569 !important;
+  stroke-width: 1.5px;
+  stroke-dasharray: 6 3;
+  rx: 8;
+  ry: 8;
+}
+
+/* Edge lines */
+.mermaid-dark .edgePath .path,
+.mermaid-dark .flowchart-link {
+  stroke: #64748b !important;
+  stroke-width: 1.5px;
+}
+
+/* Arrowheads */
+.mermaid-dark marker path {
+  fill: #64748b !important;
+  stroke: #64748b !important;
+}
+
+/* Edge label backgrounds */
+.mermaid-dark .edgeLabel rect,
+.mermaid-dark .labelBkg {
+  fill: #0f172a !important;
+  opacity: 0.9;
+}
+
+/* Ensure span elements inside foreignObject labels also get light text */
+.mermaid-dark foreignObject div,
+.mermaid-dark foreignObject span,
+.mermaid-dark foreignObject p {
+  color: #e2e8f0 !important;
+}
+
+/* ── Keyframes ─────────────────────────────────────────────── */
+
+@keyframes pulse-ring {
+  0% { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-6px); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes rotate-border {
+  0% { --border-angle: 0deg; }
+  100% { --border-angle: 360deg; }
+}
+
+@keyframes hud-scan {
+  0% { top: 0%; }
+  50% { top: 100%; }
+  100% { top: 0%; }
+}
+
+/* Animated border needs registered property for the angle variable */
+@property --border-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}

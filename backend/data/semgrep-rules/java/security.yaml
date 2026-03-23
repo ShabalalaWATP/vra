@@ -1,0 +1,186 @@
+rules:
+  # ── SQL Injection ──────────────────────────────────────────────
+  - id: java.sqli.string-concat
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $STMT.executeQuery("..." + $VAR + "...")
+          - pattern: |
+              $STMT.execute("..." + $VAR + "...")
+          - pattern: |
+              $CONN.createStatement().executeQuery("..." + $VAR + "...")
+          - pattern: |
+              String $SQL = "..." + $VAR + "...";
+              ...
+              $STMT.executeQuery($SQL);
+    message: >
+      SQL query built with string concatenation. Use PreparedStatement
+      with parameterised queries to prevent SQL injection.
+    severity: ERROR
+    languages: [java]
+    metadata:
+      cwe: CWE-89
+      category: security
+      confidence: HIGH
+
+  # ── Deserialization ────────────────────────────────────────────
+  - id: java.deserialization.object-input-stream
+    pattern: new ObjectInputStream($INPUT).readObject()
+    message: >
+      Deserialization of untrusted data via ObjectInputStream enables
+      remote code execution. Use a safe format (JSON, Protocol Buffers)
+      or implement an ObjectInputFilter.
+    severity: ERROR
+    languages: [java]
+    metadata:
+      cwe: CWE-502
+      category: security
+      confidence: HIGH
+
+  # ── XXE ────────────────────────────────────────────────────────
+  - id: java.xxe.document-builder
+    patterns:
+      - pattern: |
+          $DBF = DocumentBuilderFactory.newInstance();
+          ...
+          $DB = $DBF.newDocumentBuilder();
+          ...
+          $DB.parse($INPUT);
+      - pattern-not-inside: |
+          $DBF.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+          ...
+    message: >
+      XML parsing without disabling DOCTYPE declarations is vulnerable to
+      XXE attacks. Set disallow-doctype-decl feature to true.
+    severity: ERROR
+    languages: [java]
+    metadata:
+      cwe: CWE-611
+      category: security
+      confidence: MEDIUM
+
+  # ── Command Injection ─────────────────────────────────────────
+  - id: java.command-injection.runtime-exec
+    patterns:
+      - pattern-either:
+          - pattern: Runtime.getRuntime().exec($CMD)
+          - pattern: new ProcessBuilder($CMD).start()
+    message: >
+      Command execution with potentially user-controlled input.
+      Validate and sanitise the command arguments.
+    severity: ERROR
+    languages: [java]
+    metadata:
+      cwe: CWE-78
+      category: security
+      confidence: MEDIUM
+
+  # ── Path Traversal ─────────────────────────────────────────────
+  - id: java.path-traversal.file-constructor
+    patterns:
+      - pattern-either:
+          - pattern: new File($DIR, request.getParameter(...))
+          - pattern: new File(request.getParameter(...))
+          - pattern: Paths.get($DIR, request.getParameter(...))
+    message: >
+      File path constructed with user input. Canonicalise and validate
+      to prevent directory traversal.
+    severity: ERROR
+    languages: [java]
+    metadata:
+      cwe: CWE-22
+      category: security
+      confidence: MEDIUM
+
+  # ── SSRF ───────────────────────────────────────────────────────
+  - id: java.ssrf.url-user-input
+    patterns:
+      - pattern-either:
+          - pattern: new URL(request.getParameter(...)).openConnection()
+          - pattern: new URL($VAR).openStream()
+    message: >
+      HTTP request to a user-controlled URL enables SSRF attacks.
+      Validate and whitelist allowed domains.
+    severity: ERROR
+    languages: [java]
+    metadata:
+      cwe: CWE-918
+      category: security
+      confidence: MEDIUM
+
+  # ── Cryptography ───────────────────────────────────────────────
+  - id: java.crypto.weak-cipher
+    patterns:
+      - pattern-either:
+          - pattern: Cipher.getInstance("DES")
+          - pattern: Cipher.getInstance("DES/...")
+          - pattern: Cipher.getInstance("DESede/ECB/...")
+          - pattern: Cipher.getInstance("AES/ECB/...")
+          - pattern: Cipher.getInstance("RC4")
+    message: >
+      Weak or insecure cipher mode. Use AES/GCM or AES/CBC with HMAC.
+      ECB mode is not semantically secure.
+    severity: ERROR
+    languages: [java]
+    metadata:
+      cwe: CWE-327
+      category: security
+      confidence: HIGH
+
+  - id: java.crypto.insecure-random
+    pattern: new java.util.Random()
+    message: >
+      java.util.Random is not cryptographically secure. Use
+      java.security.SecureRandom for security-sensitive operations.
+    severity: WARNING
+    languages: [java]
+    metadata:
+      cwe: CWE-338
+      category: security
+      confidence: MEDIUM
+
+  # ── Log Injection ──────────────────────────────────────────────
+  - id: java.log-injection.user-input
+    patterns:
+      - pattern-either:
+          - pattern: $LOG.info(request.getParameter(...))
+          - pattern: $LOG.error(request.getParameter(...))
+          - pattern: $LOG.warn(request.getParameter(...))
+          - pattern: $LOG.debug(request.getParameter(...))
+    message: >
+      Logging user input without sanitisation may allow log injection
+      or log forging. Sanitise input before logging.
+    severity: WARNING
+    languages: [java]
+    metadata:
+      cwe: CWE-117
+      category: security
+      confidence: MEDIUM
+
+  # ── Spring-specific ────────────────────────────────────────────
+  - id: java.spring.csrf-disabled
+    pattern: http.csrf().disable()
+    message: >
+      CSRF protection is disabled in Spring Security. This may be
+      intentional for APIs but dangerous for web forms.
+    severity: WARNING
+    languages: [java]
+    metadata:
+      cwe: CWE-352
+      category: security
+      confidence: HIGH
+
+  - id: java.spring.cors-allow-all
+    patterns:
+      - pattern-either:
+          - pattern: registry.addMapping("/**").allowedOrigins("*")
+          - pattern: |
+              @CrossOrigin(origins = "*")
+    message: >
+      CORS allows all origins. Restrict to specific trusted domains.
+    severity: WARNING
+    languages: [java]
+    metadata:
+      cwe: CWE-942
+      category: security
+      confidence: HIGH

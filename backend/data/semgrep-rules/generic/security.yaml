@@ -1,0 +1,80 @@
+rules:
+  # ── Secrets in code (language-agnostic) ────────────────────────
+  - id: generic.secrets.aws-access-key
+    pattern-regex: "AKIA[0-9A-Z]{16}"
+    message: >
+      AWS Access Key ID detected in source code.
+    severity: ERROR
+    languages: [generic]
+    metadata:
+      cwe: CWE-798
+      category: security
+      confidence: HIGH
+
+  - id: generic.secrets.private-key
+    pattern-regex: "-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+    message: >
+      Private key embedded in source code.
+    severity: ERROR
+    languages: [generic]
+    metadata:
+      cwe: CWE-798
+      category: security
+      confidence: HIGH
+
+  - id: generic.secrets.github-token
+    pattern-regex: "gh[pousr]_[A-Za-z0-9_]{36,}"
+    message: >
+      GitHub personal access token detected.
+    severity: ERROR
+    languages: [generic]
+    metadata:
+      cwe: CWE-798
+      category: security
+      confidence: HIGH
+
+  - id: generic.secrets.jwt-token
+    pattern-regex: "eyJ[a-zA-Z0-9_-]*\\.eyJ[a-zA-Z0-9_-]*\\.[a-zA-Z0-9_\\-]+"
+    message: >
+      JWT token detected in source code. Tokens should not be hardcoded.
+    severity: WARNING
+    languages: [generic]
+    metadata:
+      cwe: CWE-798
+      category: security
+      confidence: MEDIUM
+
+  - id: generic.secrets.connection-string
+    pattern-regex: "(postgres|mysql|mongodb|redis)://[^\\s'\"]{10,}"
+    message: >
+      Database connection string with credentials detected.
+    severity: ERROR
+    languages: [generic]
+    metadata:
+      cwe: CWE-798
+      category: security
+      confidence: MEDIUM
+
+  # ── Dangerous configurations ───────────────────────────────────
+  - id: generic.config.cors-wildcard
+    pattern-regex: "Access-Control-Allow-Origin.*\\*"
+    message: >
+      CORS allows all origins. Restrict to specific trusted domains.
+    severity: WARNING
+    languages: [generic]
+    metadata:
+      cwe: CWE-942
+      category: security
+      confidence: MEDIUM
+
+  - id: generic.config.debug-enabled
+    patterns:
+      - pattern-regex: "(?i)(debug|verbose)\\s*[=:]\\s*(true|1|yes|on)"
+    message: >
+      Debug mode appears to be enabled. Disable in production.
+    severity: WARNING
+    languages: [generic]
+    metadata:
+      cwe: CWE-489
+      category: security
+      confidence: LOW

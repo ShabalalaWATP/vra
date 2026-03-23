@@ -1,0 +1,353 @@
+rules:
+  # ── SQL Injection ──────────────────────────────────────────────
+  - id: python.sql-injection.string-format
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $CURSOR.execute($SQL % ...)
+          - pattern: |
+              $CURSOR.execute($SQL.format(...))
+          - pattern: |
+              $CURSOR.execute(f"...{$VAR}...")
+          - pattern: |
+              $DB.execute($SQL % ...)
+          - pattern: |
+              $DB.execute($SQL.format(...))
+          - pattern: |
+              $DB.execute(f"...{$VAR}...")
+    message: >
+      SQL query built using string formatting. Use parameterised queries instead
+      to prevent SQL injection.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-89
+      owasp: A03:2021
+      category: security
+      confidence: HIGH
+
+  - id: python.sql-injection.raw-query
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $MODEL.objects.raw($SQL + ...)
+          - pattern: |
+              $MODEL.objects.raw(f"...{$VAR}...")
+          - pattern: |
+              $MODEL.objects.extra(where=[$SQL + ...])
+    message: >
+      Django raw SQL query with string concatenation. Use parameterised queries.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-89
+      category: security
+      confidence: HIGH
+
+  # ── Command Injection ─────────────────────────────────────────
+  - id: python.command-injection.os-system
+    pattern: os.system($CMD)
+    message: >
+      os.system() executes a shell command. If $CMD contains user input,
+      this is a command injection vulnerability. Use subprocess with
+      shell=False instead.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-78
+      category: security
+      confidence: MEDIUM
+
+  - id: python.command-injection.subprocess-shell
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.call($CMD, shell=True, ...)
+          - pattern: subprocess.run($CMD, shell=True, ...)
+          - pattern: subprocess.Popen($CMD, shell=True, ...)
+          - pattern: subprocess.check_output($CMD, shell=True, ...)
+    message: >
+      Subprocess called with shell=True. If command contains user input,
+      this enables command injection. Use shell=False with a list argument.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      cwe: CWE-78
+      category: security
+      confidence: MEDIUM
+
+  - id: python.command-injection.eval
+    patterns:
+      - pattern-either:
+          - pattern: eval($EXPR)
+          - pattern: exec($EXPR)
+          - pattern: compile($EXPR, ...)
+    message: >
+      eval/exec/compile can execute arbitrary code. If the expression
+      contains user input, this is a code injection vulnerability.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-94
+      category: security
+      confidence: MEDIUM
+
+  # ── Deserialization ────────────────────────────────────────────
+  - id: python.deserialization.pickle-load
+    patterns:
+      - pattern-either:
+          - pattern: pickle.load(...)
+          - pattern: pickle.loads(...)
+          - pattern: cPickle.load(...)
+          - pattern: cPickle.loads(...)
+          - pattern: shelve.open(...)
+    message: >
+      Pickle deserialization of untrusted data allows arbitrary code execution.
+      Use a safe serialisation format like JSON instead.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-502
+      category: security
+      confidence: HIGH
+
+  - id: python.deserialization.yaml-load
+    pattern: yaml.load($DATA, ...)
+    pattern-not: yaml.load($DATA, Loader=yaml.SafeLoader)
+    message: >
+      yaml.load() without SafeLoader allows arbitrary code execution.
+      Use yaml.safe_load() or yaml.load(data, Loader=yaml.SafeLoader).
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-502
+      category: security
+      confidence: HIGH
+
+  # ── Path Traversal ─────────────────────────────────────────────
+  - id: python.path-traversal.open-user-input
+    patterns:
+      - pattern-either:
+          - pattern: open(request.$ATTR[...], ...)
+          - pattern: open(request.$METHOD(...), ...)
+    message: >
+      File opened with user-controlled path. Validate and sanitise the path
+      to prevent directory traversal attacks.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-22
+      category: security
+      confidence: MEDIUM
+
+  - id: python.path-traversal.send-file
+    patterns:
+      - pattern-either:
+          - pattern: send_file(request.$ATTR[...], ...)
+          - pattern: send_from_directory($DIR, request.$ATTR[...], ...)
+    message: >
+      File served based on user input. Ensure the path is validated to
+      prevent directory traversal.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-22
+      category: security
+      confidence: MEDIUM
+
+  # ── SSRF ───────────────────────────────────────────────────────
+  - id: python.ssrf.requests-user-input
+    patterns:
+      - pattern-either:
+          - pattern: requests.get(request.$ATTR[...], ...)
+          - pattern: requests.post(request.$ATTR[...], ...)
+          - pattern: requests.put(request.$ATTR[...], ...)
+          - pattern: requests.delete(request.$ATTR[...], ...)
+          - pattern: httpx.get(request.$ATTR[...], ...)
+          - pattern: urllib.request.urlopen(request.$ATTR[...], ...)
+    message: >
+      HTTP request made with user-controlled URL. This enables SSRF attacks.
+      Validate and whitelist allowed URLs.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-918
+      category: security
+      confidence: MEDIUM
+
+  # ── Cryptography ───────────────────────────────────────────────
+  - id: python.crypto.weak-hash
+    patterns:
+      - pattern-either:
+          - pattern: hashlib.md5(...)
+          - pattern: hashlib.sha1(...)
+    message: >
+      MD5 and SHA-1 are cryptographically broken. Use SHA-256 or SHA-3
+      for integrity checks, or bcrypt/argon2 for password hashing.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      cwe: CWE-328
+      category: security
+      confidence: HIGH
+
+  - id: python.crypto.hardcoded-secret
+    patterns:
+      - pattern-either:
+          - pattern: $FUNC(..., password="...", ...)
+          - pattern: $FUNC(..., secret="...", ...)
+          - pattern: $FUNC(..., api_key="...", ...)
+          - pattern: $FUNC(..., secret_key="...", ...)
+          - pattern: SECRET_KEY = "..."
+    message: >
+      Hardcoded secret or password detected. Use environment variables
+      or a secrets manager.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-798
+      category: security
+      confidence: MEDIUM
+
+  # ── XSS ────────────────────────────────────────────────────────
+  - id: python.xss.flask-markup
+    patterns:
+      - pattern-either:
+          - pattern: Markup($VAR)
+          - pattern: Markup(request.$ATTR[...])
+    message: >
+      Markup() marks content as safe for HTML rendering. If the input
+      contains user data, this disables auto-escaping and enables XSS.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-79
+      category: security
+      confidence: MEDIUM
+
+  - id: python.xss.django-safe-filter
+    pattern: "|safe"
+    message: >
+      Django |safe filter disables auto-escaping. Ensure the content does
+      not contain user-controlled data to prevent XSS.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      cwe: CWE-79
+      category: security
+      confidence: LOW
+
+  # ── Authentication ─────────────────────────────────────────────
+  - id: python.auth.flask-debug
+    patterns:
+      - pattern-either:
+          - pattern: app.run(..., debug=True, ...)
+          - pattern: app.config["DEBUG"] = True
+    message: >
+      Flask debug mode is enabled. This exposes the interactive debugger
+      which allows arbitrary code execution. Disable in production.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-489
+      category: security
+      confidence: HIGH
+
+  - id: python.auth.jwt-no-verify
+    patterns:
+      - pattern-either:
+          - pattern: jwt.decode(..., options={"verify_signature": False}, ...)
+          - pattern: jwt.decode(..., verify=False, ...)
+          - pattern: jwt.decode($TOKEN, algorithms=["none"], ...)
+    message: >
+      JWT signature verification is disabled. Tokens can be forged by attackers.
+      Always verify signatures.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-347
+      category: security
+      confidence: HIGH
+
+  # ── CSRF ───────────────────────────────────────────────────────
+  - id: python.csrf.django-exempt
+    pattern: "@csrf_exempt"
+    message: >
+      CSRF protection is disabled for this view. Ensure this is intentional
+      and that the endpoint does not modify state.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      cwe: CWE-352
+      category: security
+      confidence: HIGH
+
+  # ── Information Disclosure ─────────────────────────────────────
+  - id: python.info-disclosure.stack-trace
+    patterns:
+      - pattern-either:
+          - pattern: traceback.format_exc()
+          - pattern: traceback.print_exc()
+    message: >
+      Stack traces may leak internal paths, library versions, and code
+      structure. Don't expose in production responses.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      cwe: CWE-209
+      category: security
+      confidence: LOW
+
+  # ── XXE ────────────────────────────────────────────────────────
+  - id: python.xxe.lxml-parse
+    patterns:
+      - pattern-either:
+          - pattern: etree.parse($INPUT, ...)
+          - pattern: etree.fromstring($INPUT, ...)
+          - pattern: etree.iterparse($INPUT, ...)
+    pattern-not-inside: |
+      $PARSER = etree.XMLParser(resolve_entities=False, ...)
+      ...
+    message: >
+      XML parsing without disabling entity resolution may be vulnerable
+      to XXE attacks. Use defusedxml or set resolve_entities=False.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      cwe: CWE-611
+      category: security
+      confidence: MEDIUM
+
+  # ── Open Redirect ──────────────────────────────────────────────
+  - id: python.redirect.open-redirect
+    patterns:
+      - pattern-either:
+          - pattern: redirect(request.$ATTR[...])
+          - pattern: redirect(request.$METHOD(...))
+          - pattern: HttpResponseRedirect(request.$ATTR[...])
+    message: >
+      Redirect to a user-controlled URL enables open redirect attacks.
+      Validate the URL is relative or on an allowed domain.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      cwe: CWE-601
+      category: security
+      confidence: MEDIUM
+
+  # ── Insecure TLS ───────────────────────────────────────────────
+  - id: python.tls.verify-disabled
+    patterns:
+      - pattern-either:
+          - pattern: requests.get(..., verify=False, ...)
+          - pattern: requests.post(..., verify=False, ...)
+          - pattern: httpx.get(..., verify=False, ...)
+          - pattern: httpx.post(..., verify=False, ...)
+    message: >
+      TLS certificate verification is disabled. This enables MITM attacks.
+      Use verify=True (the default) or provide a CA bundle.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: CWE-295
+      category: security
+      confidence: HIGH

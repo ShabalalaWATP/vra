@@ -1,0 +1,178 @@
+rules:
+  # ── Express.js ─────────────────────────────────────────────────
+  - id: javascript.express.no-csrf
+    pattern: |
+      const app = express()
+      ...
+      app.post($PATH, ...)
+    pattern-not-inside: |
+      ...
+      app.use(csrf(...))
+      ...
+    message: "Express POST endpoint without CSRF protection. Use csurf or csrf middleware."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-352, category: security, confidence: LOW }
+
+  - id: javascript.express.session-insecure
+    patterns:
+      - pattern-either:
+          - pattern: session({..., cookie: {secure: false}, ...})
+          - pattern: session({..., cookie: {httpOnly: false}, ...})
+    message: "Express session cookies should use secure:true and httpOnly:true."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-614, category: security, confidence: MEDIUM }
+
+  - id: javascript.express.error-leak
+    pattern: |
+      app.use(function($ERR, $REQ, $RES, $NEXT) {
+        ...
+        $RES.send($ERR)
+        ...
+      })
+    message: "Error handler sends raw error to client. Sanitise before sending."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-209, category: security, confidence: MEDIUM }
+
+  # ── React ──────────────────────────────────────────────────────
+  - id: javascript.react.href-xss
+    pattern: <a href={$VAR}>
+    message: "Dynamic href could enable javascript: protocol XSS. Validate URL scheme."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-79, category: security, confidence: LOW }
+
+  - id: javascript.react.ref-innerhtml
+    pattern: $REF.current.innerHTML = $VAR
+    message: "Setting innerHTML via ref bypasses React's XSS protection."
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-79, category: security, confidence: MEDIUM }
+
+  # ── Node.js general ────────────────────────────────────────────
+  - id: javascript.node.path-join-user
+    patterns:
+      - pattern-either:
+          - pattern: path.join($DIR, req.params.$PARAM)
+          - pattern: path.join($DIR, req.query.$PARAM)
+          - pattern: path.join($DIR, req.body.$PARAM)
+          - pattern: path.resolve($DIR, req.params.$PARAM)
+    message: "Path built with user input. Use path.normalize() and verify result stays within allowed directory."
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-22, category: security, confidence: HIGH }
+
+  - id: javascript.node.buffer-from-user
+    patterns:
+      - pattern-either:
+          - pattern: Buffer.from(req.$ATTR, "base64")
+          - pattern: Buffer.allocUnsafe($SIZE)
+    message: "Uninitialized buffer (allocUnsafe) may leak memory. Buffer.from with user input needs validation."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-200, category: security, confidence: MEDIUM }
+
+  - id: javascript.node.env-secret-log
+    patterns:
+      - pattern-either:
+          - pattern: console.log(process.env.$SECRET)
+          - pattern: console.log(..., process.env.DATABASE_URL, ...)
+    message: "Environment variable logged to console. May leak secrets in logs."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-532, category: security, confidence: MEDIUM }
+
+  # ── MongoDB / NoSQL ────────────────────────────────────────────
+  - id: javascript.nosql-injection.mongo-query
+    patterns:
+      - pattern-either:
+          - pattern: $COLLECTION.find({$FIELD: req.body.$PARAM})
+          - pattern: $COLLECTION.findOne({$FIELD: req.query.$PARAM})
+          - pattern: $COLLECTION.updateOne({$FIELD: req.body.$PARAM}, ...)
+          - pattern: $COLLECTION.deleteOne({$FIELD: req.body.$PARAM})
+    message: "NoSQL injection: user input directly in MongoDB query. Sanitise with mongo-sanitize."
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-943, category: security, confidence: MEDIUM }
+
+  # ── JWT / Auth ─────────────────────────────────────────────────
+  - id: javascript.jwt.weak-secret
+    patterns:
+      - pattern-either:
+          - pattern: jwt.sign($PAYLOAD, "...", ...)
+          - pattern: jwt.verify($TOKEN, "...", ...)
+    message: "JWT signed/verified with hardcoded secret. Use environment variable."
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-798, category: security, confidence: MEDIUM }
+
+  - id: javascript.bcrypt.low-rounds
+    patterns:
+      - pattern-either:
+          - pattern: bcrypt.hash($PASS, 1)
+          - pattern: bcrypt.hash($PASS, 2)
+          - pattern: bcrypt.hash($PASS, 3)
+          - pattern: bcrypt.hash($PASS, 4)
+          - pattern: bcrypt.hash($PASS, 5)
+          - pattern: bcrypt.hash($PASS, 6)
+          - pattern: bcrypt.hash($PASS, 7)
+          - pattern: bcrypt.hash($PASS, 8)
+    message: "bcrypt rounds too low (<10). Use at least 10 rounds for password hashing."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-916, category: security, confidence: HIGH }
+
+  # ── File Upload ────────────────────────────────────────────────
+  - id: javascript.upload.no-validation
+    patterns:
+      - pattern-either:
+          - pattern: multer({dest: $DIR})
+          - pattern: multer({storage: $STORAGE})
+    pattern-not-inside: |
+      multer({..., fileFilter: $FILTER, ...})
+    message: "File upload without fileFilter. Validate file types to prevent malicious uploads."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-434, category: security, confidence: LOW }
+
+  # ── Helmet / Security Headers ──────────────────────────────────
+  - id: javascript.express.cors-credentials-wildcard
+    patterns:
+      - pattern-either:
+          - pattern: cors({origin: "*", credentials: true})
+          - pattern: cors({origin: true, credentials: true})
+    message: "CORS with wildcard origin AND credentials. Browsers block this but misconfig is common."
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-942, category: security, confidence: HIGH }
+
+  # ── Rate Limiting ──────────────────────────────────────────────
+  - id: javascript.express.login-no-rate-limit
+    patterns:
+      - pattern: |
+          app.post("/login", ...)
+      - pattern: |
+          app.post("/auth", ...)
+      - pattern: |
+          app.post("/signin", ...)
+      - pattern: |
+          router.post("/login", ...)
+    message: "Login endpoint without visible rate limiting. Add express-rate-limit or similar."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-307, category: security, confidence: LOW }
+
+  # ── Timing Attacks ─────────────────────────────────────────────
+  - id: javascript.timing-attack.string-compare
+    patterns:
+      - pattern-either:
+          - pattern: |
+              if ($TOKEN === $SECRET) { ... }
+          - pattern: |
+              if ($TOKEN == $SECRET) { ... }
+    message: "String comparison for secrets is vulnerable to timing attacks. Use crypto.timingSafeEqual()."
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: { cwe: CWE-208, category: security, confidence: LOW }

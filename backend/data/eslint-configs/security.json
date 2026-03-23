@@ -1,0 +1,222 @@
+{
+  "env": {
+    "browser": true,
+    "node": true,
+    "es2022": true
+  },
+  "parserOptions": {
+    "ecmaVersion": "latest",
+    "sourceType": "module",
+    "ecmaFeatures": {
+      "jsx": true
+    }
+  },
+  "rules": {
+    "no-eval": "error",
+    "no-implied-eval": "error",
+    "no-new-func": "error",
+    "no-script-url": "error",
+    "no-proto": "error",
+    "no-extend-native": "error",
+    "no-with": "error",
+    "no-octal-escape": "error",
+    "no-shadow-restricted-names": "error",
+    "no-new-wrappers": "error",
+    "no-iterator": "error",
+    "no-caller": "error",
+    "no-label-var": "error",
+    "no-self-compare": "error",
+    "no-throw-literal": "error",
+    "no-useless-escape": "warn",
+    "no-multi-str": "warn",
+    "no-return-assign": "error",
+    "no-sequences": "error",
+    "no-unused-expressions": ["warn", {"allowShortCircuit": true, "allowTernary": true}],
+    "prefer-regex-literals": "warn",
+    "no-buffer-constructor": "error",
+    "no-path-concat": "error",
+    "no-restricted-globals": [
+      "error",
+      {"name": "event", "message": "Use local event parameter instead"},
+      {"name": "fdescribe", "message": "Test-only global leaked"},
+      {"name": "fit", "message": "Test-only global leaked"},
+      {"name": "SharedArrayBuffer", "message": "SharedArrayBuffer can enable Spectre attacks — verify usage"}
+    ],
+    "no-restricted-properties": [
+      "error",
+      {"object": "document", "property": "write", "message": "document.write is an XSS risk — use DOM methods instead"},
+      {"object": "document", "property": "writeln", "message": "document.writeln is an XSS risk"},
+      {"object": "document", "property": "domain", "message": "Setting document.domain weakens same-origin policy"},
+      {"property": "__defineGetter__", "message": "Deprecated — potential prototype pollution vector"},
+      {"property": "__defineSetter__", "message": "Deprecated — potential prototype pollution vector"},
+      {"property": "__lookupGetter__", "message": "Deprecated — potential prototype pollution vector"},
+      {"property": "__lookupSetter__", "message": "Deprecated — potential prototype pollution vector"},
+      {"object": "Object", "property": "assign", "message": "Object.assign with user input can cause prototype pollution — validate source"},
+      {"object": "crypto", "property": "createCipher", "message": "crypto.createCipher is deprecated — use createCipheriv with a random IV"},
+      {"object": "crypto", "property": "createDecipher", "message": "crypto.createDecipher is deprecated — use createDecipheriv"},
+      {"object": "crypto", "property": "pseudoRandomBytes", "message": "Use crypto.randomBytes instead — pseudoRandomBytes is not cryptographically secure"},
+      {"object": "Math", "property": "random", "message": "Math.random is not cryptographically secure — use crypto.randomBytes for security-sensitive values"},
+      {"object": "process", "property": "exit", "message": "process.exit prevents graceful shutdown — throw an error or return instead"},
+      {"object": "child_process", "property": "exec", "message": "child_process.exec is vulnerable to command injection — use execFile with an args array"},
+      {"object": "child_process", "property": "execSync", "message": "child_process.execSync is vulnerable to command injection — use execFileSync"}
+    ],
+    "no-restricted-syntax": [
+      "error",
+      {
+        "selector": "AssignmentExpression[left.property.name='innerHTML']",
+        "message": "Setting innerHTML is an XSS risk — use textContent or a sanitiser"
+      },
+      {
+        "selector": "AssignmentExpression[left.property.name='outerHTML']",
+        "message": "Setting outerHTML is an XSS risk"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='insertAdjacentHTML']",
+        "message": "insertAdjacentHTML is an XSS risk — sanitise content first"
+      },
+      {
+        "selector": "JSXAttribute[name.name='dangerouslySetInnerHTML']",
+        "message": "dangerouslySetInnerHTML is an XSS risk — sanitise content first"
+      },
+      {
+        "selector": "CallExpression[callee.name='setTimeout'][arguments.0.type='Literal']",
+        "message": "setTimeout with a string argument is equivalent to eval()"
+      },
+      {
+        "selector": "CallExpression[callee.name='setInterval'][arguments.0.type='Literal']",
+        "message": "setInterval with a string argument is equivalent to eval()"
+      },
+      {
+        "selector": "CallExpression[callee.name='require'][arguments.0.type!='Literal']",
+        "message": "Dynamic require() — potential code injection if user input reaches here"
+      },
+      {
+        "selector": "ImportExpression[source.type!='Literal']",
+        "message": "Dynamic import() — potential code injection if user input reaches here"
+      },
+      {
+        "selector": "NewExpression[callee.name='RegExp'][arguments.0.type!='Literal']",
+        "message": "Dynamic RegExp — potential ReDoS if user input flows into the pattern"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='compile']",
+        "message": "RegExp.compile is deprecated and unsafe with dynamic input"
+      },
+      {
+        "selector": "MemberExpression[object.name='location'][property.name='href']",
+        "message": "Direct location.href assignment — check for open redirect if value is user-controlled"
+      },
+      {
+        "selector": "AssignmentExpression[left.object.name='location'][left.property.name='href']",
+        "message": "Setting location.href — verify no open redirect from user-controlled input"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='assign'][callee.object.name='location']",
+        "message": "location.assign — verify no open redirect from user-controlled input"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='replace'][callee.object.name='location']",
+        "message": "location.replace — verify no open redirect from user-controlled input"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='open'][callee.object.name='window']",
+        "message": "window.open — verify URL is not user-controlled (open redirect / phishing)"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='postMessage']",
+        "message": "postMessage — verify targetOrigin is specific, not '*', to prevent data leakage"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='setAttribute'][arguments.0.value='href']",
+        "message": "Setting href attribute — verify value is not a javascript: URL or user-controlled"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='setAttribute'][arguments.0.value='src']",
+        "message": "Setting src attribute — verify value is not user-controlled (injection risk)"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='setAttribute'][arguments.0.value='action']",
+        "message": "Setting form action — verify value is not user-controlled"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='setAttribute'][arguments.0.value='formaction']",
+        "message": "Setting formaction — verify value is not user-controlled"
+      },
+      {
+        "selector": "CallExpression[callee.name='fetch'][arguments.0.type!='Literal']",
+        "message": "Dynamic fetch URL — verify no user-controlled input (SSRF risk)"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='readFileSync']",
+        "message": "fs.readFileSync — verify path is not user-controlled (path traversal)"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='readFile']",
+        "message": "fs.readFile — verify path is not user-controlled (path traversal)"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='writeFileSync']",
+        "message": "fs.writeFileSync — verify path is not user-controlled (arbitrary file write)"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='writeFile']",
+        "message": "fs.writeFile — verify path is not user-controlled (arbitrary file write)"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='createReadStream']",
+        "message": "fs.createReadStream — verify path is not user-controlled"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='createWriteStream']",
+        "message": "fs.createWriteStream — verify path is not user-controlled"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='unlink']",
+        "message": "fs.unlink — verify path is not user-controlled (arbitrary file delete)"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='unlinkSync']",
+        "message": "fs.unlinkSync — verify path is not user-controlled (arbitrary file delete)"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='query'][arguments.0.type='TemplateLiteral']",
+        "message": "SQL query with template literal — use parameterised queries to prevent injection"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='query'][arguments.0.type='BinaryExpression']",
+        "message": "SQL query with string concatenation — use parameterised queries to prevent injection"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='deserialize']",
+        "message": "Deserialization — verify input is trusted (deserialization of untrusted data is dangerous)"
+      },
+      {
+        "selector": "CallExpression[callee.name='unserialize']",
+        "message": "unserialize — PHP-style deserialization of untrusted data is dangerous"
+      },
+      {
+        "selector": "NewExpression[callee.name='Function']",
+        "message": "new Function() is equivalent to eval() — avoid with user input"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='send'][callee.object.property.name='headers']",
+        "message": "Sending raw headers — verify no header injection from user-controlled values"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='setHeader'][arguments.1.type!='Literal']",
+        "message": "Dynamic HTTP header value — verify no CRLF injection from user input"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='redirect'][arguments.0.type!='Literal']",
+        "message": "Dynamic redirect — verify no open redirect from user-controlled input"
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["*.ts", "*.tsx"],
+      "parser": "@typescript-eslint/parser",
+      "rules": {}
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "source": "OSV (https://osv.dev)",
+  "license": "CC-BY-4.0",
+  "synced_at": "2026-03-21T19:57:37.677901",
+  "total_advisories": 257004,
+  "ecosystems": [
+    "npm",
+    "pypi",
+    "maven",
+    "go",
+    "crates",
+    "nuget",
+    "rubygems",
+    "packagist",
+    "pub",
+    "hex"
+  ]
+}

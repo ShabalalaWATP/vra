@@ -1,0 +1,82 @@
+rules:
+  - id: csharp.sqli.string-concat
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $CMD.CommandText = "..." + $VAR + "..."
+          - pattern: |
+              new SqlCommand("..." + $VAR + "...", ...)
+          - pattern: |
+              $DB.ExecuteSqlRaw("..." + $VAR + "...")
+    message: "SQL injection via string concatenation. Use parameterised queries."
+    severity: ERROR
+    languages: [csharp]
+    metadata: { cwe: CWE-89, category: security, confidence: HIGH }
+
+  - id: csharp.command-injection.process-start
+    patterns:
+      - pattern-either:
+          - pattern: Process.Start($CMD)
+          - pattern: new ProcessStartInfo($CMD)
+    message: "Command execution with potentially user-controlled input."
+    severity: ERROR
+    languages: [csharp]
+    metadata: { cwe: CWE-78, category: security, confidence: MEDIUM }
+
+  - id: csharp.xss.raw-html
+    patterns:
+      - pattern-either:
+          - pattern: Html.Raw($VAR)
+          - pattern: "@Html.Raw($VAR)"
+    message: "Html.Raw() bypasses Razor auto-escaping. Sanitise content."
+    severity: ERROR
+    languages: [csharp]
+    metadata: { cwe: CWE-79, category: security, confidence: MEDIUM }
+
+  - id: csharp.deserialization.binary-formatter
+    patterns:
+      - pattern-either:
+          - pattern: new BinaryFormatter().Deserialize(...)
+          - pattern: JsonConvert.DeserializeObject($INPUT, new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.All })
+    message: "Insecure deserialization allows RCE. Use System.Text.Json with safe settings."
+    severity: ERROR
+    languages: [csharp]
+    metadata: { cwe: CWE-502, category: security, confidence: HIGH }
+
+  - id: csharp.path-traversal
+    patterns:
+      - pattern-either:
+          - pattern: Path.Combine($DIR, Request.Query[...])
+          - pattern: System.IO.File.ReadAllText(Request.Query[...])
+    message: "File operation with user-controlled path."
+    severity: ERROR
+    languages: [csharp]
+    metadata: { cwe: CWE-22, category: security, confidence: MEDIUM }
+
+  - id: csharp.crypto.weak
+    patterns:
+      - pattern-either:
+          - pattern: new MD5CryptoServiceProvider()
+          - pattern: new SHA1CryptoServiceProvider()
+          - pattern: new DESCryptoServiceProvider()
+    message: "Weak cryptographic algorithm. Use SHA256 or AES."
+    severity: WARNING
+    languages: [csharp]
+    metadata: { cwe: CWE-327, category: security, confidence: HIGH }
+
+  - id: csharp.cors.allow-all
+    pattern: policy.AllowAnyOrigin()
+    message: "CORS allows all origins. Restrict to trusted domains."
+    severity: WARNING
+    languages: [csharp]
+    metadata: { cwe: CWE-942, category: security, confidence: HIGH }
+
+  - id: csharp.xxe.xml-reader
+    patterns:
+      - pattern-either:
+          - pattern: new XmlDocument().Load($INPUT)
+          - pattern: XDocument.Load($INPUT)
+    message: "XML parsing may be vulnerable to XXE. Set DtdProcessing.Prohibit."
+    severity: WARNING
+    languages: [csharp]
+    metadata: { cwe: CWE-611, category: security, confidence: MEDIUM }

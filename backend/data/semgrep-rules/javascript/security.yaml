@@ -1,0 +1,270 @@
+rules:
+  # ── XSS ────────────────────────────────────────────────────────
+  - id: javascript.xss.innerHTML
+    patterns:
+      - pattern-either:
+          - pattern: $EL.innerHTML = $VAR
+          - pattern: $EL.outerHTML = $VAR
+          - pattern: document.write($VAR)
+          - pattern: document.writeln($VAR)
+    message: >
+      Direct assignment to innerHTML/outerHTML with dynamic content
+      enables XSS. Use textContent or a sanitisation library.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-79
+      category: security
+      confidence: MEDIUM
+
+  - id: javascript.xss.react-dangerously
+    pattern: dangerouslySetInnerHTML={{__html: $VAR}}
+    message: >
+      dangerouslySetInnerHTML bypasses React's XSS protection. Ensure
+      the HTML content is sanitised (e.g., with DOMPurify).
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-79
+      category: security
+      confidence: MEDIUM
+
+  # ── SQL Injection ──────────────────────────────────────────────
+  - id: javascript.sqli.string-concat
+    patterns:
+      - pattern-either:
+          - pattern: $DB.query("..." + $VAR + "...", ...)
+          - pattern: $DB.query(`...${$VAR}...`, ...)
+          - pattern: $POOL.query("..." + $VAR + "...", ...)
+          - pattern: $POOL.query(`...${$VAR}...`, ...)
+          - pattern: $KNEX.raw("..." + $VAR + "...", ...)
+          - pattern: $KNEX.raw(`...${$VAR}...`, ...)
+    message: >
+      SQL query built with string concatenation/template literals.
+      Use parameterised queries ($1, ?) to prevent SQL injection.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-89
+      category: security
+      confidence: HIGH
+
+  # ── Command Injection ─────────────────────────────────────────
+  - id: javascript.command-injection.exec
+    patterns:
+      - pattern-either:
+          - pattern: child_process.exec($CMD, ...)
+          - pattern: child_process.execSync($CMD, ...)
+          - pattern: require("child_process").exec($CMD, ...)
+    message: >
+      child_process.exec runs commands in a shell. If the command contains
+      user input, use execFile or spawn with shell:false instead.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-78
+      category: security
+      confidence: MEDIUM
+
+  - id: javascript.command-injection.eval
+    patterns:
+      - pattern-either:
+          - pattern: eval($EXPR)
+          - pattern: new Function($EXPR)
+          - pattern: setTimeout($EXPR, ...)
+          - pattern: setInterval($EXPR, ...)
+    message: >
+      eval() and similar functions execute arbitrary code. If the expression
+      contains user input, this is a code injection vulnerability.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-94
+      category: security
+      confidence: MEDIUM
+
+  # ── Path Traversal ─────────────────────────────────────────────
+  - id: javascript.path-traversal.user-path
+    patterns:
+      - pattern-either:
+          - pattern: fs.readFile(req.$ATTR, ...)
+          - pattern: fs.readFileSync(req.$ATTR, ...)
+          - pattern: fs.createReadStream(req.$ATTR, ...)
+          - pattern: path.join($DIR, req.$ATTR)
+          - pattern: res.sendFile(req.$ATTR, ...)
+    message: >
+      File operation with user-controlled path. Validate and sanitise
+      to prevent directory traversal (../).
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-22
+      category: security
+      confidence: MEDIUM
+
+  # ── SSRF ───────────────────────────────────────────────────────
+  - id: javascript.ssrf.fetch-user-url
+    patterns:
+      - pattern-either:
+          - pattern: fetch(req.$ATTR, ...)
+          - pattern: axios.get(req.$ATTR, ...)
+          - pattern: axios.post(req.$ATTR, ...)
+          - pattern: got(req.$ATTR, ...)
+          - pattern: http.get(req.$ATTR, ...)
+    message: >
+      HTTP request with user-controlled URL enables SSRF. Validate and
+      whitelist allowed URLs/domains.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-918
+      category: security
+      confidence: MEDIUM
+
+  # ── Deserialization ────────────────────────────────────────────
+  - id: javascript.deserialization.node-serialize
+    patterns:
+      - pattern-either:
+          - pattern: serialize.unserialize(...)
+          - pattern: node_serialize.unserialize(...)
+    message: >
+      node-serialize unserialize() allows remote code execution.
+      Use JSON.parse() for deserialization.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-502
+      category: security
+      confidence: HIGH
+
+  # ── Cryptography ───────────────────────────────────────────────
+  - id: javascript.crypto.weak-random
+    patterns:
+      - pattern-either:
+          - pattern: Math.random()
+    message: >
+      Math.random() is not cryptographically secure. Use crypto.randomBytes()
+      or crypto.getRandomValues() for security-sensitive randomness.
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-338
+      category: security
+      confidence: LOW
+
+  - id: javascript.crypto.weak-hash
+    patterns:
+      - pattern-either:
+          - pattern: crypto.createHash("md5")
+          - pattern: crypto.createHash("sha1")
+    message: >
+      MD5 and SHA-1 are cryptographically broken. Use SHA-256 or SHA-3.
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-328
+      category: security
+      confidence: HIGH
+
+  # ── Authentication ─────────────────────────────────────────────
+  - id: javascript.auth.jwt-no-verify
+    patterns:
+      - pattern-either:
+          - pattern: jwt.decode($TOKEN)
+          - pattern: jwt.verify($TOKEN, ..., {algorithms: ["none"]})
+    message: >
+      JWT decoded without verification or with algorithm "none".
+      Always verify the signature with jwt.verify() and a strong algorithm.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-347
+      category: security
+      confidence: HIGH
+
+  - id: javascript.auth.helmet-missing
+    pattern: |
+      const app = express()
+      ...
+      app.listen(...)
+    pattern-not-inside: |
+      ...
+      app.use(helmet(...))
+      ...
+    message: >
+      Express app does not use Helmet middleware. Helmet sets security
+      headers (CSP, HSTS, X-Frame-Options, etc.).
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-693
+      category: security
+      confidence: LOW
+
+  # ── Prototype Pollution ────────────────────────────────────────
+  - id: javascript.prototype-pollution.merge
+    patterns:
+      - pattern-either:
+          - pattern: Object.assign($TARGET, req.$ATTR)
+          - pattern: "{ ...$TARGET, ...req.$ATTR }"
+          - pattern: $LODASH.merge($TARGET, req.$ATTR)
+          - pattern: $LODASH.defaultsDeep($TARGET, req.$ATTR)
+    message: >
+      Merging user input into an object may enable prototype pollution.
+      Validate and filter input properties.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-1321
+      category: security
+      confidence: MEDIUM
+
+  # ── Open Redirect ──────────────────────────────────────────────
+  - id: javascript.redirect.open-redirect
+    patterns:
+      - pattern-either:
+          - pattern: res.redirect(req.$ATTR)
+          - pattern: res.redirect(req.query.$PARAM)
+          - pattern: res.redirect(req.body.$PARAM)
+    message: >
+      Redirect to user-controlled URL. Validate the target is on an
+      allowed domain to prevent open redirect attacks.
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-601
+      category: security
+      confidence: MEDIUM
+
+  # ── Insecure Cookie ────────────────────────────────────────────
+  - id: javascript.cookie.insecure
+    patterns:
+      - pattern-either:
+          - pattern: res.cookie(..., {httpOnly: false, ...})
+          - pattern: res.cookie(..., {secure: false, ...})
+    message: >
+      Cookie set without httpOnly or secure flag. Session cookies should
+      use httpOnly:true, secure:true, sameSite:'strict'.
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-614
+      category: security
+      confidence: MEDIUM
+
+  # ── Regex DoS ──────────────────────────────────────────────────
+  - id: javascript.redos.user-regex
+    patterns:
+      - pattern-either:
+          - pattern: new RegExp(req.$ATTR)
+          - pattern: new RegExp(req.query.$PARAM)
+          - pattern: new RegExp(req.body.$PARAM)
+    message: >
+      Regular expression created from user input. Malicious patterns can
+      cause catastrophic backtracking (ReDoS). Use a safe regex library.
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata:
+      cwe: CWE-1333
+      category: security
+      confidence: MEDIUM

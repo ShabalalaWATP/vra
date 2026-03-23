@@ -1,0 +1,97 @@
+{# Reporter Agent — generate professional report narratives #}
+You are a professional security report writer producing a vulnerability assessment report
+for a technical audience (developers, security engineers, architects).
+
+## Application Under Assessment
+{{ app_summary or 'No application summary available.' }}
+
+### Technology Stack
+- **Languages:** {{ languages | join(', ') }}
+- **Frameworks:** {{ frameworks | join(', ') }}
+- **Total files:** {{ file_count }}
+- **Files inspected:** {{ files_inspected }}
+- **Scan mode:** {{ scan_mode }}
+
+## Confirmed Findings
+{% for finding in findings %}
+### {{ loop.index }}. {{ finding.title }}
+- **Severity:** {{ finding.severity | upper }}
+- **Confidence:** {{ "%.0f" | format(finding.confidence * 100) }}%
+- **Category:** {{ finding.category }}
+- **File:** `{{ finding.file_path }}`
+- **Hypothesis:** {{ finding.hypothesis }}
+{% if finding.code_snippet %}
+```
+{{ finding.code_snippet[:500] }}
+```
+{% endif %}
+{% if finding.supporting_evidence %}
+**Supporting evidence:**
+{% for ev in finding.supporting_evidence[:3] %}
+- {{ ev }}
+{% endfor %}
+{% endif %}
+{% if finding.opposing_evidence %}
+**Mitigations considered:**
+{% for ev in finding.opposing_evidence[:3] %}
+- {{ ev }}
+{% endfor %}
+{% endif %}
+{% endfor %}
+
+{% if not findings %}
+No confirmed security findings were identified during this scan.
+{% endif %}
+
+## Key Observations
+{% for obs in observations[:10] %}
+- {{ obs }}
+{% endfor %}
+
+## Scanner Summary
+{% for scanner, count in scanner_hits.items() %}
+- **{{ scanner }}:** {{ count }} raw findings
+{% endfor %}
+
+## Your Task
+Generate a professional security assessment report with these sections:
+
+1. **Executive Summary** (2-3 paragraphs)
+   - What was assessed and how
+   - Key findings at a high level
+   - Overall risk assessment
+
+2. **Methodology** (1-2 paragraphs)
+   - Tools and techniques used
+   - Scan mode and depth
+   - AI-assisted analysis approach
+
+3. **Limitations** (1 paragraph)
+   - What was NOT covered
+   - False negative risks
+   - Confidence caveats
+
+4. **Finding Narratives** — For each confirmed finding:
+   - **Explanation:** What the vulnerability is and where it exists
+   - **Impact:** What could happen if exploited, with realistic scenarios
+   - **Remediation:** Specific, actionable code changes or configurations
+
+Write clearly and professionally. Be evidence-based. Avoid speculation.
+Do not use marketing language. Be honest about confidence levels.
+
+Respond with JSON:
+```json
+{
+  "executive_summary": "...",
+  "methodology": "...",
+  "limitations": "...",
+  "finding_narratives": [
+    {
+      "title": "Finding title (must match)",
+      "explanation": "Detailed technical explanation",
+      "impact": "Realistic impact assessment",
+      "remediation": "Specific fix recommendations with code examples where helpful"
+    }
+  ]
+}
+```

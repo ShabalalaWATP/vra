@@ -1,0 +1,1 @@
+backend/data/advisories/npm/advisories.json filter=lfs diff=lfs merge=lfs -text

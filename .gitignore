@@ -1,0 +1,43 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+
+# ── Node ──────────────────────────────────────────────────────
+frontend/node_modules/
+
+# ── Large downloaded tools (binaries — installed via scripts on target) ──
+backend/tools/codeql/
+backend/tools/jadx/
+
+# ── Runtime / user data ───────────────────────────────────────
+backend/uploads/
+backend/exports/
+*.db
+*.sqlite3
+
+# ── Build artifacts ───────────────────────────────────────────
+# frontend/dist/ is committed so air-gapped deploy doesn't need npm
+
+# ── Environment / secrets ─────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── IDE ───────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

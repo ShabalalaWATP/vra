@@ -1,0 +1,53 @@
+rules:
+  - id: terraform.aws.s3-public-acl
+    patterns:
+      - pattern-either:
+          - pattern: acl = "public-read"
+          - pattern: acl = "public-read-write"
+    message: "S3 bucket has public ACL. Use private ACL and bucket policies."
+    severity: ERROR
+    languages: [hcl]
+    metadata: { cwe: CWE-284, category: security, confidence: HIGH }
+
+  - id: terraform.aws.security-group-open
+    pattern: |
+      cidr_blocks = ["0.0.0.0/0"]
+    message: "Security group allows traffic from all IPs. Restrict CIDR blocks."
+    severity: WARNING
+    languages: [hcl]
+    metadata: { cwe: CWE-284, category: security, confidence: MEDIUM }
+
+  - id: terraform.aws.rds-public
+    pattern: publicly_accessible = true
+    message: "RDS instance is publicly accessible. Set to false."
+    severity: ERROR
+    languages: [hcl]
+    metadata: { cwe: CWE-284, category: security, confidence: HIGH }
+
+  - id: terraform.aws.rds-no-encryption
+    pattern: storage_encrypted = false
+    message: "RDS storage not encrypted. Enable encryption."
+    severity: WARNING
+    languages: [hcl]
+    metadata: { cwe: CWE-311, category: security, confidence: HIGH }
+
+  - id: terraform.aws.cloudtrail-disabled
+    pattern: enable_logging = false
+    message: "CloudTrail logging disabled. Enable for audit trail."
+    severity: WARNING
+    languages: [hcl]
+    metadata: { cwe: CWE-778, category: security, confidence: HIGH }
+
+  - id: terraform.hardcoded-secret
+    pattern-regex: '(password|secret|api_key|access_key)\s*=\s*"[^"]{8,}"'
+    message: "Hardcoded secret in Terraform config. Use variables or secrets manager."
+    severity: ERROR
+    languages: [hcl]
+    metadata: { cwe: CWE-798, category: security, confidence: MEDIUM }
+
+  - id: terraform.aws.no-encryption-at-rest
+    pattern: encrypted = false
+    message: "Resource not encrypted at rest."
+    severity: WARNING
+    languages: [hcl]
+    metadata: { cwe: CWE-311, category: security, confidence: MEDIUM }

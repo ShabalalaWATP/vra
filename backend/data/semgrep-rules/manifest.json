@@ -1,0 +1,32 @@
+{
+  "source": "semgrep/semgrep-rules",
+  "license": "LGPL-2.1",
+  "total_rules": 1952,
+  "categories": [
+    "_extras",
+    "apex",
+    "bash",
+    "c",
+    "clojure",
+    "csharp",
+    "dockerfile",
+    "generic",
+    "go",
+    "html",
+    "java",
+    "javascript",
+    "json",
+    "kotlin",
+    "ocaml",
+    "php",
+    "python",
+    "ruby",
+    "rust",
+    "scala",
+    "solidity",
+    "swift",
+    "terraform",
+    "typescript",
+    "yaml"
+  ]
+}

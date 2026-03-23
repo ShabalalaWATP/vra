@@ -1,0 +1,50 @@
+rules:
+  - id: kotlin.sqli.string-template
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $STMT.executeQuery("...$${$VAR}...")
+          - pattern: |
+              $DB.rawQuery("...$${$VAR}...", ...)
+    message: "SQL injection via string template. Use parameterised queries."
+    severity: ERROR
+    languages: [kotlin]
+    metadata: { cwe: CWE-89, category: security, confidence: HIGH }
+
+  - id: kotlin.command-injection.runtime-exec
+    patterns:
+      - pattern-either:
+          - pattern: Runtime.getRuntime().exec($CMD)
+          - pattern: ProcessBuilder($CMD).start()
+    message: "Command execution with potentially user-controlled input."
+    severity: ERROR
+    languages: [kotlin]
+    metadata: { cwe: CWE-78, category: security, confidence: MEDIUM }
+
+  - id: kotlin.crypto.insecure-random
+    pattern: java.util.Random()
+    message: "java.util.Random is not cryptographically secure. Use SecureRandom."
+    severity: WARNING
+    languages: [kotlin]
+    metadata: { cwe: CWE-338, category: security, confidence: MEDIUM }
+
+  - id: kotlin.android.webview-js
+    pattern: $WV.settings.javaScriptEnabled = true
+    message: "WebView JavaScript enabled. Risk of XSS if loading untrusted content."
+    severity: WARNING
+    languages: [kotlin]
+    metadata: { cwe: CWE-79, category: security, confidence: MEDIUM }
+
+  - id: kotlin.android.cleartext-traffic
+    pattern: cleartextTrafficPermitted = true
+    message: "Cleartext HTTP traffic permitted. Use HTTPS."
+    severity: ERROR
+    languages: [kotlin]
+    metadata: { cwe: CWE-319, category: security, confidence: HIGH }
+
+  - id: kotlin.deserialization.object-input
+    pattern: ObjectInputStream($INPUT).readObject()
+    message: "Deserialization of untrusted data. Use safe formats."
+    severity: ERROR
+    languages: [kotlin]
+    metadata: { cwe: CWE-502, category: security, confidence: HIGH }

@@ -1,0 +1,81 @@
+rules:
+  - id: ruby.sqli.string-interpolation
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $MODEL.where("...#{$VAR}...")
+          - pattern: |
+              $MODEL.find_by_sql("...#{$VAR}...")
+          - pattern: |
+              ActiveRecord::Base.connection.execute("...#{$VAR}...")
+    message: "SQL injection via string interpolation. Use parameterised queries or sanitize_sql."
+    severity: ERROR
+    languages: [ruby]
+    metadata: { cwe: CWE-89, category: security, confidence: HIGH }
+
+  - id: ruby.command-injection.system
+    patterns:
+      - pattern-either:
+          - pattern: system($CMD)
+          - pattern: exec($CMD)
+          - pattern: "`#{$CMD}`"
+          - pattern: IO.popen($CMD)
+          - pattern: Open3.capture2($CMD)
+    message: "Command execution with potentially user-controlled input."
+    severity: ERROR
+    languages: [ruby]
+    metadata: { cwe: CWE-78, category: security, confidence: MEDIUM }
+
+  - id: ruby.xss.raw-output
+    patterns:
+      - pattern-either:
+          - pattern: raw($VAR)
+          - pattern: html_safe
+    message: "raw() or html_safe bypasses Rails auto-escaping. Ensure content is sanitised."
+    severity: WARNING
+    languages: [ruby]
+    metadata: { cwe: CWE-79, category: security, confidence: MEDIUM }
+
+  - id: ruby.deserialization.marshal
+    patterns:
+      - pattern-either:
+          - pattern: Marshal.load(...)
+          - pattern: YAML.load($INPUT)
+    message: "Deserialization of untrusted data (Marshal/YAML) allows RCE. Use YAML.safe_load."
+    severity: ERROR
+    languages: [ruby]
+    metadata: { cwe: CWE-502, category: security, confidence: HIGH }
+
+  - id: ruby.csrf.skip-verify
+    pattern: "skip_before_action :verify_authenticity_token"
+    message: "CSRF protection disabled for this controller."
+    severity: WARNING
+    languages: [ruby]
+    metadata: { cwe: CWE-352, category: security, confidence: HIGH }
+
+  - id: ruby.mass-assignment.permit-all
+    pattern: params.permit!
+    message: "Mass assignment with permit! allows all attributes. Whitelist specific params."
+    severity: ERROR
+    languages: [ruby]
+    metadata: { cwe: CWE-915, category: security, confidence: HIGH }
+
+  - id: ruby.open-redirect
+    patterns:
+      - pattern-either:
+          - pattern: redirect_to(params[$KEY])
+          - pattern: redirect_to(request.referer)
+    message: "Redirect to user-controlled URL enables open redirect."
+    severity: WARNING
+    languages: [ruby]
+    metadata: { cwe: CWE-601, category: security, confidence: MEDIUM }
+
+  - id: ruby.path-traversal.send-file
+    patterns:
+      - pattern-either:
+          - pattern: send_file(params[$KEY])
+          - pattern: File.read(params[$KEY])
+    message: "File operation with user-controlled path. Validate path."
+    severity: ERROR
+    languages: [ruby]
+    metadata: { cwe: CWE-22, category: security, confidence: MEDIUM }

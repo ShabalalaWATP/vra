@@ -1,0 +1,62 @@
+rules:
+  # TypeScript-specific patterns (extends JavaScript rules)
+  - id: typescript.any-type-cast
+    pattern: $EXPR as any
+    message: "'as any' bypasses TypeScript type safety. May mask security-relevant type errors."
+    severity: INFO
+    languages: [typescript]
+    metadata: { category: security, confidence: LOW }
+
+  - id: typescript.non-null-assertion
+    pattern: $EXPR!.$PROP
+    message: "Non-null assertion operator. If $EXPR is null, this crashes at runtime."
+    severity: INFO
+    languages: [typescript]
+    metadata: { category: security, confidence: LOW }
+
+  - id: typescript.prisma.raw-query
+    patterns:
+      - pattern-either:
+          - pattern: $PRISMA.$queryRawUnsafe($SQL)
+          - pattern: $PRISMA.$executeRawUnsafe($SQL)
+    message: "Prisma raw query without parameterisation. Use $queryRaw with template literals."
+    severity: ERROR
+    languages: [typescript]
+    metadata: { cwe: CWE-89, category: security, confidence: HIGH }
+
+  - id: typescript.nest.no-auth-guard
+    patterns:
+      - pattern: |
+          @Controller(...)
+          class $CLASS {
+            @Get(...)
+            $METHOD(...) { ... }
+          }
+      - pattern-not-inside: |
+          @UseGuards(...)
+          ...
+    message: "NestJS endpoint without auth guard. Consider adding @UseGuards(AuthGuard)."
+    severity: WARNING
+    languages: [typescript]
+    metadata: { cwe: CWE-306, category: security, confidence: LOW }
+
+  - id: typescript.express.no-rate-limit
+    pattern: |
+      const app = express();
+      ...
+      app.listen(...);
+    pattern-not-inside: |
+      ...
+      app.use(rateLimit(...));
+      ...
+    message: "Express app without rate limiting middleware. Consider express-rate-limit."
+    severity: INFO
+    languages: [typescript]
+    metadata: { cwe: CWE-770, category: security, confidence: LOW }
+
+  - id: typescript.zod.passthrough
+    pattern: $SCHEMA.passthrough()
+    message: "Zod passthrough allows unknown properties. May enable mass assignment."
+    severity: WARNING
+    languages: [typescript]
+    metadata: { cwe: CWE-915, category: security, confidence: MEDIUM }

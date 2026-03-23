@@ -1,0 +1,138 @@
+rules:
+  # ── SQL Injection ──────────────────────────────────────────────
+  - id: go.sqli.string-format
+    patterns:
+      - pattern-either:
+          - pattern: $DB.Query(fmt.Sprintf("...%s...", $VAR))
+          - pattern: $DB.Query("..." + $VAR + "...")
+          - pattern: $DB.Exec(fmt.Sprintf("...%s...", $VAR))
+          - pattern: $DB.Exec("..." + $VAR + "...")
+    message: >
+      SQL query built with string formatting. Use parameterised queries
+      ($1, ?) to prevent SQL injection.
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: CWE-89
+      category: security
+      confidence: HIGH
+
+  # ── Command Injection ─────────────────────────────────────────
+  - id: go.command-injection.exec
+    patterns:
+      - pattern-either:
+          - pattern: exec.Command("sh", "-c", $CMD)
+          - pattern: exec.Command("bash", "-c", $CMD)
+          - pattern: exec.Command("cmd", "/c", $CMD)
+    message: >
+      Command executed via shell. If the command contains user input,
+      this enables command injection. Use exec.Command with arguments.
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: CWE-78
+      category: security
+      confidence: MEDIUM
+
+  # ── Path Traversal ─────────────────────────────────────────────
+  - id: go.path-traversal.filepath-join
+    patterns:
+      - pattern-either:
+          - pattern: filepath.Join($DIR, r.URL.Query().Get(...))
+          - pattern: filepath.Join($DIR, r.FormValue(...))
+          - pattern: os.Open(r.URL.Query().Get(...))
+    message: >
+      File path constructed with user input. Use filepath.Clean()
+      and verify the result is within the intended directory.
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: CWE-22
+      category: security
+      confidence: MEDIUM
+
+  # ── SSRF ───────────────────────────────────────────────────────
+  - id: go.ssrf.http-get-user-url
+    patterns:
+      - pattern-either:
+          - pattern: http.Get(r.URL.Query().Get(...))
+          - pattern: http.Get(r.FormValue(...))
+          - pattern: $CLIENT.Get(r.URL.Query().Get(...))
+    message: >
+      HTTP request with user-controlled URL enables SSRF. Validate
+      and whitelist allowed URLs.
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: CWE-918
+      category: security
+      confidence: MEDIUM
+
+  # ── Cryptography ───────────────────────────────────────────────
+  - id: go.crypto.weak-hash
+    patterns:
+      - pattern-either:
+          - pattern: md5.New()
+          - pattern: md5.Sum(...)
+          - pattern: sha1.New()
+          - pattern: sha1.Sum(...)
+    message: >
+      MD5 and SHA-1 are cryptographically broken. Use SHA-256 or SHA-3.
+    severity: WARNING
+    languages: [go]
+    metadata:
+      cwe: CWE-328
+      category: security
+      confidence: HIGH
+
+  - id: go.crypto.insecure-random
+    pattern: math_rand.Intn(...)
+    message: >
+      math/rand is not cryptographically secure. Use crypto/rand for
+      security-sensitive randomness.
+    severity: WARNING
+    languages: [go]
+    metadata:
+      cwe: CWE-338
+      category: security
+      confidence: MEDIUM
+
+  # ── TLS ────────────────────────────────────────────────────────
+  - id: go.tls.skip-verify
+    pattern: "InsecureSkipVerify: true"
+    message: >
+      TLS certificate verification is disabled. This enables MITM attacks.
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: CWE-295
+      category: security
+      confidence: HIGH
+
+  # ── Deserialization ────────────────────────────────────────────
+  - id: go.deserialization.gob-decode
+    pattern: gob.NewDecoder($INPUT).Decode(...)
+    message: >
+      Go gob deserialization of untrusted data. Validate and type-check
+      decoded values.
+    severity: WARNING
+    languages: [go]
+    metadata:
+      cwe: CWE-502
+      category: security
+      confidence: LOW
+
+  # ── Open Redirect ──────────────────────────────────────────────
+  - id: go.redirect.open-redirect
+    patterns:
+      - pattern-either:
+          - pattern: http.Redirect($W, $R, r.URL.Query().Get(...), ...)
+          - pattern: http.Redirect($W, $R, r.FormValue(...), ...)
+    message: >
+      Redirect to user-controlled URL. Validate the destination.
+    severity: WARNING
+    languages: [go]
+    metadata:
+      cwe: CWE-601
+      category: security
+      confidence: MEDIUM
