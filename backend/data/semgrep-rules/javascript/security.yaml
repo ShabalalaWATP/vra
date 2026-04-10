@@ -18,7 +18,8 @@ rules:
       confidence: MEDIUM
 
   - id: javascript.xss.react-dangerously
-    pattern: dangerouslySetInnerHTML={{__html: $VAR}}
+    pattern: |
+      <$EL ... dangerouslySetInnerHTML={{__html: $VAR}} ... />
     message: >
       dangerouslySetInnerHTML bypasses React's XSS protection. Ensure
       the HTML content is sanitised (e.g., with DOMPurify).
@@ -171,7 +172,8 @@ rules:
     patterns:
       - pattern-either:
           - pattern: jwt.decode($TOKEN)
-          - pattern: jwt.verify($TOKEN, ..., {algorithms: ["none"]})
+          - pattern: |
+              jwt.verify($TOKEN, ..., {algorithms: ["none"]})
     message: >
       JWT decoded without verification or with algorithm "none".
       Always verify the signature with jwt.verify() and a strong algorithm.
@@ -240,8 +242,10 @@ rules:
   - id: javascript.cookie.insecure
     patterns:
       - pattern-either:
-          - pattern: res.cookie(..., {httpOnly: false, ...})
-          - pattern: res.cookie(..., {secure: false, ...})
+          - pattern: |
+              res.cookie(..., {httpOnly: false, ...})
+          - pattern: |
+              res.cookie(..., {secure: false, ...})
     message: >
       Cookie set without httpOnly or secure flag. Session cookies should
       use httpOnly:true, secure:true, sameSite:'strict'.

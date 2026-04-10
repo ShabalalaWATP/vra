@@ -1,10 +1,10 @@
 import uuid
 
 from sqlalchemy import Float, ForeignKey, String, Text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.db_types import JSONType
 
 
 class Dependency(Base):
@@ -33,8 +33,14 @@ class DependencyFinding(Base):
     details: Mapped[str | None] = mapped_column(Text)  # Full vulnerability description
     affected_range: Mapped[str | None] = mapped_column(String(200))
     fixed_version: Mapped[str | None] = mapped_column(String(100))
-    cwes: Mapped[list | None] = mapped_column(JSONB)  # ["CWE-79", "CWE-89"]
-    references: Mapped[list | None] = mapped_column(JSONB)  # [urls]
-    vulnerable_functions: Mapped[list | None] = mapped_column(JSONB)  # ["parse()", "load()"]
+    cwes: Mapped[list | None] = mapped_column(JSONType)  # ["CWE-79", "CWE-89"]
+    references: Mapped[list | None] = mapped_column(JSONType)  # [urls]
+    vulnerable_functions: Mapped[list | None] = mapped_column(JSONType)  # ["parse()", "load()"]
+    evidence_type: Mapped[str] = mapped_column(String(40), default="exact_package_match")
     relevance: Mapped[str] = mapped_column(String(20), default="unknown")
+    usage_evidence: Mapped[list | None] = mapped_column(JSONType)
+    reachability_status: Mapped[str] = mapped_column(String(30), default="unknown")
+    reachability_confidence: Mapped[float | None] = mapped_column(Float)
+    risk_score: Mapped[float | None] = mapped_column(Float)
+    risk_factors: Mapped[dict | None] = mapped_column(JSONType)
     ai_assessment: Mapped[str | None] = mapped_column(Text)

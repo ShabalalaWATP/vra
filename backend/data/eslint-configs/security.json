@@ -12,71 +12,101 @@
     }
   },
   "rules": {
-    "no-eval": "error",
-    "no-implied-eval": "error",
-    "no-new-func": "error",
-    "no-script-url": "error",
-    "no-proto": "error",
-    "no-extend-native": "error",
-    "no-with": "error",
-    "no-octal-escape": "error",
-    "no-shadow-restricted-names": "error",
-    "no-new-wrappers": "error",
-    "no-iterator": "error",
-    "no-caller": "error",
-    "no-label-var": "error",
-    "no-self-compare": "error",
-    "no-throw-literal": "error",
-    "no-useless-escape": "warn",
-    "no-multi-str": "warn",
-    "no-return-assign": "error",
-    "no-sequences": "error",
-    "no-unused-expressions": ["warn", {"allowShortCircuit": true, "allowTernary": true}],
-    "prefer-regex-literals": "warn",
+    "accessor-pairs": "warn",
+    "default-case-last": "error",
+    "dot-notation": "warn",
+    "eqeqeq": ["error", "always", {"null": "ignore"}],
+    "no-alert": "warn",
     "no-buffer-constructor": "error",
+    "no-caller": "error",
+    "no-constructor-return": "error",
+    "no-constant-binary-expression": "error",
+    "no-extend-native": "error",
+    "no-eval": "error",
+    "no-global-assign": "error",
+    "no-implied-eval": "error",
+    "no-iterator": "error",
+    "no-label-var": "error",
+    "no-loss-of-precision": "error",
+    "no-multi-str": "warn",
+    "no-new-func": "error",
+    "no-new-wrappers": "error",
+    "no-object-constructor": "warn",
+    "no-octal-escape": "error",
     "no-path-concat": "error",
+    "no-promise-executor-return": "warn",
+    "no-proto": "error",
+    "no-return-assign": "error",
+    "no-script-url": "error",
+    "no-self-assign": "error",
+    "no-self-compare": "error",
+    "no-sequences": "error",
+    "no-shadow-restricted-names": "error",
+    "no-template-curly-in-string": "warn",
+    "no-throw-literal": "error",
+    "no-unmodified-loop-condition": "warn",
+    "no-unreachable-loop": "warn",
+    "no-unsafe-finally": "error",
+    "no-unsafe-optional-chaining": "error",
+    "no-unused-expressions": ["warn", {"allowShortCircuit": true, "allowTernary": true}],
+    "no-useless-call": "warn",
+    "no-useless-concat": "warn",
+    "no-useless-escape": "warn",
+    "no-with": "error",
+    "prefer-regex-literals": "warn",
+    "radix": "error",
     "no-restricted-globals": [
       "error",
-      {"name": "event", "message": "Use local event parameter instead"},
-      {"name": "fdescribe", "message": "Test-only global leaked"},
-      {"name": "fit", "message": "Test-only global leaked"},
-      {"name": "SharedArrayBuffer", "message": "SharedArrayBuffer can enable Spectre attacks — verify usage"}
+      {"name": "event", "message": "Use a local event parameter instead"},
+      {"name": "fdescribe", "message": "Focused test global leaked into scanned code"},
+      {"name": "fit", "message": "Focused test global leaked into scanned code"},
+      {"name": "SharedArrayBuffer", "message": "SharedArrayBuffer can enable Spectre-class attacks; verify the threat model"}
     ],
     "no-restricted-properties": [
       "error",
-      {"object": "document", "property": "write", "message": "document.write is an XSS risk — use DOM methods instead"},
-      {"object": "document", "property": "writeln", "message": "document.writeln is an XSS risk"},
-      {"object": "document", "property": "domain", "message": "Setting document.domain weakens same-origin policy"},
-      {"property": "__defineGetter__", "message": "Deprecated — potential prototype pollution vector"},
-      {"property": "__defineSetter__", "message": "Deprecated — potential prototype pollution vector"},
-      {"property": "__lookupGetter__", "message": "Deprecated — potential prototype pollution vector"},
-      {"property": "__lookupSetter__", "message": "Deprecated — potential prototype pollution vector"},
-      {"object": "Object", "property": "assign", "message": "Object.assign with user input can cause prototype pollution — validate source"},
-      {"object": "crypto", "property": "createCipher", "message": "crypto.createCipher is deprecated — use createCipheriv with a random IV"},
-      {"object": "crypto", "property": "createDecipher", "message": "crypto.createDecipher is deprecated — use createDecipheriv"},
-      {"object": "crypto", "property": "pseudoRandomBytes", "message": "Use crypto.randomBytes instead — pseudoRandomBytes is not cryptographically secure"},
-      {"object": "Math", "property": "random", "message": "Math.random is not cryptographically secure — use crypto.randomBytes for security-sensitive values"},
-      {"object": "process", "property": "exit", "message": "process.exit prevents graceful shutdown — throw an error or return instead"},
-      {"object": "child_process", "property": "exec", "message": "child_process.exec is vulnerable to command injection — use execFile with an args array"},
-      {"object": "child_process", "property": "execSync", "message": "child_process.execSync is vulnerable to command injection — use execFileSync"}
+      {"object": "document", "property": "write", "message": "document.write is an XSS sink; use DOM methods or templating instead"},
+      {"object": "document", "property": "writeln", "message": "document.writeln is an XSS sink"},
+      {"object": "document", "property": "domain", "message": "Setting document.domain weakens same-origin isolation"},
+      {"property": "__defineGetter__", "message": "Deprecated metaprogramming API; review for prototype pollution or sandbox escape patterns"},
+      {"property": "__defineSetter__", "message": "Deprecated metaprogramming API; review for prototype pollution or sandbox escape patterns"},
+      {"property": "__lookupGetter__", "message": "Deprecated metaprogramming API; review for prototype pollution or sandbox escape patterns"},
+      {"property": "__lookupSetter__", "message": "Deprecated metaprogramming API; review for prototype pollution or sandbox escape patterns"},
+      {"object": "Object", "property": "assign", "message": "Object.assign with untrusted input can enable prototype pollution; validate merge sources"},
+      {"object": "Buffer", "property": "allocUnsafe", "message": "Buffer.allocUnsafe can expose stale memory; prefer Buffer.alloc"},
+      {"object": "Buffer", "property": "allocUnsafeSlow", "message": "Buffer.allocUnsafeSlow can expose stale memory; prefer Buffer.alloc"},
+      {"object": "crypto", "property": "createCipher", "message": "crypto.createCipher is deprecated and unsafe; use createCipheriv with a random IV"},
+      {"object": "crypto", "property": "createDecipher", "message": "crypto.createDecipher is deprecated and unsafe; use createDecipheriv"},
+      {"object": "crypto", "property": "pseudoRandomBytes", "message": "Use crypto.randomBytes instead; pseudoRandomBytes is not suitable for new code"},
+      {"object": "Math", "property": "random", "message": "Math.random is not cryptographically secure; do not use it for secrets or tokens"},
+      {"object": "process", "property": "exit", "message": "process.exit short-circuits cleanup and can hide security-sensitive shutdown behavior"},
+      {"object": "child_process", "property": "exec", "message": "child_process.exec is command-injection prone; prefer execFile with a fixed binary and args array"},
+      {"object": "child_process", "property": "execSync", "message": "child_process.execSync is command-injection prone; prefer execFileSync with fixed args"},
+      {"object": "vm", "property": "runInNewContext", "message": "vm.runInNewContext executes dynamic code; treat all inputs as hostile"},
+      {"object": "vm", "property": "runInThisContext", "message": "vm.runInThisContext executes dynamic code; treat all inputs as hostile"},
+      {"object": "vm", "property": "runInContext", "message": "vm.runInContext executes dynamic code; treat all inputs as hostile"},
+      {"object": "vm", "property": "compileFunction", "message": "vm.compileFunction compiles dynamic code; validate all code strings and context objects"}
     ],
     "no-restricted-syntax": [
       "error",
       {
         "selector": "AssignmentExpression[left.property.name='innerHTML']",
-        "message": "Setting innerHTML is an XSS risk — use textContent or a sanitiser"
+        "message": "Setting innerHTML is an XSS sink; prefer textContent or a sanitiser"
       },
       {
         "selector": "AssignmentExpression[left.property.name='outerHTML']",
-        "message": "Setting outerHTML is an XSS risk"
+        "message": "Setting outerHTML is an XSS sink"
+      },
+      {
+        "selector": "AssignmentExpression[left.property.name='srcdoc']",
+        "message": "Setting srcdoc injects HTML into an iframe; sanitise content first"
       },
       {
         "selector": "CallExpression[callee.property.name='insertAdjacentHTML']",
-        "message": "insertAdjacentHTML is an XSS risk — sanitise content first"
+        "message": "insertAdjacentHTML is an XSS sink; sanitise content first"
       },
       {
         "selector": "JSXAttribute[name.name='dangerouslySetInnerHTML']",
-        "message": "dangerouslySetInnerHTML is an XSS risk — sanitise content first"
+        "message": "dangerouslySetInnerHTML is an XSS sink; sanitise content first"
       },
       {
         "selector": "CallExpression[callee.name='setTimeout'][arguments.0.type='Literal']",
@@ -88,15 +118,15 @@
       },
       {
         "selector": "CallExpression[callee.name='require'][arguments.0.type!='Literal']",
-        "message": "Dynamic require() — potential code injection if user input reaches here"
+        "message": "Dynamic require() can become code injection if user input reaches the module path"
       },
       {
         "selector": "ImportExpression[source.type!='Literal']",
-        "message": "Dynamic import() — potential code injection if user input reaches here"
+        "message": "Dynamic import() can become code injection if user input reaches the module path"
       },
       {
         "selector": "NewExpression[callee.name='RegExp'][arguments.0.type!='Literal']",
-        "message": "Dynamic RegExp — potential ReDoS if user input flows into the pattern"
+        "message": "Dynamic RegExp construction can become ReDoS if untrusted input controls the pattern"
       },
       {
         "selector": "CallExpression[callee.property.name='compile']",
@@ -104,119 +134,187 @@
       },
       {
         "selector": "MemberExpression[object.name='location'][property.name='href']",
-        "message": "Direct location.href assignment — check for open redirect if value is user-controlled"
+        "message": "Direct location.href assignment should be reviewed for open redirects"
       },
       {
         "selector": "AssignmentExpression[left.object.name='location'][left.property.name='href']",
-        "message": "Setting location.href — verify no open redirect from user-controlled input"
+        "message": "Setting location.href should be reviewed for open redirects"
       },
       {
         "selector": "CallExpression[callee.property.name='assign'][callee.object.name='location']",
-        "message": "location.assign — verify no open redirect from user-controlled input"
+        "message": "location.assign should be reviewed for open redirects"
       },
       {
         "selector": "CallExpression[callee.property.name='replace'][callee.object.name='location']",
-        "message": "location.replace — verify no open redirect from user-controlled input"
+        "message": "location.replace should be reviewed for open redirects"
       },
       {
         "selector": "CallExpression[callee.property.name='open'][callee.object.name='window']",
-        "message": "window.open — verify URL is not user-controlled (open redirect / phishing)"
+        "message": "window.open should be reviewed for open redirect or phishing flows"
       },
       {
         "selector": "CallExpression[callee.property.name='postMessage']",
-        "message": "postMessage — verify targetOrigin is specific, not '*', to prevent data leakage"
+        "message": "postMessage should use a specific targetOrigin rather than '*'"
       },
       {
         "selector": "CallExpression[callee.property.name='setAttribute'][arguments.0.value='href']",
-        "message": "Setting href attribute — verify value is not a javascript: URL or user-controlled"
+        "message": "Setting href should be reviewed for javascript: URLs and user-controlled redirects"
       },
       {
         "selector": "CallExpression[callee.property.name='setAttribute'][arguments.0.value='src']",
-        "message": "Setting src attribute — verify value is not user-controlled (injection risk)"
+        "message": "Setting src should be reviewed when the value is user-controlled"
       },
       {
         "selector": "CallExpression[callee.property.name='setAttribute'][arguments.0.value='action']",
-        "message": "Setting form action — verify value is not user-controlled"
+        "message": "Setting form action should be reviewed for user-controlled redirects"
       },
       {
         "selector": "CallExpression[callee.property.name='setAttribute'][arguments.0.value='formaction']",
-        "message": "Setting formaction — verify value is not user-controlled"
+        "message": "Setting formaction should be reviewed for user-controlled redirects"
       },
       {
         "selector": "CallExpression[callee.name='fetch'][arguments.0.type!='Literal']",
-        "message": "Dynamic fetch URL — verify no user-controlled input (SSRF risk)"
+        "message": "Dynamic fetch URL should be reviewed for SSRF or credential-leak flows"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='parseFromString'][arguments.1.value='text/html']",
+        "message": "DOMParser.parseFromString(..., 'text/html') parses attacker-controlled HTML; sanitise first"
       },
       {
         "selector": "CallExpression[callee.property.name='readFileSync']",
-        "message": "fs.readFileSync — verify path is not user-controlled (path traversal)"
+        "message": "fs.readFileSync should be reviewed for path traversal when the path is user-controlled"
       },
       {
         "selector": "CallExpression[callee.property.name='readFile']",
-        "message": "fs.readFile — verify path is not user-controlled (path traversal)"
+        "message": "fs.readFile should be reviewed for path traversal when the path is user-controlled"
       },
       {
         "selector": "CallExpression[callee.property.name='writeFileSync']",
-        "message": "fs.writeFileSync — verify path is not user-controlled (arbitrary file write)"
+        "message": "fs.writeFileSync should be reviewed for arbitrary file write when the path is user-controlled"
       },
       {
         "selector": "CallExpression[callee.property.name='writeFile']",
-        "message": "fs.writeFile — verify path is not user-controlled (arbitrary file write)"
+        "message": "fs.writeFile should be reviewed for arbitrary file write when the path is user-controlled"
       },
       {
         "selector": "CallExpression[callee.property.name='createReadStream']",
-        "message": "fs.createReadStream — verify path is not user-controlled"
+        "message": "fs.createReadStream should be reviewed for path traversal when the path is user-controlled"
       },
       {
         "selector": "CallExpression[callee.property.name='createWriteStream']",
-        "message": "fs.createWriteStream — verify path is not user-controlled"
+        "message": "fs.createWriteStream should be reviewed for arbitrary file write when the path is user-controlled"
       },
       {
         "selector": "CallExpression[callee.property.name='unlink']",
-        "message": "fs.unlink — verify path is not user-controlled (arbitrary file delete)"
+        "message": "fs.unlink should be reviewed for arbitrary file delete when the path is user-controlled"
       },
       {
         "selector": "CallExpression[callee.property.name='unlinkSync']",
-        "message": "fs.unlinkSync — verify path is not user-controlled (arbitrary file delete)"
+        "message": "fs.unlinkSync should be reviewed for arbitrary file delete when the path is user-controlled"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='sendFile']",
+        "message": "res.sendFile should be reviewed for path traversal when the file path is not fixed"
+      },
+      {
+        "selector": "CallExpression[callee.property.name='download']",
+        "message": "res.download should be reviewed for path traversal when the file path is not fixed"
       },
       {
         "selector": "CallExpression[callee.property.name='query'][arguments.0.type='TemplateLiteral']",
-        "message": "SQL query with template literal — use parameterised queries to prevent injection"
+        "message": "SQL query built from a template literal should use parameter binding instead"
       },
       {
         "selector": "CallExpression[callee.property.name='query'][arguments.0.type='BinaryExpression']",
-        "message": "SQL query with string concatenation — use parameterised queries to prevent injection"
+        "message": "SQL query built from string concatenation should use parameter binding instead"
       },
       {
         "selector": "CallExpression[callee.property.name='deserialize']",
-        "message": "Deserialization — verify input is trusted (deserialization of untrusted data is dangerous)"
+        "message": "Deserialization should be reviewed for untrusted input"
       },
       {
         "selector": "CallExpression[callee.name='unserialize']",
-        "message": "unserialize — PHP-style deserialization of untrusted data is dangerous"
+        "message": "unserialize-style APIs are dangerous with untrusted input"
       },
       {
         "selector": "NewExpression[callee.name='Function']",
-        "message": "new Function() is equivalent to eval() — avoid with user input"
+        "message": "new Function() is equivalent to eval() and should not receive untrusted input"
       },
       {
         "selector": "CallExpression[callee.property.name='send'][callee.object.property.name='headers']",
-        "message": "Sending raw headers — verify no header injection from user-controlled values"
+        "message": "Sending raw headers should be reviewed for header injection"
       },
       {
         "selector": "CallExpression[callee.property.name='setHeader'][arguments.1.type!='Literal']",
-        "message": "Dynamic HTTP header value — verify no CRLF injection from user input"
+        "message": "Dynamic HTTP header values should be reviewed for CRLF injection"
       },
       {
         "selector": "CallExpression[callee.property.name='redirect'][arguments.0.type!='Literal']",
-        "message": "Dynamic redirect — verify no open redirect from user-controlled input"
+        "message": "Dynamic redirect targets should be reviewed for open redirects"
+      },
+      {
+        "selector": "CallExpression[callee.object.name='crypto'][callee.property.name='createHash'][arguments.0.value='md5']",
+        "message": "MD5 is cryptographically broken; use SHA-256 or better"
+      },
+      {
+        "selector": "CallExpression[callee.object.name='crypto'][callee.property.name='createHash'][arguments.0.value='sha1']",
+        "message": "SHA-1 is deprecated for security-sensitive hashing; use SHA-256 or better"
+      },
+      {
+        "selector": "CallExpression[callee.object.name='crypto'][callee.property.name='createHmac'][arguments.0.value='md5']",
+        "message": "HMAC-MD5 is deprecated; prefer SHA-256 or better"
+      },
+      {
+        "selector": "CallExpression[callee.object.name='crypto'][callee.property.name='createHmac'][arguments.0.value='sha1']",
+        "message": "HMAC-SHA1 is deprecated; prefer SHA-256 or better"
+      },
+      {
+        "selector": "Property[key.name='rejectUnauthorized'][value.value=false]",
+        "message": "rejectUnauthorized: false disables TLS verification and should be treated as a security finding"
+      },
+      {
+        "selector": "Property[key.name='secure'][value.value=false]",
+        "message": "secure: false weakens transport protections; verify this is not a production cookie or session setting"
+      },
+      {
+        "selector": "Property[key.name='httpOnly'][value.value=false]",
+        "message": "httpOnly: false exposes cookies to JavaScript and increases XSS impact"
       }
     ]
   },
   "overrides": [
     {
-      "files": ["*.ts", "*.tsx"],
+      "files": ["**/*.{ts,tsx}"],
       "parser": "@typescript-eslint/parser",
-      "rules": {}
+      "parserOptions": {
+        "ecmaVersion": "latest",
+        "sourceType": "module",
+        "ecmaFeatures": {
+          "jsx": true
+        }
+      },
+      "rules": {
+        "no-warning-comments": ["warn", {"terms": ["@ts-ignore", "@ts-expect-error"], "location": "anywhere"}],
+        "no-restricted-syntax": [
+          "warn",
+          {
+            "selector": "TSAsExpression[typeAnnotation.type='TSAnyKeyword']",
+            "message": "Avoid 'as any' in security-sensitive paths; it can hide unsafe input handling"
+          },
+          {
+            "selector": "TSTypeAssertion[typeAnnotation.type='TSAnyKeyword']",
+            "message": "Avoid casting to 'any' in security-sensitive paths; it can hide unsafe input handling"
+          },
+          {
+            "selector": "TSNonNullExpression",
+            "message": "Non-null assertions can bypass validation and error handling on attacker-controlled data"
+          },
+          {
+            "selector": "TSSatisfiesExpression > TSAnyKeyword",
+            "message": "Using 'satisfies any' defeats useful type checks in security-relevant code"
+          }
+        ]
+      }
     }
   ]
 }

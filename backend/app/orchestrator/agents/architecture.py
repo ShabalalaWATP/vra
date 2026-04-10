@@ -104,7 +104,7 @@ flowchart TD
     end
 
     subgraph Storage
-        DB[(fa:database PostgreSQL)]
+        DB[(fa:database SQLite)]
         Cache[(mdi:memory Redis Cache)]
     end
 

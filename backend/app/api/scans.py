@@ -8,9 +8,11 @@ from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.models.llm_profile import LLMProfile
 from app.models.project import Project
 from app.models.scan import Scan, ScanConfig
 from app.schemas.scan import ScanCreate, ScanEventOut, ScanOut
+from app.scanners.registry import create_scanner_set
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,34 @@ router = APIRouter(prefix="/scans", tags=["scans"])
 
 # Reference to the orchestrator runner — set during app startup
 _run_scan_fn = None
+
+SCANNER_ALIASES = {
+    "semgrep": "semgrep",
+    "bandit": "bandit",
+    "eslint": "eslint",
+    "codeql": "codeql",
+    "secrets": "secrets",
+    "dependencies": "dep_audit",
+    "dependency": "dep_audit",
+    "dep_audit": "dep_audit",
+}
+DEFAULT_SCANNERS = {
+    "semgrep": True,
+    "bandit": True,
+    "eslint": True,
+    "codeql": True,
+    "secrets": True,
+    "dep_audit": True,
+}
+
+PROVENANCE_FIELDS = {
+    "semgrep": "semgrep_version",
+    "bandit": "bandit_version",
+    "eslint": "eslint_version",
+    "codeql": "codeql_version",
+    "secrets": "secrets_version",
+    "dep_audit": "advisory_db_ver",
+}
 
 
 def set_scan_runner(fn):
@@ -35,11 +65,59 @@ def _scan_task_done(task: asyncio.Task, *, scan_id: uuid.UUID) -> None:
         logger.error("Scan task %s failed with unhandled exception: %s", scan_id, exc, exc_info=exc)
 
 
+def normalise_scanner_config(raw: dict | None) -> dict[str, bool]:
+    config = dict(DEFAULT_SCANNERS)
+    if not raw:
+        return config
+
+    for key, value in raw.items():
+        canonical = SCANNER_ALIASES.get(str(key).strip().lower())
+        if not canonical:
+            continue
+        config[canonical] = bool(value)
+
+    return config
+
+
+async def collect_scan_provenance(
+    scanner_config: dict[str, bool],
+    *,
+    llm_profile: LLMProfile | None = None,
+) -> dict[str, str | None]:
+    provenance = {field: None for field in PROVENANCE_FIELDS.values()}
+    provenance["llm_model"] = llm_profile.model_name if llm_profile else None
+
+    scanners = create_scanner_set()
+    version_tasks: list = []
+    version_fields: list[str] = []
+
+    for scanner_name, field_name in PROVENANCE_FIELDS.items():
+        if not scanner_config.get(scanner_name, False):
+            continue
+        scanner = scanners.get(scanner_name)
+        if scanner is None:
+            continue
+        version_fields.append(field_name)
+        version_tasks.append(scanner.get_version())
+
+    if version_tasks:
+        results = await asyncio.gather(*version_tasks, return_exceptions=True)
+        for field_name, result in zip(version_fields, results):
+            provenance[field_name] = None if isinstance(result, Exception) else result
+
+    return provenance
+
+
 @router.post("", response_model=ScanOut, status_code=201)
 async def create_scan(body: ScanCreate, db: AsyncSession = Depends(get_db)):
     project = await db.get(Project, body.project_id)
     if not project:
         raise HTTPException(404, "Project not found")
+    llm_profile = None
+    if body.llm_profile_id:
+        llm_profile = await db.get(LLMProfile, body.llm_profile_id)
+        if not llm_profile:
+            raise HTTPException(404, "LLM profile not found")
 
     scan = Scan(
         project_id=body.project_id,
@@ -51,16 +129,18 @@ async def create_scan(body: ScanCreate, db: AsyncSession = Depends(get_db)):
     await db.flush()
 
     # Create config snapshot
-    scanners = body.scanners or {
-        "semgrep": True,
-        "bandit": True,
-        "eslint": True,
-        "secrets": True,
-        "dependencies": True,
-    }
+    scanners = normalise_scanner_config(body.scanners)
+    provenance = await collect_scan_provenance(scanners, llm_profile=llm_profile)
     config = ScanConfig(
         scan_id=scan.id,
         scanners=scanners,
+        semgrep_version=provenance.get("semgrep_version"),
+        bandit_version=provenance.get("bandit_version"),
+        eslint_version=provenance.get("eslint_version"),
+        codeql_version=provenance.get("codeql_version"),
+        secrets_version=provenance.get("secrets_version"),
+        advisory_db_ver=provenance.get("advisory_db_ver"),
+        llm_model=provenance.get("llm_model"),
         scan_mode=body.mode,
     )
     db.add(config)

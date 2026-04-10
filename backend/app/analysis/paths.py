@@ -7,10 +7,20 @@ Conversion to OS-native paths happens only at I/O boundaries.
 import os
 import platform
 import re
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 
 PLATFORM = platform.system().lower()  # 'windows', 'linux', 'darwin'
+IGNORE_FILE_NAME = ".vragentignore"
+DEFAULT_SKIP_DIRS = {
+    "node_modules", ".git", "__pycache__", ".venv", "venv",
+    "dist", "build", ".next", "target", "vendor", ".tox",
+    ".mypy_cache", ".pytest_cache", ".gradle", ".idea",
+    ".vscode", "coverage", ".terraform", ".serverless",
+    "bower_components", ".nuxt", ".svelte-kit", "out",
+    ".angular", ".parcel-cache", ".turbo",
+}
 
 
 def normalise_path(path: str) -> str:
@@ -87,15 +97,119 @@ def is_binary_extension(path: str) -> bool:
 
 def should_skip_dir(dir_name: str) -> bool:
     """Check if a directory should be skipped during scanning."""
-    SKIP_DIRS = {
-        "node_modules", ".git", "__pycache__", ".venv", "venv",
-        "dist", "build", ".next", "target", "vendor", ".tox",
-        ".mypy_cache", ".pytest_cache", ".gradle", ".idea",
-        ".vscode", "coverage", ".terraform", ".serverless",
-        "bower_components", ".nuxt", ".svelte-kit", "out",
-        ".angular", ".parcel-cache", ".turbo",
-    }
-    return dir_name in SKIP_DIRS
+    return dir_name in DEFAULT_SKIP_DIRS
+
+
+@dataclass
+class RepoPathPolicy:
+    """Repo-specific path exclusions including managed assets and .vragentignore."""
+
+    managed_prefixes: list[str] = field(default_factory=list)
+    ignored_prefixes: list[str] = field(default_factory=list)
+    ignored_globs: list[str] = field(default_factory=list)
+    ignore_file: str | None = None
+
+    @property
+    def ignored_paths(self) -> list[str]:
+        return [*self.managed_prefixes, *self.ignored_prefixes, *self.ignored_globs]
+
+
+def _has_glob(pattern: str) -> bool:
+    return any(ch in pattern for ch in "*?[]")
+
+
+def _normalise_ignore_pattern(pattern: str) -> str:
+    return normalise_path(pattern.strip())
+
+
+def _prefix_matches(rel_path: str, prefix: str) -> bool:
+    clean = prefix.rstrip("/")
+    return rel_path == clean or rel_path.startswith(f"{clean}/")
+
+
+def _pattern_matches(rel_path: str, pattern: str) -> bool:
+    if _has_glob(pattern):
+        return match_glob(rel_path, pattern) or match_glob(rel_path, f"**/{pattern}")
+    return _prefix_matches(rel_path, pattern)
+
+
+def load_repo_path_policy(repo_root: Path) -> RepoPathPolicy:
+    """Load repo-local ignore rules and VRAgent-managed path exclusions."""
+    repo_root = repo_root.resolve()
+    policy = RepoPathPolicy()
+
+    ignore_file = repo_root / IGNORE_FILE_NAME
+    if ignore_file.exists():
+        policy.ignore_file = str(ignore_file)
+        try:
+            for raw_line in ignore_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pattern = _normalise_ignore_pattern(line)
+                if not pattern:
+                    continue
+                if _has_glob(pattern):
+                    policy.ignored_globs.append(pattern)
+                else:
+                    policy.ignored_prefixes.append(pattern.rstrip("/"))
+        except OSError:
+            pass
+
+    try:
+        from app.config import settings
+
+        managed_candidates = [
+            settings.data_dir,
+            settings.upload_dir,
+            settings.export_dir,
+            settings.data_dir.parent / "tools",
+        ]
+        for candidate in managed_candidates:
+            try:
+                rel = candidate.resolve().relative_to(repo_root)
+            except (ValueError, OSError):
+                continue
+            policy.managed_prefixes.append(normalise_path(str(rel)))
+    except Exception:
+        pass
+
+    policy.managed_prefixes = sorted(set(p for p in policy.managed_prefixes if p))
+    policy.ignored_prefixes = sorted(set(p for p in policy.ignored_prefixes if p))
+    policy.ignored_globs = sorted(set(p for p in policy.ignored_globs if p))
+    return policy
+
+
+def should_skip_repo_path(
+    path: Path,
+    repo_root: Path,
+    *,
+    policy: RepoPathPolicy | None = None,
+) -> bool:
+    """Check whether a path should be excluded from scanning for this repo."""
+    try:
+        rel = path.relative_to(repo_root)
+    except ValueError:
+        return False
+
+    if any(should_skip_dir(part) for part in rel.parts):
+        return True
+
+    rel_path = normalise_path(str(rel))
+    if rel_path == IGNORE_FILE_NAME:
+        return True
+    active_policy = policy or load_repo_path_policy(repo_root)
+
+    for prefix in active_policy.managed_prefixes:
+        if _prefix_matches(rel_path, prefix):
+            return True
+    for prefix in active_policy.ignored_prefixes:
+        if _prefix_matches(rel_path, prefix):
+            return True
+    for pattern in active_policy.ignored_globs:
+        if _pattern_matches(rel_path, pattern):
+            return True
+    return False
 
 
 def scanner_command(binary: str) -> str:
@@ -148,12 +262,13 @@ def collect_source_files(
     and size limits. Returns OS-native Path objects.
     """
     files = []
+    policy = load_repo_path_policy(repo_path)
     for path in repo_path.rglob("*"):
         if len(files) >= max_files:
             break
         if not path.is_file():
             continue
-        if any(should_skip_dir(part) for part in path.relative_to(repo_path).parts):
+        if should_skip_repo_path(path, repo_path, policy=policy):
             continue
         if is_binary_extension(str(path)):
             continue

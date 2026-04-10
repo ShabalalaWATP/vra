@@ -4,6 +4,8 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from app.analysis.paths import DEFAULT_SKIP_DIRS, load_repo_path_policy, normalise_path, should_skip_repo_path
+
 LANGUAGE_EXTENSIONS = {
     ".py": "python",
     ".js": "javascript",
@@ -85,14 +87,14 @@ FRAMEWORK_INDICATORS = {
     # Mobile
     "AndroidManifest.xml": {"android"},
     "Info.plist": {"ios"},
-    "pubspec.yaml": {"flutter"},
+    "pubspec.yaml": {"flutter", "dart"},
+    "pubspec.lock": {"flutter", "dart"},
+    # Elixir / BEAM
+    "mix.exs": {"elixir"},
+    "mix.lock": {"elixir"},
 }
 
-SKIP_DIRS = {
-    "node_modules", ".git", "__pycache__", ".venv", "venv", "dist",
-    "build", ".next", "target", "vendor", ".tox", ".mypy_cache",
-    ".pytest_cache", ".gradle", ".idea", ".vscode", "coverage",
-}
+SKIP_DIRS = DEFAULT_SKIP_DIRS
 
 
 def fingerprint_repo(repo_path: Path) -> dict:
@@ -102,9 +104,13 @@ def fingerprint_repo(repo_path: Path) -> dict:
     file_count = 0
     total_size = 0
     manifests_found = []
+    ignored_file_count = 0
+    policy = load_repo_path_policy(repo_path)
 
     for path in repo_path.rglob("*"):
-        if any(skip in path.parts for skip in SKIP_DIRS):
+        if should_skip_repo_path(path, repo_path, policy=policy):
+            if path.is_file():
+                ignored_file_count += 1
             continue
 
         if path.is_file():
@@ -200,6 +206,10 @@ def fingerprint_repo(repo_path: Path) -> dict:
         "is_monorepo": is_monorepo,
         "workspaces": workspaces,
         "size_warnings": size_warnings,
+        "repo_ignore_file": policy.ignore_file,
+        "ignored_paths": policy.ignored_paths,
+        "managed_paths_ignored": policy.managed_prefixes,
+        "ignored_file_count": ignored_file_count,
     }
 
 
@@ -214,6 +224,10 @@ def detect_workspaces(repo_path: Path) -> list[dict]:
     - apps/ and packages/ directory conventions
     """
     workspaces: list[dict] = []
+    policy = load_repo_path_policy(repo_path)
+
+    def rel(path: Path) -> str:
+        return normalise_path(str(path.relative_to(repo_path)))
 
     # ── npm/yarn/pnpm workspace detection ─────────────────────────
     root_pkg = repo_path / "package.json"
@@ -233,14 +247,14 @@ def detect_workspaces(repo_path: Path) -> list[dict]:
                                 sub_pkg = json.loads((match / "package.json").read_text())
                                 workspaces.append({
                                     "name": sub_pkg.get("name", match.name),
-                                    "path": str(match.relative_to(repo_path)),
+                                    "path": rel(match),
                                     "type": "npm_workspace",
                                     "manifest": "package.json",
                                 })
                             except Exception:
                                 workspaces.append({
                                     "name": match.name,
-                                    "path": str(match.relative_to(repo_path)),
+                                    "path": rel(match),
                                     "type": "npm_workspace",
                                     "manifest": "package.json",
                                 })
@@ -261,7 +275,7 @@ def detect_workspaces(repo_path: Path) -> list[dict]:
                     if match.is_dir() and (match / "package.json").exists():
                         workspaces.append({
                             "name": match.name,
-                            "path": str(match.relative_to(repo_path)),
+                            "path": rel(match),
                             "type": "pnpm_workspace",
                             "manifest": "package.json",
                         })
@@ -278,7 +292,7 @@ def detect_workspaces(repo_path: Path) -> list[dict]:
                     if match.is_dir() and (match / "package.json").exists():
                         workspaces.append({
                             "name": match.name,
-                            "path": str(match.relative_to(repo_path)),
+                            "path": rel(match),
                             "type": "lerna_package",
                             "manifest": "package.json",
                         })
@@ -295,14 +309,24 @@ def detect_workspaces(repo_path: Path) -> list[dict]:
                         continue
                     # Check for any manifest file
                     manifest = None
-                    for mf in ("package.json", "pyproject.toml", "setup.py", "go.mod", "Cargo.toml", "pom.xml", "build.gradle"):
+                    for mf in (
+                        "package.json",
+                        "pyproject.toml",
+                        "setup.py",
+                        "go.mod",
+                        "Cargo.toml",
+                        "pom.xml",
+                        "build.gradle",
+                        "pubspec.yaml",
+                        "mix.exs",
+                    ):
                         if (sub / mf).exists():
                             manifest = mf
                             break
                     if manifest:
                         workspaces.append({
                             "name": sub.name,
-                            "path": str(sub.relative_to(repo_path)),
+                            "path": rel(sub),
                             "type": f"{convention_dir}_convention",
                             "manifest": manifest,
                         })
@@ -315,12 +339,12 @@ def detect_workspaces(repo_path: Path) -> list[dict]:
         pyprojects = [
             p for p in pyprojects
             if p.parent != repo_path
-            and not any(skip in p.parts for skip in SKIP_DIRS)
+            and not should_skip_repo_path(p, repo_path, policy=policy)
         ]
         for pp in pyprojects[:20]:
             workspaces.append({
                 "name": pp.parent.name,
-                "path": str(pp.parent.relative_to(repo_path)),
+                "path": rel(pp.parent),
                 "type": "python_subproject",
                 "manifest": "pyproject.toml",
             })
@@ -331,12 +355,12 @@ def detect_workspaces(repo_path: Path) -> list[dict]:
         go_mods = [
             g for g in go_mods
             if g.parent != repo_path
-            and not any(skip in g.parts for skip in SKIP_DIRS)
+            and not should_skip_repo_path(g, repo_path, policy=policy)
         ]
         for gm in go_mods[:20]:
             workspaces.append({
                 "name": gm.parent.name,
-                "path": str(gm.parent.relative_to(repo_path)),
+                "path": rel(gm.parent),
                 "type": "go_module",
                 "manifest": "go.mod",
             })

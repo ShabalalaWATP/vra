@@ -1,12 +1,13 @@
-import { Component, type ReactNode } from "react";
+import { Component, Suspense, lazy, type ReactNode } from "react";
 import { Routes, Route, Link } from "react-router-dom";
 import AppShell from "./components/layout/AppShell";
 import HomePage from "./pages/HomePage";
-import NewScanPage from "./pages/NewScanPage";
-import ScanProgressPage from "./pages/ScanProgressPage";
-import ReportPage from "./pages/ReportPage";
-import HistoryPage from "./pages/HistoryPage";
-import SettingsPage from "./pages/SettingsPage";
+
+const NewScanPage = lazy(() => import("./pages/NewScanPage"));
+const ScanProgressPage = lazy(() => import("./pages/ScanProgressPage"));
+const ReportPage = lazy(() => import("./pages/ReportPage"));
+const HistoryPage = lazy(() => import("./pages/HistoryPage"));
+const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null };
@@ -44,19 +45,32 @@ function NotFoundPage() {
   );
 }
 
+function RouteFallback() {
+  return (
+    <div className="flex items-center justify-center h-[60vh]">
+      <div className="flex items-center gap-3 text-text-secondary">
+        <div className="w-5 h-5 border-2 border-accent-primary border-t-transparent rounded-full animate-spin" />
+        <span className="text-sm uppercase tracking-[0.2em]">Loading view</span>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   return (
     <AppShell>
       <ErrorBoundary>
-        <Routes>
-          <Route path="/" element={<HomePage />} />
-          <Route path="/scan/new" element={<NewScanPage />} />
-          <Route path="/scan/:scanId/progress" element={<ScanProgressPage />} />
-          <Route path="/scan/:scanId/report" element={<ReportPage />} />
-          <Route path="/history" element={<HistoryPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<NotFoundPage />} />
-        </Routes>
+        <Suspense fallback={<RouteFallback />}>
+          <Routes>
+            <Route path="/" element={<HomePage />} />
+            <Route path="/scan/new" element={<NewScanPage />} />
+            <Route path="/scan/:scanId/progress" element={<ScanProgressPage />} />
+            <Route path="/scan/:scanId/report" element={<ReportPage />} />
+            <Route path="/history" element={<HistoryPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="*" element={<NotFoundPage />} />
+          </Routes>
+        </Suspense>
       </ErrorBoundary>
     </AppShell>
   );

@@ -209,6 +209,11 @@ async def list_dependency_findings(scan_id: uuid.UUID, db: AsyncSession = Depend
         select(DependencyFinding, Dependency)
         .join(Dependency, DependencyFinding.dependency_id == Dependency.id)
         .where(DependencyFinding.scan_id == scan_id)
+        .order_by(
+            case((DependencyFinding.risk_score.is_(None), 1), else_=0),
+            DependencyFinding.risk_score.desc(),
+            DependencyFinding.severity.desc(),
+        )
     )
     out = []
     for df, dep in result.all():
@@ -224,7 +229,14 @@ async def list_dependency_findings(scan_id: uuid.UUID, db: AsyncSession = Depend
                 summary=df.summary,
                 affected_range=df.affected_range,
                 fixed_version=df.fixed_version,
+                vulnerable_functions=df.vulnerable_functions,
+                evidence_type=df.evidence_type,
                 relevance=df.relevance,
+                usage_evidence=df.usage_evidence,
+                reachability_status=df.reachability_status,
+                reachability_confidence=df.reachability_confidence,
+                risk_score=df.risk_score,
+                risk_factors=df.risk_factors,
                 ai_assessment=df.ai_assessment,
             )
         )

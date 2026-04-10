@@ -1,11 +1,15 @@
 """Tests for cross-platform path utilities."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 from app.analysis.paths import (
+    collect_source_files,
+    load_repo_path_policy,
     normalise_path,
     is_safe_path,
     is_binary_extension,
+    should_skip_repo_path,
     should_skip_dir,
     get_extension,
     relative_to_repo,
@@ -73,3 +77,42 @@ def test_relative_to_repo():
     repo = Path("/home/user/project")
     file = Path("/home/user/project/src/auth/login.py")
     assert relative_to_repo(file, repo) == "src/auth/login.py"
+
+
+def test_repo_path_policy_respects_vragentignore(tmp_path):
+    (tmp_path / ".vragentignore").write_text("generated/\n*.snap\n")
+    (tmp_path / "generated").mkdir()
+    generated = tmp_path / "generated" / "code.py"
+    generated.write_text("print('ignore me')\n")
+    kept = tmp_path / "src.py"
+    kept.write_text("print('keep me')\n")
+    snap = tmp_path / "state.snap"
+    snap.write_text("snapshot\n")
+
+    policy = load_repo_path_policy(tmp_path)
+
+    assert should_skip_repo_path(generated, tmp_path, policy=policy)
+    assert should_skip_repo_path(snap, tmp_path, policy=policy)
+    assert not should_skip_repo_path(kept, tmp_path, policy=policy)
+
+
+def test_collect_source_files_skips_managed_paths(tmp_path):
+    managed_data = tmp_path / "backend" / "data"
+    managed_uploads = tmp_path / "backend" / "uploads"
+    kept_dir = tmp_path / "backend" / "src"
+    managed_data.mkdir(parents=True)
+    managed_uploads.mkdir(parents=True)
+    kept_dir.mkdir(parents=True)
+    (managed_data / "rule.yaml").write_text("rules: []\n")
+    (managed_uploads / "payload.py").write_text("print('uploaded')\n")
+    kept_file = kept_dir / "app.py"
+    kept_file.write_text("print('real code')\n")
+
+    with patch("app.config.settings") as mock_settings:
+        mock_settings.data_dir = managed_data
+        mock_settings.upload_dir = managed_uploads
+        mock_settings.export_dir = tmp_path / "backend" / "exports"
+
+        files = collect_source_files(tmp_path / "backend")
+
+    assert files == [kept_file]

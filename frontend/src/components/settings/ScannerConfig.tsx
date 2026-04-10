@@ -113,10 +113,10 @@ export default function ScannerConfig() {
         </p>
         <p>
           ESLint:{" "}
-          <code className="bg-bg-secondary px-1 rounded">npm install -g eslint</code>
+          <code className="bg-bg-secondary px-1 rounded">cd frontend &amp;&amp; npm ci</code>
         </p>
         <p>
-          All tools must be installed locally for offline operation.
+          ESLint is bundled with the frontend dependencies; the scanner will also try to bootstrap it automatically on first use.
         </p>
       </div>
     </div>

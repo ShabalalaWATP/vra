@@ -9,7 +9,9 @@ Key improvements:
 """
 
 import logging
+from pathlib import Path
 
+from app.analysis.dependency_context import vulnerable_dependency_context_for_file
 from app.database import async_session
 from app.models.finding import Evidence, Finding, FindingFile
 from app.orchestrator.agents.base import BaseAgent
@@ -71,6 +73,8 @@ Respond with JSON:
 
 
 class VerifierAgent(BaseAgent):
+    _MAX_TOOL_ROUNDS = 4
+
     @property
     def name(self) -> str:
         return "verifier"
@@ -192,7 +196,7 @@ class VerifierAgent(BaseAgent):
                     "get_entry_points_reaching",
                     "get_resolved_imports",
                 ],
-                max_tool_rounds=2,
+                max_tool_rounds=self._MAX_TOOL_ROUNDS,
             )
         except Exception as e:
             await self.emit(ctx, f"Verification batch failed: {e}", level="warn")
@@ -359,7 +363,7 @@ class VerifierAgent(BaseAgent):
                         "get_callers_of",
                         "get_entry_points_reaching",
                     ],
-                    max_tool_rounds=2,
+                    max_tool_rounds=self._MAX_TOOL_ROUNDS,
                 )
 
                 if result.get("sanitised"):
@@ -426,37 +430,179 @@ Respond with JSON:
                 await self.emit(ctx, f"PoC generation failed for {finding.title}: {e}", level="warn")
 
     async def _correlate_cves(self, ctx: ScanContext):
-        """Correlate confirmed findings with CVE database using CWE matching."""
-        from app.analysis.cve_correlator import correlate_by_cwe
+        """Correlate findings with advisory data and persist strong package evidence."""
+        from app.analysis.cve_correlator import correlate_by_cwe, find_vulnerable_function_calls
 
         correlated = 0
         for finding in ctx.candidate_findings:
-            if finding.status == "dismissed" or not finding.cwe_ids:
+            if finding.status == "dismissed":
                 continue
 
-            matches = correlate_by_cwe(
-                finding.cwe_ids,
-                languages=list(ctx.languages) if ctx.languages else None,
-                max_results=3,
-            )
+            cwe_matches = []
+            if finding.cwe_ids:
+                cwe_matches = correlate_by_cwe(
+                    finding.cwe_ids,
+                    languages=list(ctx.languages) if ctx.languages else None,
+                    max_results=5,
+                )
 
-            if matches:
-                finding.related_cves = [
-                    {
-                        "cve_id": m["cve_id"],
-                        "package": m["package"],
-                        "severity": m["severity"],
-                        "summary": m["summary"],
-                        "fixed_version": m.get("fixed_version"),
-                    }
-                    for m in matches
-                ]
+            function_matches = []
+            if finding.file_path:
+                content = self._read_repo_file(ctx, finding.file_path)
+                if content:
+                    dep_context = vulnerable_dependency_context_for_file(ctx, finding.file_path)
+                    function_matches = [
+                        match
+                        for match in find_vulnerable_function_calls(
+                            finding.file_path,
+                            content,
+                            languages=list(ctx.languages) if ctx.languages else None,
+                            import_resolutions=ctx.import_graph.get(finding.file_path, []),
+                            vulnerable_dependencies=dep_context,
+                        )
+                        if match.get("evidence_strength") in {"strong", "medium"}
+                    ]
+
+            merged = self._merge_related_advisories(cwe_matches, function_matches)
+            if merged:
+                finding.related_cves = merged
                 correlated += 1
 
         if correlated:
-            await self.emit(ctx, f"CVE correlation: {correlated} findings matched with known CVEs")
+            await self.emit(ctx, f"Advisory correlation: {correlated} findings matched with known advisories")
         else:
-            await self.emit(ctx, "CVE correlation: no matches found in advisory database")
+            await self.emit(ctx, "Advisory correlation: no matches found in advisory database")
+
+    @staticmethod
+    def _read_repo_file(ctx: ScanContext, file_path: str, max_chars: int = 20000) -> str:
+        try:
+            full_path = Path(ctx.repo_path) / file_path
+            if not full_path.exists():
+                return ""
+            return full_path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _normalise_related_advisory(match: dict) -> dict:
+        display_id = match.get("display_id") or match.get("cve_id") or match.get("advisory_id")
+        evidence_type = match.get("match_type") or match.get("evidence_type") or "related_by_cwe"
+        evidence_source = match.get("package_evidence_source")
+        if not evidence_source and evidence_type == "related_by_cwe":
+            evidence_source = "cwe_correlation"
+
+        return {
+            "display_id": display_id,
+            "cve_id": match.get("cve_id"),
+            "advisory_id": match.get("advisory_id"),
+            "package": match.get("package", ""),
+            "ecosystem": match.get("ecosystem"),
+            "severity": match.get("severity", "medium"),
+            "summary": match.get("summary", ""),
+            "fixed_version": match.get("fixed_version"),
+            "evidence_type": evidence_type,
+            "evidence_strength": match.get("evidence_strength") or "contextual",
+            "package_evidence_source": evidence_source,
+            "package_match_confidence": match.get("package_match_confidence"),
+            "import_module": match.get("import_module"),
+            "imported_symbol": match.get("imported_symbol"),
+            "call_object": match.get("call_object"),
+            "function": match.get("function"),
+            "line": match.get("line"),
+            "cwe_ids": match.get("cwe_ids") or match.get("cwes") or [],
+            "evidence_types": [evidence_type],
+            "evidence_sources": [evidence_source] if evidence_source else [],
+        }
+
+    @classmethod
+    def _merge_related_advisories(
+        cls,
+        cwe_matches: list[dict],
+        function_matches: list[dict],
+        *,
+        max_results: int = 5,
+    ) -> list[dict]:
+        strength_rank = {"strong": 3, "medium": 2, "weak": 1, "contextual": 0}
+        severity_rank = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
+        merged: dict[str, dict] = {}
+
+        for raw_match in [*cwe_matches, *function_matches]:
+            entry = cls._normalise_related_advisory(raw_match)
+            key = (
+                entry.get("display_id")
+                or entry.get("advisory_id")
+                or entry.get("cve_id")
+                or f"{entry.get('package', '')}:{entry.get('summary', '')}"
+            )
+            existing = merged.get(key)
+            if not existing:
+                merged[key] = entry
+                continue
+
+            current_score = (
+                strength_rank.get(entry.get("evidence_strength", ""), 0),
+                float(entry.get("package_match_confidence") or 0.0),
+                severity_rank.get(str(entry.get("severity", "")).lower(), 0),
+            )
+            existing_score = (
+                strength_rank.get(existing.get("evidence_strength", ""), 0),
+                float(existing.get("package_match_confidence") or 0.0),
+                severity_rank.get(str(existing.get("severity", "")).lower(), 0),
+            )
+
+            winner = entry if current_score > existing_score else existing
+            loser = existing if winner is entry else entry
+
+            winner["evidence_types"] = sorted(
+                {
+                    *(winner.get("evidence_types") or []),
+                    *(loser.get("evidence_types") or []),
+                    winner.get("evidence_type"),
+                    loser.get("evidence_type"),
+                }
+                - {None, ""}
+            )
+            winner["evidence_sources"] = sorted(
+                {
+                    *(winner.get("evidence_sources") or []),
+                    *(loser.get("evidence_sources") or []),
+                    winner.get("package_evidence_source"),
+                    loser.get("package_evidence_source"),
+                }
+                - {None, ""}
+            )
+
+            for field in (
+                "summary",
+                "fixed_version",
+                "import_module",
+                "imported_symbol",
+                "call_object",
+                "function",
+                "line",
+            ):
+                if not winner.get(field) and loser.get(field):
+                    winner[field] = loser[field]
+
+            combined_cwes = {
+                *(winner.get("cwe_ids") or []),
+                *(loser.get("cwe_ids") or []),
+            }
+            if combined_cwes:
+                winner["cwe_ids"] = sorted(combined_cwes)
+
+            merged[key] = winner
+
+        ranked = sorted(
+            merged.values(),
+            key=lambda item: (
+                -strength_rank.get(item.get("evidence_strength", ""), 0),
+                -float(item.get("package_match_confidence") or 0.0),
+                -severity_rank.get(str(item.get("severity", "")).lower(), 0),
+                str(item.get("display_id") or item.get("package") or ""),
+            ),
+        )
+        return ranked[:max_results]
 
     async def _persist_findings(self, ctx: ScanContext):
         """Save confirmed findings to the database."""

@@ -26,7 +26,7 @@ import {
 } from "lucide-react";
 import { api } from "@/api/client";
 import { useWebSocket } from "@/hooks/useWebSocket";
-import type { Project, Scan } from "@/types";
+import type { Project, Scan, ScannerRunSummary } from "@/types";
 
 /* ── Phase definitions matching the backend stages ─────────── */
 const APK_PHASE = {
@@ -130,7 +130,7 @@ const BASE_PHASES = [
     description: "AI-selected follow-up scanner rules on hot files",
     substeps: [
       "Select scanner rules based on findings",
-      "Run targeted Semgrep, Bandit, ESLint passes",
+      "Run targeted Semgrep, Bandit, ESLint, and CodeQL passes",
       "Investigate new scanner hits",
       "Feed results back into investigation",
     ],
@@ -303,6 +303,37 @@ export default function ScanProgressPage() {
     : 0;
 
   const logEvents = events.filter((e) => e.type === "event");
+  const scannerRuns = events.reduce((acc, event) => {
+    const detail = (event.detail ?? {}) as Record<string, unknown>;
+    const scannerRun = detail as Partial<ScannerRunSummary>;
+    if (typeof scannerRun.scanner === "string" && typeof scannerRun.status === "string") {
+      acc[scannerRun.scanner] = {
+        scanner: scannerRun.scanner,
+        status: scannerRun.status as ScannerRunSummary["status"],
+        success: Boolean(scannerRun.success),
+        hit_count: Number(scannerRun.hit_count ?? 0),
+        duration_ms: Number(scannerRun.duration_ms ?? 0),
+        errors: Array.isArray(scannerRun.errors) ? scannerRun.errors.filter((e): e is string => typeof e === "string") : [],
+      };
+    }
+    if (detail.scanner_runs && typeof detail.scanner_runs === "object") {
+      for (const [name, raw] of Object.entries(detail.scanner_runs as Record<string, unknown>)) {
+        const run = raw as Partial<ScannerRunSummary>;
+        acc[name] = {
+          scanner: typeof run.scanner === "string" ? run.scanner : name,
+          status: (typeof run.status === "string" ? run.status : "completed") as ScannerRunSummary["status"],
+          success: Boolean(run.success),
+          hit_count: Number(run.hit_count ?? 0),
+          duration_ms: Number(run.duration_ms ?? 0),
+          errors: Array.isArray(run.errors) ? run.errors.filter((e): e is string => typeof e === "string") : [],
+        };
+      }
+    }
+    return acc;
+  }, {} as Record<string, ScannerRunSummary>);
+  const progressDetail = (lastProgress?.detail ?? {}) as Record<string, unknown>;
+  const degradedCoverage = Boolean(progressDetail.degraded_coverage);
+  const ignoredFileCount = Number(progressDetail.ignored_file_count ?? 0);
   const eta = useETA(scan?.started_at ?? null, phaseIdx, PHASES.length, aiCalls, maxAiCalls);
 
   // Elapsed time
@@ -466,6 +497,52 @@ export default function ScanProgressPage() {
           ))}
         </div>
       </div>
+
+      {(Object.keys(scannerRuns).length > 0 || degradedCoverage || ignoredFileCount > 0) && (
+        <HudFrame label="scanner health" color={degradedCoverage ? "accent-warning" : "accent-secondary"}>
+          <div className="px-3 pt-4 pb-3 space-y-3">
+            {degradedCoverage && (
+              <div className="rounded-xl border border-accent-warning/20 bg-accent-warning/10 px-3 py-2 text-sm text-accent-warning">
+                Scanner coverage is degraded. At least one scanner failed or returned errors.
+              </div>
+            )}
+            {ignoredFileCount > 0 && (
+              <div className="rounded-xl border border-border/50 bg-bg-secondary/40 px-3 py-2 text-sm text-text-secondary">
+                {ignoredFileCount} files are outside scan scope due to default skips, managed-path exclusions, or <code>.vragentignore</code>.
+              </div>
+            )}
+            {Object.keys(scannerRuns).length > 0 && (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                {Object.values(scannerRuns).map((run) => {
+                  const tone =
+                    run.status === "failed"
+                      ? "border-accent-danger/30 bg-accent-danger/10 text-accent-danger"
+                      : run.status === "degraded"
+                      ? "border-accent-warning/30 bg-accent-warning/10 text-accent-warning"
+                      : "border-accent-success/20 bg-accent-success/10 text-accent-success";
+                  return (
+                    <div key={run.scanner} className={`rounded-xl border px-3 py-2 ${tone}`}>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="font-semibold uppercase tracking-wide text-[11px]">{run.scanner}</span>
+                        <span className="text-[10px] font-mono uppercase">{run.status}</span>
+                      </div>
+                      <div className="mt-2 flex items-center gap-3 text-xs">
+                        <span>{run.hit_count} hits</span>
+                        <span>{run.duration_ms}ms</span>
+                      </div>
+                      {run.errors[0] && (
+                        <p className="mt-2 text-xs leading-relaxed text-text-secondary">
+                          {run.errors[0]}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </HudFrame>
+      )}
 
       {/* ── Main Layout: Pipeline + Log ───────────────────────── */}
       <div className="grid grid-cols-3 gap-6">

@@ -3,6 +3,7 @@ import shutil
 from fastapi import APIRouter
 
 from app.config import settings
+from app.scanners.eslint import ESLintAdapter
 
 router = APIRouter(tags=["health"])
 
@@ -20,13 +21,20 @@ async def tool_availability():
     for name, binary in [
         ("semgrep", settings.semgrep_binary),
         ("bandit", settings.bandit_binary),
-        ("eslint", settings.eslint_binary),
     ]:
         path = shutil.which(binary)
         tools[name] = {
             "available": path is not None,
             "path": path,
         }
+
+    eslint_adapter = ESLintAdapter()
+    eslint_available = await eslint_adapter.is_available()
+    eslint_path = eslint_adapter._resolve_binary_path()
+    tools["eslint"] = {
+        "available": eslint_available,
+        "path": str(eslint_path) if eslint_path else None,
+    }
 
     tools["advisory_db"] = {
         "available": settings.advisory_db_path.exists(),
@@ -41,16 +49,16 @@ async def tool_availability():
         for lang_dir in rules_path.iterdir():
             if lang_dir.is_dir() and lang_dir.name != "__pycache__":
                 rule_languages.append(lang_dir.name)
-                for rf in lang_dir.glob("*.yaml"):
+                for rf in lang_dir.rglob("*.yaml"):
                     try:
                         content = rf.read_text()
-                        rule_count += content.count("  - id:")
+                        rule_count += content.count("- id:")
                     except Exception:
                         pass
-                for rf in lang_dir.glob("*.yml"):
+                for rf in lang_dir.rglob("*.yml"):
                     try:
                         content = rf.read_text()
-                        rule_count += content.count("  - id:")
+                        rule_count += content.count("- id:")
                     except Exception:
                         pass
 
@@ -64,11 +72,6 @@ async def tool_availability():
             "on an internet-connected machine and copy data/semgrep-rules/ to this deployment "
             "for full coverage (3000+ rules)."
         ),
-    }
-
-    tools["advisory_db"] = {
-        "available": settings.advisory_db_path.exists(),
-        "path": str(settings.advisory_db_path),
     }
 
     # CodeQL

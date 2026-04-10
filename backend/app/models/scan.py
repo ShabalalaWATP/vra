@@ -1,11 +1,11 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Float, ForeignKey, Integer, String, Text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.db_types import JSONType
 
 
 class Scan(Base):
@@ -45,10 +45,12 @@ class ScanConfig(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     scan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scans.id"), unique=True)
-    scanners: Mapped[dict] = mapped_column(JSONB)
+    scanners: Mapped[dict] = mapped_column(JSONType)
     semgrep_version: Mapped[str | None] = mapped_column(String(50))
     bandit_version: Mapped[str | None] = mapped_column(String(50))
     eslint_version: Mapped[str | None] = mapped_column(String(50))
+    codeql_version: Mapped[str | None] = mapped_column(String(50))
+    secrets_version: Mapped[str | None] = mapped_column(String(50))
     advisory_db_ver: Mapped[str | None] = mapped_column(String(50))
     llm_model: Mapped[str | None] = mapped_column(String(255))
     scan_mode: Mapped[str] = mapped_column(String(20))
@@ -59,12 +61,12 @@ class ScanConfig(Base):
 class ScanEvent(Base):
     __tablename__ = "scan_events"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     scan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scans.id"), index=True)
     phase: Mapped[str | None] = mapped_column(String(50))
     level: Mapped[str] = mapped_column(String(10), default="info")
     message: Mapped[str] = mapped_column(Text)
-    detail: Mapped[dict | None] = mapped_column(JSONB)
+    detail: Mapped[dict | None] = mapped_column(JSONType)
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     scan: Mapped["Scan"] = relationship(back_populates="events")

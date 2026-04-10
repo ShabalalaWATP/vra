@@ -13,7 +13,7 @@
     - Semgrep rules (downloaded from GitHub)
     - OSV advisory database (downloaded from GCS)
     - Technology icons (downloaded from GitHub)
-    - PostgreSQL database setup
+    - SQLite database setup
     - Database migrations
 
     For air-gapped installs, run with -Offline and ensure offline packages
@@ -26,25 +26,13 @@
     Skip CodeQL download (it's optional but recommended).
 
 .PARAMETER SkipDB
-    Skip PostgreSQL database creation and migrations.
+    Skip SQLite database initialization and migrations.
 
 .PARAMETER SkipData
     Skip downloading Semgrep rules, advisories, and icons.
 
-.PARAMETER DBUser
-    PostgreSQL username (default: vragent)
-
-.PARAMETER DBPassword
-    PostgreSQL password (default: vragent)
-
-.PARAMETER DBName
-    PostgreSQL database name (default: vragent)
-
-.PARAMETER DBHost
-    PostgreSQL host (default: localhost)
-
-.PARAMETER DBPort
-    PostgreSQL port (default: 5432)
+.PARAMETER DBPath
+    SQLite database file path (default: backend\data\vragent.db)
 
 .EXAMPLE
     # Full install (internet required)
@@ -56,8 +44,8 @@
     # Install without CodeQL
     .\install.ps1 -SkipCodeQL
 
-    # Custom database settings
-    .\install.ps1 -DBUser myuser -DBPassword mypass -DBName mydb
+    # Custom database path
+    .\install.ps1 -DBPath backend\data\custom.db
 #>
 
 param(
@@ -65,11 +53,7 @@ param(
     [switch]$SkipCodeQL,
     [switch]$SkipDB,
     [switch]$SkipData,
-    [string]$DBUser = "vragent",
-    [string]$DBPassword = "vragent",
-    [string]$DBName = "vragent",
-    [string]$DBHost = "localhost",
-    [int]$DBPort = 5432
+    [string]$DBPath = "backend\\data\\vragent.db"
 )
 
 $ErrorActionPreference = "Stop"
@@ -107,6 +91,14 @@ function Test-Command {
     param([string]$Name)
     $null = Get-Command $Name -ErrorAction SilentlyContinue
     return $?
+}
+
+function Get-SqliteUrl {
+    param([string]$PathString)
+    $fullPath = [System.IO.Path]::GetFullPath(
+        $(if ([System.IO.Path]::IsPathRooted($PathString)) { $PathString } else { Join-Path $ROOT $PathString })
+    )
+    return "sqlite+aiosqlite:///" + ($fullPath -replace "\\", "/")
 }
 
 # ── Banner ──────────────────────────────────────────────────────────
@@ -149,17 +141,6 @@ if (Test-Command "npm") {
 } else {
     Write-Err "npm not found. Should come with Node.js."
     exit 1
-}
-
-# PostgreSQL (optional check)
-if (-not $SkipDB) {
-    if (Test-Command "psql") {
-        $psqlVer = psql --version 2>&1
-        Write-Step "PostgreSQL client: $psqlVer"
-    } else {
-        Write-Warn "psql not found in PATH. Database setup may fail."
-        Write-Warn "Ensure PostgreSQL is installed and psql is in PATH."
-    }
 }
 
 # ── Install Python backend ─────────────────────────────────────────
@@ -229,22 +210,26 @@ try {
             exit 1
         }
     } else {
-        Write-Step "Running npm install..."
-        npm install 2>&1 | Out-Null
+        $npmInstallArgs = if (Test-Path (Join-Path $FRONTEND "package-lock.json")) { @("ci") } else { @("install") }
+        Write-Step "Running npm $($npmInstallArgs[0])..."
+        & npm @npmInstallArgs 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0 -and $npmInstallArgs[0] -eq "ci") {
+            Write-Warn "npm ci failed; falling back to npm install to refresh the lockfile."
+            & npm install 2>&1 | Out-Null
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Frontend dependency installation failed."
+            exit 1
+        }
     }
     Write-Step "Frontend dependencies installed"
 
     # ESLint
-    if (Test-Command "eslint") {
-        Write-Step "ESLint already installed"
+    $localEslint = Join-Path $FRONTEND "node_modules" ".bin" "eslint.cmd"
+    if (Test-Path $localEslint) {
+        Write-Step "ESLint available locally: $localEslint"
     } else {
-        Write-Step "Installing ESLint globally..."
-        npm install -g eslint 2>&1 | Out-Null
-        if (Test-Command "eslint") {
-            Write-Step "ESLint installed"
-        } else {
-            Write-Warn "ESLint global install may have failed. VRAgent will try local eslint."
-        }
+        Write-Warn "Local ESLint binary not found. VRAgent will bootstrap frontend dependencies on first ESLint scan."
     }
 } finally {
     Pop-Location
@@ -388,44 +373,23 @@ if (-not $SkipData -and -not $Offline) {
 if (-not $SkipDB) {
     Write-Header "Setting Up Database"
 
-    $connStr = "postgresql+asyncpg://${DBUser}:${DBPassword}@${DBHost}:${DBPort}/${DBName}"
-
-    # Try to create database
-    if (Test-Command "psql") {
-        Write-Step "Creating database '$DBName' (if not exists)..."
-        try {
-            $env:PGPASSWORD = $DBPassword
-            $dbExists = psql -h $DBHost -p $DBPort -U $DBUser -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$DBName'" 2>$null
-            if ($dbExists -ne "1") {
-                psql -h $DBHost -p $DBPort -U postgres -c "CREATE USER $DBUser WITH PASSWORD '$DBPassword';" 2>$null
-                psql -h $DBHost -p $DBPort -U postgres -c "CREATE DATABASE $DBName OWNER $DBUser;" 2>$null
-                psql -h $DBHost -p $DBPort -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE $DBName TO $DBUser;" 2>$null
-                Write-Step "Database created"
-            } else {
-                Write-Step "Database '$DBName' already exists"
-            }
-        } catch {
-            Write-Warn "Could not auto-create database. Create it manually:"
-            Write-Warn "  CREATE USER $DBUser WITH PASSWORD '$DBPassword';"
-            Write-Warn "  CREATE DATABASE $DBName OWNER $DBUser;"
-        } finally {
-            Remove-Item Env:\PGPASSWORD -ErrorAction SilentlyContinue
-        }
-    } else {
-        Write-Warn "psql not in PATH. Ensure the database exists:"
-        Write-Warn "  CREATE USER $DBUser WITH PASSWORD '$DBPassword';"
-        Write-Warn "  CREATE DATABASE $DBName OWNER $DBUser;"
+    $dbFile = if ([System.IO.Path]::IsPathRooted($DBPath)) { $DBPath } else { Join-Path $ROOT $DBPath }
+    $dbDir = Split-Path -Parent $dbFile
+    if (-not (Test-Path $dbDir)) {
+        New-Item -ItemType Directory -Path $dbDir -Force | Out-Null
     }
+    $connStr = Get-SqliteUrl -PathString $DBPath
+    Write-Step "Using SQLite database: $dbFile"
 
     # Run migrations
     Write-Step "Running database migrations..."
     Push-Location $BACKEND
     try {
         $env:VRAGENT_DATABASE_URL = $connStr
-        alembic upgrade head 2>&1 | Out-Null
+        python -m alembic upgrade head 2>&1 | Out-Null
         Write-Step "Migrations complete"
     } catch {
-        Write-Warn "Migration failed. Ensure PostgreSQL is running and the database exists."
+        Write-Warn "Migration failed for SQLite database: $dbFile"
         Write-Warn "Connection string: $connStr"
     } finally {
         Pop-Location
@@ -441,7 +405,7 @@ $checks = @(
     @{ Name = "Frontend node_modules"; Check = { Test-Path (Join-Path $FRONTEND "node_modules") } },
     @{ Name = "Semgrep"; Check = { Test-Command "semgrep" } },
     @{ Name = "Bandit"; Check = { Test-Command "bandit" } },
-    @{ Name = "ESLint"; Check = { Test-Command "eslint" } },
+    @{ Name = "ESLint"; Check = { Test-Path (Join-Path $FRONTEND "node_modules" ".bin" "eslint.cmd") } },
     @{ Name = "CodeQL"; Check = { Test-Path (Join-Path $BACKEND "tools" "codeql" "codeql.exe") } },
     @{ Name = "jadx"; Check = { Test-Path (Join-Path $BACKEND "tools" "jadx" "bin" "jadx.bat") } },
     @{ Name = "Semgrep rules"; Check = { (Get-ChildItem -Path (Join-Path $BACKEND "data" "semgrep-rules") -Filter "*.yaml" -Recurse -ErrorAction SilentlyContinue | Measure-Object).Count -gt 100 } },

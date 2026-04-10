@@ -5,15 +5,18 @@ import logging
 import uuid
 from pathlib import Path
 
+from app.analysis.dependency_inventory import dependency_identity_key
 from app.analysis.file_scorer import score_file
 from app.analysis.fingerprint import SKIP_DIRS, fingerprint_repo
+from app.analysis.investigation_scope import should_investigate_file_path
 from app.analysis.obfuscation import detect_obfuscation, summarise_obfuscation, ObfuscationResult
 from app.analysis.paths import (
     is_binary_extension,
+    load_repo_path_policy,
     normalise_path,
     relative_to_repo,
     safe_read_file,
-    should_skip_dir,
+    should_skip_repo_path,
 )
 from app.analysis.treesitter import parse_file as ts_parse_file, is_available as ts_available
 from app.config import settings
@@ -57,6 +60,10 @@ class TriageAgent(BaseAgent):
         ctx.is_monorepo = fp.get("is_monorepo", False)
         ctx.workspaces = fp.get("workspaces", [])
         ctx.size_warnings = fp.get("size_warnings", [])
+        ctx.repo_ignore_file = fp.get("repo_ignore_file")
+        ctx.ignored_paths = fp.get("ignored_paths", [])
+        ctx.managed_paths_ignored = fp.get("managed_paths_ignored", [])
+        ctx.ignored_file_count = fp.get("ignored_file_count", 0)
         await self.emit(ctx, f"Detected: {', '.join(ctx.languages[:5])} | Frameworks: {', '.join(ctx.frameworks[:5])}")
 
         if ctx.is_monorepo:
@@ -65,6 +72,13 @@ class TriageAgent(BaseAgent):
 
         for warning in ctx.size_warnings:
             await self.emit(ctx, warning, level="warn")
+        if ctx.ignored_file_count > 0:
+            await self.emit(
+                ctx,
+                f"Repo scope excludes {ctx.ignored_file_count} files via default skips, managed paths, or .vragentignore",
+            )
+        if ctx.repo_ignore_file:
+            await self.emit(ctx, f"Using repo ignore file: {ctx.repo_ignore_file}")
 
         # APK-specific: parse AndroidManifest.xml if present
         if ctx.source_type in ("apk", "aab", "dex", "jar"):
@@ -123,16 +137,32 @@ class TriageAgent(BaseAgent):
 
         if "semgrep" in available:
             ctx.current_task = "Running Semgrep"
-            await self.emit(ctx, f"Running Semgrep baseline scan (languages: {', '.join(ctx.languages[:5])})...")
             try:
-                ctx.baseline_rule_dirs = available["semgrep"]._get_baseline_configs(
+                baseline_configs = available["semgrep"]._get_baseline_configs(
                     settings.semgrep_rules_path,
                     ctx.languages,
                     repo,
+                    frameworks=ctx.frameworks,
                 )
+                ctx.baseline_rule_dirs = available["semgrep"].describe_config_paths(
+                    baseline_configs,
+                    rules_path=settings.semgrep_rules_path,
+                )
+                ctx.baseline_rule_count = available["semgrep"].count_rules(baseline_configs)
             except Exception:
                 ctx.baseline_rule_dirs = []
-            scanner_tasks.append(("semgrep", available["semgrep"].run(repo, languages=ctx.languages)))
+                ctx.baseline_rule_count = 0
+            baseline_hint = ""
+            if ctx.baseline_rule_dirs:
+                baseline_hint = f"; {len(ctx.baseline_rule_dirs)} rule packs (~{ctx.baseline_rule_count} rules)"
+            await self.emit(
+                ctx,
+                f"Running Semgrep baseline scan (languages: {', '.join(ctx.languages[:5])}{baseline_hint})...",
+            )
+            scanner_tasks.append((
+                "semgrep",
+                available["semgrep"].run(repo, languages=ctx.languages, frameworks=ctx.frameworks),
+            ))
 
         if "bandit" in available and "python" in ctx.languages:
             await self.emit(ctx, "Running Bandit...")
@@ -144,7 +174,16 @@ class TriageAgent(BaseAgent):
 
         if "codeql" in available:
             await self.emit(ctx, f"Running CodeQL semantic analysis...")
-            scanner_tasks.append(("codeql", available["codeql"].run(repo, languages=ctx.languages)))
+            scanner_tasks.append(
+                (
+                    "codeql",
+                    available["codeql"].run(
+                        repo,
+                        languages=ctx.languages,
+                        rules=[f"baseline:{ctx.mode}"],
+                    ),
+                )
+            )
 
         if "secrets" in available:
             await self.emit(ctx, "Scanning for secrets...")
@@ -163,13 +202,36 @@ class TriageAgent(BaseAgent):
 
             for (scanner_name, _), result in zip(scanner_tasks, results):
                 if isinstance(result, Exception):
-                    await self.emit(ctx, f"{scanner_name} failed: {result}", level="error")
+                    summary = ctx.record_scanner_run(
+                        scanner_name,
+                        success=False,
+                        hit_count=0,
+                        duration_ms=0,
+                        errors=[str(result)],
+                    )
+                    await self.emit(
+                        ctx,
+                        f"{scanner_name} failed before producing results",
+                        level="error",
+                        detail=summary,
+                    )
                     continue
 
-                ctx.scanner_hit_counts[scanner_name] = len(result.hits)
+                summary = ctx.record_scanner_run(
+                    scanner_name,
+                    success=result.success,
+                    hit_count=len(result.hits),
+                    duration_ms=result.duration_ms,
+                    errors=result.errors,
+                )
+                level = "warn" if summary["status"] == "degraded" else ("error" if summary["status"] == "failed" else "info")
+                error_suffix = f" ({len(summary['errors'])} errors)" if summary["errors"] else ""
                 await self.emit(
                     ctx,
-                    f"{scanner_name}: {len(result.hits)} findings in {result.duration_ms}ms",
+                    f"{scanner_name}: {len(result.hits)} findings in {result.duration_ms}ms [{summary['status']}]"
+                    f"{error_suffix}",
+                    level=level,
+                    detail=summary,
                 )
 
                 # Persist scanner results
@@ -192,20 +254,10 @@ class TriageAgent(BaseAgent):
 
         # Build the priority queue
         sorted_files = sorted(file_records.items(), key=lambda x: x[1].get("score", 0), reverse=True)
-        # Filter out tests and non-code files (docs, assets, config)
-        _non_code_ext = {".md", ".txt", ".rst", ".csv", ".json", ".yaml", ".yml",
-                         ".toml", ".xml", ".css", ".scss", ".less", ".html", ".htm",
-                         ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".lock",
-                         ".sum", ".map", ".woff", ".woff2", ".ttf", ".eot",
-                         ".pdf", ".zip", ".tar", ".gz", ".min.js", ".min.css"}
-        _non_code_names = {"LICENSE", "LICENCE", "COPYING", "CHANGELOG", "AUTHORS",
-                           "CONTRIBUTORS", "Makefile", "Dockerfile", ".gitignore"}
-        import os
         ctx.file_queue = [
             path for path, meta in sorted_files
             if not _get(meta, "is_test")
-            and os.path.splitext(path.lower())[1] not in _non_code_ext
-            and os.path.basename(path) not in _non_code_names
+            and should_investigate_file_path(path)
         ]
 
         # Step 5: Build call graph (deterministic, no LLM needed)
@@ -351,14 +403,13 @@ class TriageAgent(BaseAgent):
         """Walk the repo, create File records, return path->metadata mapping."""
         file_map = {}
         total_seen = 0
+        policy = load_repo_path_policy(repo)
 
         async with async_session() as session:
             for path in repo.rglob("*"):
                 if not path.is_file():
                     continue
-                # Cross-platform safe dir skipping
-                rel_parts = path.relative_to(repo).parts
-                if any(should_skip_dir(part) for part in rel_parts):
+                if should_skip_repo_path(path, repo, policy=policy):
                     continue
                 if is_binary_extension(str(path)):
                     continue
@@ -415,11 +466,80 @@ class TriageAgent(BaseAgent):
 
         return file_map
 
+    @staticmethod
+    def scanner_summary(result) -> dict:
+        """Return a serialisable scanner run summary for UI and reporting."""
+        errors = [e.strip() for e in getattr(result, "errors", []) if isinstance(e, str) and e.strip()]
+        if not getattr(result, "success", False):
+            status = "failed"
+        elif errors:
+            status = "degraded"
+        else:
+            status = "completed"
+        return {
+            "status": status,
+            "success": getattr(result, "success", False),
+            "hit_count": len(getattr(result, "hits", [])),
+            "duration_ms": getattr(result, "duration_ms", 0),
+            "errors": errors,
+        }
+
     async def _persist_scanner_results(
         self, ctx: ScanContext, scanner_name: str, hits: list, file_map: dict
     ):
         """Save scanner hits to the database."""
         async with async_session() as session:
+            dependency_cache: dict[tuple[str, str, str, str, bool], object] = {}
+            dependency_finding_keys: set[tuple[tuple[str, str, str, str, bool], str, str, str]] = set()
+
+            if scanner_name == "dep_audit":
+                from app.models.dependency import Dependency, DependencyFinding
+
+                dep_rows = await session.execute(
+                    select(Dependency).where(Dependency.scan_id == ctx.scan_id)
+                )
+                for dep in dep_rows.scalars().all():
+                    dependency_cache[
+                        dependency_identity_key(
+                            ecosystem=dep.ecosystem,
+                            name=dep.name,
+                            version=dep.version,
+                            source_file=dep.source_file,
+                            is_dev=dep.is_dev,
+                        )
+                    ] = dep
+
+                finding_rows = await session.execute(
+                    select(
+                        Dependency.ecosystem,
+                        Dependency.name,
+                        Dependency.version,
+                        Dependency.source_file,
+                        Dependency.is_dev,
+                        DependencyFinding.advisory_id,
+                        DependencyFinding.cve_id,
+                        DependencyFinding.summary,
+                    )
+                    .join(Dependency, DependencyFinding.dependency_id == Dependency.id)
+                    .where(DependencyFinding.scan_id == ctx.scan_id)
+                )
+                for row in finding_rows.all():
+                    dep_key = dependency_identity_key(
+                        ecosystem=row.ecosystem,
+                        name=row.name,
+                        version=row.version,
+                        source_file=row.source_file,
+                        is_dev=row.is_dev,
+                    )
+                    dependency_finding_keys.add(
+                        (
+                            dep_key,
+                            row.advisory_id or "",
+                            row.cve_id or "",
+                            row.summary or "",
+                        )
+                    )
+
             for hit in hits:
                 # Resolve file_id from file_map
                 norm_path = self._normalise_hit_path(repo=Path(ctx.repo_path), raw_path=hit.file_path, file_map=file_map)
@@ -450,33 +570,52 @@ class TriageAgent(BaseAgent):
                     from app.models.dependency import Dependency, DependencyFinding
 
                     meta = hit.metadata or {}
-                    dep = Dependency(
-                        scan_id=ctx.scan_id,
+                    dep_key = dependency_identity_key(
                         ecosystem=meta.get("ecosystem", "unknown"),
                         name=meta.get("package", ""),
                         version=meta.get("installed_version", ""),
                         source_file=norm_path or hit.file_path,
                         is_dev=meta.get("is_dev", False),
                     )
-                    session.add(dep)
-                    await session.flush()  # Get dep.id
+                    dep = dependency_cache.get(dep_key)
+                    if dep is None:
+                        dep = Dependency(
+                            scan_id=ctx.scan_id,
+                            ecosystem=meta.get("ecosystem", "unknown"),
+                            name=meta.get("package", ""),
+                            version=meta.get("installed_version", ""),
+                            source_file=norm_path or hit.file_path,
+                            is_dev=meta.get("is_dev", False),
+                        )
+                        session.add(dep)
+                        await session.flush()  # Get dep.id for finding rows
+                        dependency_cache[dep_key] = dep
 
-                    df = DependencyFinding(
-                        dependency_id=dep.id,
-                        scan_id=ctx.scan_id,
-                        advisory_id=meta.get("advisory_id"),
-                        cve_id=meta.get("cve_id"),
-                        severity=hit.severity,
-                        cvss_score=meta.get("cvss"),
-                        summary=hit.message,
-                        details=meta.get("details"),
-                        affected_range=meta.get("affected_range", ""),
-                        fixed_version=meta.get("fixed_version"),
-                        cwes=meta.get("cwes"),
-                        references=meta.get("references"),
-                        vulnerable_functions=meta.get("vulnerable_functions"),
+                    finding_key = (
+                        dep_key,
+                        meta.get("advisory_id") or "",
+                        meta.get("cve_id") or "",
+                        hit.message or "",
                     )
-                    session.add(df)
+                    if finding_key not in dependency_finding_keys:
+                        df = DependencyFinding(
+                            dependency_id=dep.id,
+                            scan_id=ctx.scan_id,
+                            advisory_id=meta.get("advisory_id"),
+                            cve_id=meta.get("cve_id"),
+                            severity=hit.severity,
+                            cvss_score=meta.get("cvss"),
+                            summary=hit.message,
+                            details=meta.get("details"),
+                            affected_range=meta.get("affected_range", ""),
+                            fixed_version=meta.get("fixed_version"),
+                            cwes=meta.get("cwes"),
+                            references=meta.get("references"),
+                            vulnerable_functions=meta.get("vulnerable_functions"),
+                            evidence_type=meta.get("match_type", "exact_package_match"),
+                        )
+                        session.add(df)
+                        dependency_finding_keys.add(finding_key)
 
                     # Also save as ScannerResult so it shows up in scanner hit queries
                     sr = ScannerResult(
@@ -710,16 +849,19 @@ class TriageAgent(BaseAgent):
     def _discover_doc_files(self, repo: Path) -> list[str]:
         """Fast filesystem scan for documentation files. No LLM needed."""
         found = []
+        policy = load_repo_path_policy(repo)
 
         # Check explicit patterns first
         for pattern in self._DOC_PATTERNS:
             candidate = repo / pattern
-            if candidate.exists() and candidate.is_file():
+            if candidate.exists() and candidate.is_file() and not should_skip_repo_path(candidate, repo, policy=policy):
                 rel = str(candidate.relative_to(repo)).replace("\\", "/")
                 found.append(rel)
 
         # Also look for case-insensitive README variants at root and one level deep
         for item in repo.iterdir():
+            if should_skip_repo_path(item, repo, policy=policy):
+                continue
             if item.is_file() and item.name.lower().startswith("readme"):
                 rel = str(item.relative_to(repo)).replace("\\", "/")
                 if rel not in found and item.name not in self._DOC_SKIP:
@@ -731,6 +873,8 @@ class TriageAgent(BaseAgent):
             if docs_path.is_dir():
                 md_files = sorted(docs_path.glob("*.md"))[:10]
                 for md_file in md_files:
+                    if should_skip_repo_path(md_file, repo, policy=policy):
+                        continue
                     rel = str(md_file.relative_to(repo)).replace("\\", "/")
                     if rel not in found and md_file.name not in self._DOC_SKIP:
                         found.append(rel)

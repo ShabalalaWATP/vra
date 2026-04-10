@@ -8,10 +8,10 @@ dev: db backend frontend
 
 # ── Database ─────────────────────────────────────────────────────
 db:
-	docker compose up -d db
+	cd backend && python -m alembic upgrade head
 
 migrate:
-	cd backend && alembic upgrade head
+	cd backend && python -m alembic upgrade head
 
 # ── Servers ──────────────────────────────────────────────────────
 backend:
@@ -24,7 +24,7 @@ frontend:
 # Install Python + Node dependencies only
 install:
 	cd backend && pip install -e ".[dev]"
-	cd frontend && npm install
+	if [ -f frontend/package-lock.json ]; then cd frontend && (npm ci || npm install); else cd frontend && npm install; fi
 
 # Install everything: deps + scanners + data + codeql + jadx
 install-all: install install-scanners download-data download-codeql download-jadx
@@ -32,10 +32,10 @@ install-all: install install-scanners download-data download-codeql download-jad
 	@echo "=== All dependencies installed ==="
 	@echo "Run 'make check-tools' to verify installation."
 
-# Install scanner tools (Semgrep, Bandit, ESLint)
+# Install scanner tools (Semgrep, Bandit; ESLint comes from frontend deps)
 install-scanners:
 	pip install semgrep bandit
-	npm install -g eslint
+	@echo "ESLint is installed locally in frontend/node_modules via the frontend install step."
 
 # ── Offline data downloads ───────────────────────────────────────
 # Download all offline data (rules + advisories + icons)
@@ -71,9 +71,9 @@ check-tools:
 	@printf "  npm:        " && npm --version 2>&1 || echo "NOT FOUND"
 	@printf "  Semgrep:    " && semgrep --version 2>&1 || echo "NOT FOUND"
 	@printf "  Bandit:     " && bandit --version 2>&1 || echo "NOT FOUND"
-	@printf "  ESLint:     " && eslint --version 2>&1 || echo "NOT FOUND"
+	@printf "  ESLint:     " && (test -x frontend/node_modules/.bin/eslint && frontend/node_modules/.bin/eslint --version 2>&1 || echo "NOT FOUND")
 	@printf "  CodeQL:     " && (backend/tools/codeql/codeql version --format=terse 2>&1 || codeql version --format=terse 2>&1 || echo "NOT FOUND")
-	@printf "  PostgreSQL: " && psql --version 2>&1 || echo "NOT FOUND"
+	@echo "  SQLite DB:  $$(test -f backend/data/vragent.db && echo 'backend/data/vragent.db' || echo 'NOT FOUND')"
 	@echo ""
 	@echo "  Semgrep rules: $$(find backend/data/semgrep-rules -name '*.yaml' 2>/dev/null | wc -l) rules"
 	@echo "  Advisory DB:   $$(test -f backend/data/advisories/manifest.json && echo 'present' || echo 'NOT FOUND')"
@@ -82,7 +82,7 @@ check-tools:
 
 # Create a new alembic migration
 migration:
-	cd backend && alembic revision --autogenerate -m "$(msg)"
+	cd backend && python -m alembic revision --autogenerate -m "$(msg)"
 
 # Clean up everything
 clean:

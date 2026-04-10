@@ -292,13 +292,14 @@ class PlannerAgent(BaseAgent):
             from sqlalchemy import select as _select
             from app.database import async_session as _async_session
             from app.models.dependency import Dependency, DependencyFinding
+            from app.orchestrator.agents.dependency import ACTIVE_DEPENDENCY_RELEVANCE
             async with _async_session() as session:
                 result = await session.execute(
                     _select(DependencyFinding, Dependency)
                     .join(Dependency, DependencyFinding.dependency_id == Dependency.id)
                     .where(
                         DependencyFinding.scan_id == ctx.scan_id,
-                        DependencyFinding.relevance == "likely_used",
+                        DependencyFinding.relevance.in_(ACTIVE_DEPENDENCY_RELEVANCE),
                     )
                     .limit(10)
                 )

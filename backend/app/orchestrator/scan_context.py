@@ -129,10 +129,21 @@ class ScanContext:
 
     # Scanner instances (created once per scan, reused across agents)
     scanners: dict = field(default_factory=dict)  # name -> ScannerAdapter instance
+    scanner_config: dict[str, bool] = field(default_factory=dict)  # name -> enabled by scan config
+    scanner_availability: dict[str, str] = field(default_factory=dict)  # name -> enabled/disabled/unavailable
 
     # Scanner results summary
     scanner_hit_counts: dict[str, int] = field(default_factory=dict)
+    scanner_runs: dict[str, dict] = field(default_factory=dict)  # name -> run status summary
+    degraded_coverage: bool = False
     baseline_rule_dirs: list[str] = field(default_factory=list)  # Semgrep dirs used in baseline
+    baseline_rule_count: int = 0
+
+    # Repo scope / ignore tracking
+    repo_ignore_file: str | None = None
+    ignored_paths: list[str] = field(default_factory=list)
+    managed_paths_ignored: list[str] = field(default_factory=list)
+    ignored_file_count: int = 0
 
     # Call graph and import resolution (built during triage, no LLM needed)
     call_graph: object | None = None  # CallGraph instance (from app.analysis.call_graph)
@@ -235,6 +246,41 @@ class ScanContext:
                 dynamic_boost=boost,
                 referenced_by=1,
             )
+
+    def record_scanner_run(
+        self,
+        scanner_name: str,
+        *,
+        success: bool,
+        hit_count: int,
+        duration_ms: int,
+        errors: list[str] | None = None,
+        status: str | None = None,
+    ) -> dict:
+        """Record a scanner execution summary for reporting and UI surfaces."""
+        cleaned_errors = [e.strip() for e in (errors or []) if isinstance(e, str) and e.strip()]
+        resolved_status = status
+        if not resolved_status:
+            if not success:
+                resolved_status = "failed"
+            elif cleaned_errors:
+                resolved_status = "degraded"
+            else:
+                resolved_status = "completed"
+
+        summary = {
+            "scanner": scanner_name,
+            "status": resolved_status,
+            "success": success,
+            "hit_count": hit_count,
+            "duration_ms": duration_ms,
+            "errors": cleaned_errors,
+        }
+        self.scanner_runs[scanner_name] = summary
+        self.scanner_hit_counts[scanner_name] = hit_count
+        if resolved_status in {"failed", "degraded"}:
+            self.degraded_coverage = True
+        return summary
 
     def get_hot_files(self, limit: int = 10) -> list[str]:
         """

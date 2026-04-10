@@ -1,0 +1,1 @@
+{"generated_at":"2026-04-10T00:39:22.251581","strategy_version":1,"stats":{"enriched_advisories":1,"extracted_vulnerable_functions":1},"advisories":{"GHSA-h6x7-r5rg-x5fw":{"vulnerable_functions":["serverpod_client"],"sources":["details_inline_code"]}}}

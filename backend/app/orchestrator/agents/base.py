@@ -103,6 +103,12 @@ class BaseAgent(ABC):
             "findings_count": len([f for f in ctx.candidate_findings if f.confidence >= 0.5]),
             "files_processed": ctx.files_processed,
             "files_total": ctx.files_total,
+            "ai_calls_made": ctx.ai_calls_made,
+            "detail": {
+                "scanner_runs": ctx.scanner_runs,
+                "degraded_coverage": ctx.degraded_coverage,
+                "ignored_file_count": ctx.ignored_file_count,
+            },
         })
 
     async def log_decision(

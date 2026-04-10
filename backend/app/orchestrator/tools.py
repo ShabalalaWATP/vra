@@ -14,6 +14,7 @@ Tools:
   - get_all_scanner_hits: Get all scanner results for the scan
   - run_semgrep: Run Semgrep on specific files with specific rules
   - run_bandit: Run Bandit on specific files
+  - run_codeql: Run targeted CodeQL suites on specific files
   - query_findings: Get current candidate findings
   - query_taint_flows: Get discovered taint flows
   - get_file_imports: Get imports/requires from a file
@@ -29,10 +30,11 @@ from pathlib import Path
 from app.analysis.paths import (
     is_binary_extension,
     is_safe_path,
+    load_repo_path_policy,
     normalise_path,
     relative_to_repo,
     safe_read_file,
-    should_skip_dir,
+    should_skip_repo_path,
 )
 from app.analysis.treesitter import parse_file, is_available as ts_available
 from app.orchestrator.scan_context import ScanContext
@@ -61,6 +63,7 @@ class AgentToolkit:
         self.ctx = ctx
         self.repo = Path(ctx.repo_path)
         self._resolved_repo = self.repo.resolve()
+        self._path_policy = load_repo_path_policy(self.repo)
 
     # ── File Tools ────────────────────────────────────────────────
 
@@ -186,17 +189,13 @@ class AgentToolkit:
             return ToolResult(success=False, error=f"Invalid regex: {e}")
 
         matches = []
-        skip_dirs = {
-            "node_modules", ".git", "__pycache__", ".venv", "venv",
-            "dist", "build", ".next", "target", "vendor",
-        }
 
         for path in self.repo.rglob(file_glob):
             if len(matches) >= max_results:
                 break
             if not path.is_file():
                 continue
-            if any(skip in path.parts for skip in skip_dirs):
+            if should_skip_repo_path(path, self.repo, policy=self._path_policy):
                 continue
             if is_binary_extension(str(path)):
                 continue
@@ -240,7 +239,7 @@ class AgentToolkit:
             for item in sorted(target.iterdir()):
                 if item.name.startswith(".") and item.name != ".env":
                     continue
-                if should_skip_dir(item.name):
+                if should_skip_repo_path(item, self.repo, policy=self._path_policy):
                     continue
 
                 rel = normalise_path(relative_to_repo(item, self.repo))
@@ -323,7 +322,7 @@ class AgentToolkit:
 
     async def get_scanner_hits(self, file_path: str) -> ToolResult:
         """Get all scanner results for a specific file."""
-        from sqlalchemy import select
+        from sqlalchemy import case, select
         from app.database import async_session
         from app.models.file import File
         from app.models.scanner_result import ScannerResult
@@ -469,6 +468,42 @@ class AgentToolkit:
         except Exception as e:
             return ToolResult(success=False, error=str(e))
 
+    async def run_codeql_on_files(
+        self, files: list[str], queries: list[str] | None = None
+    ) -> ToolResult:
+        """Run targeted CodeQL query suites on specific files."""
+        scanners = self.ctx.scanners
+        if not scanners:
+            from app.scanners.registry import get_available_scanners
+            scanners = await get_available_scanners()
+        if "codeql" not in scanners:
+            return ToolResult(success=False, error="CodeQL not available")
+
+        try:
+            safe_files = self.normalise_repo_files(files)
+            if not safe_files:
+                return ToolResult(success=False, error="No valid repo files supplied")
+            output = await scanners["codeql"].run_targeted(self.repo, safe_files, queries or [])
+            hits = [
+                {
+                    "rule_id": h.rule_id,
+                    "severity": h.severity,
+                    "message": h.message,
+                    "file": h.file_path,
+                    "line": h.start_line,
+                    "snippet": (h.snippet or "")[:200],
+                    "data_flow_steps": len((h.metadata or {}).get("data_flow_steps", [])),
+                }
+                for h in output.hits
+            ]
+            return ToolResult(
+                success=output.success,
+                data=hits,
+                error="; ".join(output.errors) if output.errors else "",
+            )
+        except Exception as e:
+            return ToolResult(success=False, error=str(e))
+
     # ── State Query Tools ─────────────────────────────────────────
 
     async def query_findings(
@@ -536,6 +571,11 @@ class AgentToolkit:
                     select(DependencyFinding, Dependency)
                     .join(Dependency, DependencyFinding.dependency_id == Dependency.id)
                     .where(DependencyFinding.scan_id == self.ctx.scan_id)
+                    .order_by(
+                        case((DependencyFinding.risk_score.is_(None), 1), else_=0),
+                        DependencyFinding.risk_score.desc(),
+                        DependencyFinding.severity.desc(),
+                    )
                 )
                 if severity:
                     query = query.where(DependencyFinding.severity == severity)
@@ -554,7 +594,13 @@ class AgentToolkit:
                         "summary": df.summary,
                         "affected_range": df.affected_range,
                         "fixed_version": df.fixed_version,
+                        "evidence_type": df.evidence_type,
                         "relevance": df.relevance,
+                        "usage_evidence": df.usage_evidence,
+                        "reachability_status": df.reachability_status,
+                        "reachability_confidence": df.reachability_confidence,
+                        "risk_score": df.risk_score,
+                        "risk_factors": df.risk_factors,
                         "ai_assessment": df.ai_assessment,
                         "source_file": dep.source_file,
                         "is_dev": dep.is_dev,
@@ -1192,6 +1238,21 @@ class AgentToolkit:
                     },
                 },
             },
+            "run_codeql_on_files": {
+                "type": "function",
+                "function": {
+                    "name": "run_codeql_on_files",
+                    "description": "Run targeted CodeQL query suites on specific files.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "files": {"type": "array", "items": {"type": "string"}},
+                            "queries": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["files"],
+                    },
+                },
+            },
             "get_android_manifest": {
                 "type": "function",
                 "function": {
@@ -1267,6 +1328,7 @@ class AgentToolkit:
             "find_files_importing",
             "run_semgrep_on_files",
             "run_bandit_on_files",
+            "run_codeql_on_files",
         ]
         if source_type in ("apk", "aab", "dex", "jar"):
             ordered.extend([
@@ -1301,6 +1363,7 @@ class AgentToolkit:
             {"name": "get_all_scanner_hits", "description": "Get all scanner results across the scan", "params": "scanner=None, severity=None, limit=50"},
             {"name": "run_semgrep_on_files", "description": "Run Semgrep on specific files with optional rules", "params": "files, rules=None"},
             {"name": "run_bandit_on_files", "description": "Run Bandit on specific Python files", "params": "files, rules=None"},
+            {"name": "run_codeql_on_files", "description": "Run targeted CodeQL query suites on specific files", "params": "files, queries=None"},
             {"name": "query_findings", "description": "Get current candidate findings", "params": "status=None, severity=None"},
             {"name": "query_taint_flows", "description": "Get discovered taint flows", "params": "unsanitised_only=False"},
             {"name": "query_dependency_findings", "description": "Get vulnerable dependencies with CVE details", "params": "severity=None, relevance=None"},

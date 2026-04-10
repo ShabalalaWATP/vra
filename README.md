@@ -6,7 +6,7 @@
   <img src="frontend/public/logo.jpg" alt="VRAgent Logo" width="200" />
 </p>
 
-VRAgent is a production-grade, fully offline security analysis platform that combines deterministic static analysis tools (Semgrep, Bandit, ESLint, CodeQL) with AI-driven multi-pass code inspection to produce analyst-quality vulnerability reports. It is designed to run in air-gapped environments with no internet dependency at runtime.
+VRAgent is a production-grade, fully offline security analysis platform that combines deterministic static analysis tools (Semgrep, Bandit, ESLint, CodeQL, secret scanning, dependency auditing) with AI-driven multi-pass code inspection to produce analyst-quality vulnerability reports. It is designed to run in air-gapped environments with no internet dependency at runtime.
 
 VRAgent is **not** a scanner dashboard. It is **not** an LLM wrapper. It is a hybrid agentic system where:
 
@@ -50,11 +50,13 @@ VRAgent is **not** a scanner dashboard. It is **not** an LLM wrapper. It is a hy
 ## Features
 
 - **Fully offline / air-gapped** — no runtime internet calls. All rules, advisories, icons, and assets are local
-- **6 integrated scanners** — Semgrep (1,952 rules), Bandit, ESLint (45+ security rules), CodeQL (2,000+ security queries), secrets scanner (50+ patterns), dependency auditor (257K advisories)
-- **257,000+ vulnerability advisories** — offline OSV database covering npm, PyPI, Maven, Go, Crates, NuGet, RubyGems, Packagist, Pub, Hex
+- **6 integrated scanners** — Semgrep (1,952 rules), Bandit, ESLint (curated JS/TS security policy), CodeQL (2,000+ security queries), secrets scanner (50+ patterns), dependency auditor (258K advisories with alias-aware package matching)
+- **Scanner provenance captured per scan** — VRAgent stores the exact Semgrep, Bandit, ESLint, CodeQL, secrets, advisory DB, and LLM model versions used for every scan
+- **258,000+ vulnerability advisories** — offline OSV database covering npm, PyPI, Maven, Go, Crates, NuGet, RubyGems, Packagist, Pub, Hex, with per-ecosystem enrichment for vulnerable-function correlation
 - **7 specialised AI agents** — triage, architecture, dependency risk, investigation, rule selection, verification, reporting
 - **Agentic multi-pass investigation** — the AI planner chooses between 7 actions (INVESTIGATE_FILES, TRACE_FLOW, DEEP_DIVE, CROSS_REFERENCE, TARGETED_SCAN, VERIFY_EARLY, STOP) based on live scan state
 - **20 AI tools** — file reading, code search, call graph traversal, import resolution, taint flow queries, scanner execution, dependency queries, Android-specific tools
+- **Config / IaC / template review** — the AI investigates JSON, YAML, TOML, XML, HTML, Dockerfiles, compose files, manifests, and lockfiles as first-class security inputs instead of treating them as out-of-scope noise
 - **Taint tracking** — AI-inferred source-to-sink data flow analysis verified against static call graphs with inter-procedural resolution
 - **Call graph & import resolution** — static call graph construction, import resolution across files, callers/callees queries exposed to AI
 - **Exploit validation & PoC generation** — the verifier agent assesses exploitability and generates proof-of-concept templates
@@ -137,14 +139,14 @@ VRAgent is **not** a scanner dashboard. It is **not** an LLM wrapper. It is a hy
 └───────────────────────────────┬──────────────────────────────────────┘
                                 │
 ┌───────────────────────────────┴──────────────────────────────────────┐
-│                        POSTGRESQL 16                                  │
+│                         SQLITE DATABASE                                │
 │  projects · scans · files · findings · evidence · reports · exports   │
 │  dependencies · secrets · scanner_results · symbols · agent_decisions │
 └──────────────────────────────────────────────────────────────────────┘
                                 │
 ┌───────────────────────────────┴──────────────────────────────────────┐
 │                       OFFLINE DATA STORES                             │
-│  1,952 Semgrep rules │ 45+ ESLint security rules │ CodeQL query packs │
+│  1,952 Semgrep rules │ Curated ESLint JS/TS policy │ CodeQL query packs │
 │  257K OSV advisories │ 449 technology SVG icons │ Bundled fonts        │
 └──────────────────────────────────────────────────────────────────────┘
                                 │
@@ -213,6 +215,7 @@ The Triage Agent rapidly fingerprints the codebase:
 - **File priority scoring** — scores every file using 15+ deterministic signals (entry points, routes, auth code, DB access, crypto, deserialization, scanner hit density, dependency risk proximity), boosted by documentation intelligence
 - **Call graph construction** — static call graph built from import analysis and call site matching across files
 - **Structural metadata extraction** — Tree-sitter parsing for symbol extraction (functions, classes, imports, routes)
+- **Scan provenance snapshot** — persists the exact scanner versions, advisory DB version, and selected LLM model into `scan_configs`
 
 ### Stage 2: Application Understanding
 
@@ -230,8 +233,9 @@ The Architecture Agent builds a mental model of the application:
 The Dependency Risk Agent matches all project dependencies against the offline advisory database:
 
 - **Parses manifests and lockfiles** — package.json, package-lock.json, requirements.txt, Pipfile.lock, pom.xml, build.gradle, go.sum, Cargo.lock, *.csproj, Gemfile.lock, composer.lock, pubspec.lock, mix.lock
-- **Matches against 257,000+ OSV advisories** — with CVE IDs, CVSS scores, CWE classifications, affected version ranges, fixed versions, vulnerable functions
-- **Assesses exploitability** — AI evaluates whether the vulnerable dependency is actually used in a security-relevant way
+- **Matches against 258,000+ OSV advisories** — with canonical package matching, aliases, CVE IDs, CVSS scores, CWE classifications, affected version ranges, fixed versions, and vulnerable functions
+- **Uses import-graph-first reachability** — correlates vulnerable dependencies to files through resolved external imports before falling back to text heuristics
+- **Assesses exploitability** — AI distinguishes manifest-only, imported-package, and symbol-usage evidence before escalating dependency risk
 - **Boosts file scores** — files that import vulnerable packages get their investigation priority increased (feedback loop)
 
 ### Stage 4: Agentic Vulnerability Investigation
@@ -247,8 +251,11 @@ The Investigator Agent performs multi-pass adaptive investigation — this is th
   - `VERIFY_EARLY` — challenge a finding before continuing
   - `STOP` — the planner decides enough evidence has been collected
 - **AI reads actual source files** — functions, classes, configuration, surrounding context
+- **Config and deployment artifacts stay in scope** — JSON/YAML/TOML/XML/HTML templates, Dockerfiles, compose files, manifests, and lockfiles can be escalated into deep review when they shape runtime behavior or security posture
 - **Taint flow tracing** — identifies where untrusted input enters, how it propagates, and where it reaches dangerous sinks
 - **Call graph verification** — uses the static call graph to verify whether traced paths are actually reachable
+- **Package-aware advisory correlation** — vulnerable-function hits are strengthened when the affected package is imported in the file; bare symbol-name overlaps remain weak leads only
+- **Richer inline scanner evidence** — the investigator carries snippets, CodeQL flow summaries, and dependency metadata directly into the main reasoning prompt before falling back to tools
 - **Evidence collection** — each candidate finding accumulates supporting evidence and opposing evidence
 - **Adaptive re-prioritisation** — file scores are updated during investigation based on what's been discovered
 - **Pass budgets by scan mode** — Light: 1 pass, Regular: 2 passes, Heavy: 3+ passes
@@ -289,6 +296,7 @@ Throughout the pipeline, VRAgent manages the AI's context window intelligently:
 - **Token estimation** — conservative estimate of ~3.2 characters per token
 - **Pre-send validation** — every prompt is validated against the model's context window before sending
 - **Auto-truncation** — if a prompt exceeds the budget, content is truncated with a clear marker
+- **Head/tail preservation** — truncation keeps both the start and end of oversized messages so code context and conclusions survive compaction pressure
 - **Adaptive compaction** — between stages, if the accumulated context exceeds a threshold, a compaction pass summarises what's been learned and releases memory
 - **Compaction thresholds scale with model size** — smaller models compact more aggressively
 - **Supports 128K, 200K, and 400K token windows** — configurable per LLM profile
@@ -370,7 +378,7 @@ VRAgent ships with 1,952 bundled Semgrep rules covering:
 | Swift | ~30 | iOS, crypto, keychain |
 | Generic | ~42 | secrets, credentials, hardcoded keys (all languages) |
 
-**Baseline scan** uses language-filtered core rules for speed. **Targeted scans** use the full rule set, selected by the Rule Selector Agent based on discovered suspicions.
+**Baseline scan** uses repo-aware language and framework packs for speed. **Targeted scans** add suspicion-driven packs, skip coverage already present in baseline, and avoid irrelevant rule families.
 
 Rules are stored in `backend/data/semgrep-rules/` organised by language directory.
 
@@ -386,17 +394,20 @@ Python-specific security analysis:
 
 ### ESLint
 
-JavaScript/TypeScript security analysis with a custom security configuration:
-- Unsafe DOM manipulation (innerHTML, document.write)
-- eval() and Function() usage
-- Prototype pollution patterns
-- Missing security headers
+JavaScript/TypeScript security analysis with a curated ESLint security policy:
+- DOM XSS sinks, dynamic code execution, dynamic module loading, and open redirect patterns
+- Node.js command execution, filesystem, crypto, TLS, VM, redirect, and deserialization APIs
+- React/browser sink coverage such as `dangerouslySetInnerHTML`, `srcdoc`, `postMessage`, and `window.open`
+- TypeScript-specific checks for `@ts-ignore`, `as any`, and non-null assertions in security-relevant paths
+- Uses `@typescript-eslint/parser` when available and bootstraps bundled frontend dependencies before falling back to JS-only analysis
 
 ### CodeQL
 
 Deep semantic analysis with deterministic taint tracking:
 - Creates language-specific databases (Python, JavaScript, Java, Go, Ruby, C#, C/C++, Swift)
+- Auto-selects build strategy for compiled languages, preferring repo wrappers and explicit build commands before falling back to autobuild
 - Runs pre-compiled security query packs
+- Baseline query plans vary by scan mode, and overlapping targeted suites are normalized and deduplicated before analysis
 - SARIF output with full taint flow paths
 - Databases are cached per scan for reuse across multiple query runs
 
@@ -414,13 +425,15 @@ Offline regex + entropy detection for 40+ secret patterns:
 
 ### Dependency Auditor
 
-Offline vulnerability matching against 257,000+ OSV advisories:
+Offline vulnerability matching against 258,000+ OSV advisories:
 - Supports 10 ecosystems: npm, PyPI, Maven, Go, Crates, NuGet, RubyGems, Packagist, Pub, Hex
-- Version range matching using semver and PEP 440
+- Ecosystem-aware version range matching using PEP 440 where available and semver-style comparison elsewhere
+- Canonical package-name normalization plus alias matching for Maven artifact IDs and import/package mismatches
 - CVE IDs, CVSS scores, CWE classifications
 - Affected version ranges and fixed version information
-- Vulnerable function lists where available
-- AI-assessed relevance (is the vulnerable code path actually used?)
+- Import-graph-first reachability, with text heuristics only as fallback evidence
+- Vulnerable function lists and per-ecosystem enrichment, with package-aware advisory/function correlation
+- AI-assessed relevance (manifest-only vs imported-package vs symbol-usage evidence)
 
 ---
 
@@ -512,118 +525,23 @@ VRAgent reads project documentation early in the scan to inform the AI's investi
 
 ## Database Schema
 
-VRAgent uses PostgreSQL 16 with the following schema:
+VRAgent uses a local SQLite database with the following schema:
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────────┐
-│   projects   │────→│    scans     │────→│   scan_configs   │
-│              │     │              │     │                  │
-│ id           │     │ id           │     │ scan_id          │
-│ name         │     │ project_id   │     │ scanners (JSONB) │
-│ description  │     │ llm_profile_id│    │ llm_model        │
-│ repo_path    │     │ mode         │     │ scan_mode        │
-│ created_at   │     │ status       │     └──────────────────┘
-│ updated_at   │     │ current_phase│
-└──────────────┘     │ current_task │     ┌──────────────────┐
-                     │ started_at   │────→│   scan_events    │
-                     │ completed_at │     │                  │
-                     │ error_message│     │ scan_id          │
-                     └──────┬───────┘     │ phase            │
-                            │             │ level            │
-                     ┌──────┴───────┐     │ message          │
-                     │    files     │     │ detail (JSONB)   │
-                     │              │     │ created_at       │
-                     │ id           │     └──────────────────┘
-                     │ scan_id      │
-                     │ path         │     ┌──────────────────┐
-                     │ language     │────→│  file_summaries  │
-                     │ size_bytes   │     │                  │
-                     │ line_count   │     │ file_id          │
-                     │ priority_score│    │ summary          │
-                     │ score_reasons│     │ purpose          │
-                     │ is_test      │     │ layer            │
-                     │ is_config    │     │ security_notes   │
-                     │ is_generated │     └──────────────────┘
-                     └──────┬───────┘
-                            │
-          ┌─────────────────┼─────────────────┐
-          │                 │                 │
-   ┌──────┴───────┐ ┌──────┴───────┐ ┌───────┴──────┐
-   │   findings   │ │  symbols     │ │  secret_     │
-   │              │ │              │ │  candidates  │
-   │ id           │ │ file_id      │ │              │
-   │ scan_id      │ │ name         │ │ scan_id      │
-   │ title        │ │ type         │ │ file_path    │
-   │ severity     │ │ line         │ │ line_number  │
-   │ confidence   │ └──────────────┘ │ pattern      │
-   │ category     │                  │ confidence   │
-   │ description  │                  │ entropy_score│
-   │ explanation  │                  └──────────────┘
-   │ impact       │
-   │ remediation  │     ┌──────────────────────┐
-   │ code_snippet │────→│      evidence        │
-   │ status       │     │                      │
-   │ exploit_     │     │ finding_id           │
-   │  difficulty  │     │ file_id              │
-   │ exploit_     │     │ type (supporting/    │
-   │  prerequisites│    │       opposing/      │
-   │ exploit_     │     │       contextual)    │
-   │  template    │     │ description          │
-   │ attack_      │     │ code_snippet         │
-   │  scenario    │     │ line_range           │
-   └──────────────┘     │ source               │
-                        └──────────────────────┘
-
-   ┌──────────────┐     ┌──────────────────────┐
-   │ dependencies │────→│ dependency_findings  │
-   │              │     │                      │
-   │ scan_id      │     │ dependency_id        │
-   │ ecosystem    │     │ advisory_id          │
-   │ name         │     │ cve_id               │
-   │ version      │     │ severity             │
-   │ source_file  │     │ cvss_score           │
-   │ is_dev       │     │ summary              │
-   └──────────────┘     │ affected_range       │
-                        │ fixed_version        │
-                        │ cwes (JSONB)         │
-                        │ vulnerable_functions │
-                        │ relevance            │
-                        │ ai_assessment        │
-                        └──────────────────────┘
-
-   ┌──────────────────┐     ┌──────────────────┐
-   │ agent_decisions  │     │ compaction_       │
-   │                  │     │  summaries        │
-   │ scan_id          │     │                   │
-   │ agent            │     │ scan_id           │
-   │ phase            │     │ phase             │
-   │ action           │     │ summary           │
-   │ reasoning        │     │ key_facts (JSONB) │
-   │ files_inspected  │     └──────────────────┘
-   │ tokens_used      │
-   │ duration_ms      │     ┌──────────────────┐
-   └──────────────────┘     │    reports       │
-                            │                  │
-   ┌──────────────────┐     │ scan_id          │
-   │  llm_profiles    │     │ app_summary      │
-   │                  │     │ architecture     │
-   │ id               │     │ diagram_spec     │
-   │ name             │     │ diagram_image    │
-   │ base_url         │     │ methodology      │
-   │ api_key          │     │ limitations      │
-   │ model_name       │     │ tech_stack(JSONB)│
-   │ cert_path        │     │ report_html      │
-   │ timeout_seconds  │     └────────┬─────────┘
-   │ context_window   │              │
-   │ max_output_tokens│     ┌────────┴─────────┐
-   │ use_max_         │     │export_artifacts  │
-   │  completion_     │     │                  │
-   │  tokens          │     │ report_id        │
-   │ concurrency      │     │ format           │
-   └──────────────────┘     │ file_path        │
-                            │ file_size        │
-                            └──────────────────┘
-```
+- `projects` and `scans` track uploaded targets, scan lifecycle state, counters, and phase progress.
+- `scan_configs` snapshots the scan settings and provenance:
+  `scanners`, `scan_mode`, `llm_model`, `semgrep_version`, `bandit_version`,
+  `eslint_version`, `codeql_version`, `secrets_version`, and `advisory_db_ver`.
+- `files`, `symbols`, and `file_summaries` store indexed source files, extracted symbols/routes/imports, and AI-generated file summaries.
+- `findings`, `evidence`, and `secret_candidates` store verified vulnerabilities, supporting/opposing evidence, exploit metadata, and secret scan candidates.
+- `dependencies` stores one row per deduplicated dependency identity
+  (`ecosystem`, `name`, `version`, `source_file`, `is_dev`), and
+  `dependency_findings` stores advisory-level detail such as `advisory_id`,
+  `cve_id`, `evidence_type`, `usage_evidence`, `reachability_status`,
+  `reachability_confidence`, `risk_score`, `risk_factors`, `fixed_version`,
+  `cwes`, and `vulnerable_functions`.
+- `reports` and `export_artifacts` store the final narrative report, diagrams, SBOM, OWASP mapping, scan coverage, and exported PDF/DOCX artifacts.
+- `agent_decisions`, `compaction_summaries`, `scan_events`, and `llm_profiles`
+  persist AI decision logs, compaction state, terminal-style event history, and reusable model configurations.
 
 ---
 
@@ -785,18 +703,19 @@ vragent/
 │   │   │   ├── swift/                 # ~30 Swift rules
 │   │   │   └── generic/               # ~42 generic rules (secrets, etc.)
 │   │   │
-│   │   ├── advisories/                # OSV vulnerability database
-│   │   │   ├── npm.json               # npm advisories
-│   │   │   ├── pypi.json              # PyPI advisories
-│   │   │   ├── maven.json             # Maven advisories
-│   │   │   ├── go.json                # Go advisories
-│   │   │   ├── crates.json            # Crates.io advisories
-│   │   │   ├── nuget.json             # NuGet advisories
-│   │   │   ├── rubygems.json          # RubyGems advisories
-│   │   │   ├── packagist.json         # Packagist advisories
-│   │   │   ├── pub.json               # Pub (Dart) advisories
-│   │   │   ├── hex.json               # Hex (Elixir) advisories
-│   │   │   └── manifest.json          # DB version, sync date, counts
+│   │   ├── advisories/                # OSV vulnerability database + enrichment
+│   │   │   ├── VERSION                # Database version string
+│   │   │   ├── manifest.json          # Sync date, counts, enrichment metadata
+│   │   │   ├── npm/
+│   │   │   │   ├── advisories.json
+│   │   │   │   └── enrichment.json
+│   │   │   ├── pypi/
+│   │   │   │   ├── advisories.json
+│   │   │   │   └── enrichment.json
+│   │   │   ├── maven/
+│   │   │   │   ├── advisories.json
+│   │   │   │   └── enrichment.json
+│   │   │   └── ...                    # go, crates, nuget, rubygems, packagist, pub, hex
 │   │   │
 │   │   ├── eslint-configs/            # Security ESLint configuration
 │   │   │   └── security.json
@@ -890,7 +809,7 @@ VRAgent is designed for environments with no direct internet access at runtime. 
 |-----------|---------|---------|
 | Python | 3.11 or higher | Backend runtime |
 | Node.js | 18 or higher | Frontend build |
-| PostgreSQL | 16 | Data persistence |
+| SQLite | bundled | Data persistence |
 | Git | 2.x | Optional — for repo analysis features |
 | Semgrep | Latest | Static analysis scanner |
 | Bandit | Latest | Python security scanner |
@@ -946,7 +865,7 @@ cd ..
 
 This downloads the official Semgrep community rules from GitHub and organises them by language. Output size: ~50MB.
 
-#### 5. Download OSV Advisory Database (257,000+ advisories)
+#### 5. Download OSV Advisory Database (258,000+ advisories)
 
 ```bash
 cd backend
@@ -990,13 +909,9 @@ pip install bandit
 #### 9. Download ESLint
 
 ```bash
-# Create an ESLint package for offline use
-mkdir -p offline-packages/eslint
-cd offline-packages/eslint
-npm init -y
-npm install eslint @eslint/js --save
-tar czf ../eslint-bundle.tar.gz .
-cd ../..
+# No separate ESLint bundle is needed.
+# ESLint is included in frontend/node_modules, so the node_modules
+# archive prepared above already contains the scanner binary.
 ```
 
 #### 10. Package Everything for Transfer
@@ -1131,25 +1046,16 @@ npm --version
 # Expected: 9.x.x or higher
 ```
 
-**PostgreSQL 16**
+**SQLite**
 
-Download from `https://www.postgresql.org/download/windows/` or install via your package manager. Use the EnterpriseDB installer on Windows.
+SQLite is the default persistence layer. No separate database server is required.
 
 ```powershell
-# During installation:
-# - Set password for postgres user
-# - Default port: 5432
-# - Install pgAdmin (optional but helpful)
-
-# After installation, create the VRAgent database:
-psql -U postgres
-```
-
-```sql
-CREATE USER vragent WITH PASSWORD 'vragent';
-CREATE DATABASE vragent OWNER vragent;
-GRANT ALL PRIVILEGES ON DATABASE vragent TO vragent;
-\q
+# The repo ships with backend\data\vragent.db, and the installer will
+# create or migrate it automatically if it does not exist yet.
+# To run migrations manually:
+cd backend
+python -m alembic upgrade head
 ```
 
 **Semgrep**
@@ -1209,21 +1115,23 @@ tar xzf C:\path\to\codeql-bundle-win64.tar.gz
 .\codeql\codeql.exe version
 ```
 
-#### Step 6: Install ESLint (for JS/TS scanning)
+#### Step 6: Install Frontend Tooling (includes ESLint for JS/TS scanning)
 
 ```powershell
-# ESLint can be installed globally or locally
-npm install -g eslint
-# Or from offline bundle:
-cd ..\offline-packages\eslint
-npm install -g .
+# ESLint is included in frontend/node_modules when frontend deps are present.
+# From an online clone:
+cd ..\frontend
+npm ci
+
+# Or from the offline node_modules bundle:
+# node_modules/ should already be extracted in frontend/
 ```
 
 #### Step 7: Run Database Migrations
 
 ```powershell
 cd ..\..\backend
-alembic upgrade head
+python -m alembic upgrade head
 ```
 
 #### Step 8: Start VRAgent
@@ -1271,28 +1179,21 @@ python3 --version   # 3.11+
 node --version       # v18+
 npm --version        # 9+
 
-# PostgreSQL 16
-sudo apt install -y postgresql-16 postgresql-client-16
-
 # Build tools (needed for some Python packages)
-sudo apt install -y build-essential libpq-dev libffi-dev
+sudo apt install -y build-essential libffi-dev
 
 # WeasyPrint dependencies (for PDF generation)
 sudo apt install -y libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 \
     libcairo2 libffi-dev shared-mime-info
 ```
 
-#### Step 2: Configure PostgreSQL
+#### Step 2: Prepare SQLite database path
 
 ```bash
-sudo -u postgres psql
-```
-
-```sql
-CREATE USER vragent WITH PASSWORD 'vragent';
-CREATE DATABASE vragent OWNER vragent;
-GRANT ALL PRIVILEGES ON DATABASE vragent TO vragent;
-\q
+mkdir -p backend/data
+cd backend
+python -m alembic upgrade head
+cd ..
 ```
 
 #### Step 3: Extract VRAgent
@@ -1336,13 +1237,13 @@ cd ../frontend
 tar xzf ../offline-packages/node_modules.tar.gz
 
 # Or with internet:
-npm install
+npm ci
 ```
 
-#### Step 7: Install ESLint
+#### Step 7: Verify ESLint
 
 ```bash
-npm install -g eslint
+test -x node_modules/.bin/eslint && node_modules/.bin/eslint --version
 ```
 
 #### Step 8: Install CodeQL (Optional)
@@ -1359,7 +1260,7 @@ chmod +x codeql/codeql
 ```bash
 cd ..
 source venv/bin/activate
-alembic upgrade head
+python -m alembic upgrade head
 ```
 
 #### Step 10: Start VRAgent
@@ -1395,7 +1296,7 @@ Open your browser to `http://localhost:3000`
 docker compose up -d
 ```
 
-This starts PostgreSQL, the backend, and the frontend in containers. Open `http://localhost:3000`.
+This starts the backend and frontend in containers and persists the SQLite database at `backend/data/vragent.db`. Open `http://localhost:3000`.
 
 ---
 
@@ -1432,7 +1333,7 @@ All configuration is via environment variables with the `VRAGENT_` prefix, or vi
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VRAGENT_DATABASE_URL` | `postgresql+asyncpg://vragent:vragent@localhost:5432/vragent` | PostgreSQL connection string |
+| `VRAGENT_DATABASE_URL` | `sqlite+aiosqlite:///backend/data/vragent.db` | SQLite connection string |
 | `VRAGENT_HOST` | `0.0.0.0` | Backend bind address |
 | `VRAGENT_PORT` | `8000` | Backend port |
 | `VRAGENT_DEBUG` | `false` | Debug mode |
@@ -1595,9 +1496,9 @@ Event types: `progress`, `event`, `finding`, `complete`
 - Verify `data/advisories/manifest.json` exists
 
 **"Database connection refused"**
-- Ensure PostgreSQL is running: `sudo systemctl status postgresql`
-- Verify the database exists: `psql -U vragent -d vragent`
-- Check `VRAGENT_DATABASE_URL` matches your PostgreSQL configuration
+- Ensure the SQLite database directory exists: `mkdir -p backend/data`
+- Run migrations: `cd backend && python -m alembic upgrade head`
+- Check `VRAGENT_DATABASE_URL` points at a writable SQLite file
 
 **"WebSocket connection failed"**
 - Ensure the backend is running on port 8000
@@ -1623,7 +1524,7 @@ Event types: `progress`, `event`, `finding`, `complete`
 **"Out of memory during scan"**
 - Large codebases can consume significant memory during Tree-sitter parsing
 - Reduce `VRAGENT_MAX_FILE_SIZE_BYTES` to skip very large files
-- Ensure PostgreSQL has adequate `shared_buffers` configured
+- Ensure the SQLite database file has enough free disk space and the containing directory is writable
 
 ### Logs
 

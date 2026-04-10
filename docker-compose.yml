@@ -1,33 +1,14 @@
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: vragent
-      POSTGRES_USER: vragent
-      POSTGRES_PASSWORD: vragent
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vragent"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   backend:
     build: ./backend
     ports:
       - "8000:8000"
     environment:
-      VRAGENT_DATABASE_URL: postgresql+asyncpg://vragent:vragent@db:5432/vragent
+      VRAGENT_DATABASE_URL: sqlite+aiosqlite:///app/data/vragent.db
       VRAGENT_CORS_ORIGINS: "http://localhost:3000,http://frontend:3000"
-    depends_on:
-      db:
-        condition: service_healthy
     volumes:
       - ./backend:/app
+      - ./frontend:/frontend
       - scan_data:/app/exports
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/api/health')"]
@@ -46,5 +27,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  pgdata:
   scan_data:

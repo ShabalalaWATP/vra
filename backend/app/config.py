@@ -4,6 +4,10 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings
 
+DEFAULT_DATA_DIR = (Path(__file__).resolve().parent.parent / "data").resolve()
+DEFAULT_SQLITE_DB = DEFAULT_DATA_DIR / "vragent.db"
+DEFAULT_DATABASE_URL = f"sqlite+aiosqlite:///{DEFAULT_SQLITE_DB.as_posix()}"
+
 # Ensure Python user scripts directory is on PATH (for pip install --user binaries)
 _user_scripts = sysconfig.get_path("scripts", f"{os.name}_user")
 if _user_scripts and os.path.isdir(_user_scripts) and _user_scripts not in os.environ.get("PATH", ""):
@@ -14,7 +18,7 @@ class Settings(BaseSettings):
     model_config = {"env_prefix": "VRAGENT_"}
 
     # Database
-    database_url: str = "postgresql+asyncpg://vragent:vragent@localhost:5432/vragent"
+    database_url: str = DEFAULT_DATABASE_URL
 
     # Server
     host: str = "0.0.0.0"
@@ -23,7 +27,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://localhost:5173"  # Comma-separated
 
     # Paths
-    data_dir: Path = Path(__file__).parent.parent / "data"
+    data_dir: Path = DEFAULT_DATA_DIR
     upload_dir: Path = Path(__file__).parent.parent / "uploads"
     export_dir: Path = Path(__file__).parent.parent / "exports"
 
@@ -34,6 +38,8 @@ class Settings(BaseSettings):
     codeql_binary: str = str(
         Path(__file__).parent.parent / "tools" / "codeql" / ("codeql.exe" if os.name == "nt" else "codeql")
     )
+    codeql_build_mode: str = "auto"  # auto, none, autobuild
+    codeql_build_command: str | None = None
     jadx_binary: str = "jadx"  # APK decompiler
 
     # Semgrep rules

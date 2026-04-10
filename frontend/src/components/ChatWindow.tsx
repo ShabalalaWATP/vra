@@ -20,9 +20,6 @@ interface ChatMessage {
 
 interface ChatWindowProps {
   scanId: string;
-  reportSummary: string;
-  riskGrade?: string;
-  findingsCount: number;
   currentFile?: string;
   currentFileContent?: string;
   initialPrompt?: string;
@@ -33,9 +30,6 @@ type ChatState = "closed" | "compact" | "expanded";
 
 export default function ChatWindow({
   scanId,
-  reportSummary,
-  riskGrade,
-  findingsCount,
   currentFile,
   currentFileContent,
   initialPrompt,

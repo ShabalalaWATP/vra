@@ -11,7 +11,7 @@
 #   - Semgrep rules (downloaded from GitHub)
 #   - OSV advisory database (downloaded from GCS)
 #   - Technology icons (downloaded from GitHub)
-#   - PostgreSQL database setup
+#   - SQLite database setup
 #   - Database migrations
 #
 # Usage:
@@ -20,7 +20,7 @@
 #   ./install.sh --skip-codeql      # Skip CodeQL download
 #   ./install.sh --skip-db          # Skip database setup
 #   ./install.sh --skip-data        # Skip data downloads
-#   ./install.sh --db-user myuser --db-password mypass --db-name mydb
+#   ./install.sh --db-path backend/data/custom.db
 #
 set -euo pipefail
 
@@ -33,11 +33,7 @@ OFFLINE=false
 SKIP_CODEQL=false
 SKIP_DB=false
 SKIP_DATA=false
-DB_USER="vragent"
-DB_PASSWORD="vragent"
-DB_NAME="vragent"
-DB_HOST="localhost"
-DB_PORT=5432
+DB_PATH="$BACKEND/data/vragent.db"
 
 # ── Parse arguments ────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -46,24 +42,16 @@ while [[ $# -gt 0 ]]; do
         --skip-codeql)  SKIP_CODEQL=true; shift ;;
         --skip-db)      SKIP_DB=true; shift ;;
         --skip-data)    SKIP_DATA=true; shift ;;
-        --db-user)      DB_USER="$2"; shift 2 ;;
-        --db-password)  DB_PASSWORD="$2"; shift 2 ;;
-        --db-name)      DB_NAME="$2"; shift 2 ;;
-        --db-host)      DB_HOST="$2"; shift 2 ;;
-        --db-port)      DB_PORT="$2"; shift 2 ;;
+        --db-path)      DB_PATH="$2"; shift 2 ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
             echo "  --offline        Install from offline packages only (no internet)"
             echo "  --skip-codeql    Skip CodeQL download"
-            echo "  --skip-db        Skip PostgreSQL setup and migrations"
+            echo "  --skip-db        Skip SQLite setup and migrations"
             echo "  --skip-data      Skip downloading rules, advisories, icons"
-            echo "  --db-user USER   PostgreSQL username (default: vragent)"
-            echo "  --db-password PW PostgreSQL password (default: vragent)"
-            echo "  --db-name NAME   PostgreSQL database (default: vragent)"
-            echo "  --db-host HOST   PostgreSQL host (default: localhost)"
-            echo "  --db-port PORT   PostgreSQL port (default: 5432)"
+            echo "  --db-path PATH   SQLite database path (default: backend/data/vragent.db)"
             exit 0
             ;;
         *)
@@ -137,15 +125,6 @@ else
     exit 1
 fi
 
-# PostgreSQL
-if [[ "$SKIP_DB" == false ]]; then
-    if has_cmd psql; then
-        step "PostgreSQL: $(psql --version)"
-    else
-        warn "psql not found. Database setup may require manual steps."
-    fi
-fi
-
 # ── Install Python backend ─────────────────────────────────────────
 header "Installing Backend Dependencies"
 
@@ -206,18 +185,24 @@ if [[ "$OFFLINE" == true ]]; then
         exit 1
     fi
 else
-    step "Running npm install..."
-    npm install 2>&1 | tail -3
+    if [[ -f "$FRONTEND/package-lock.json" ]]; then
+        step "Running npm ci..."
+        if ! npm ci 2>&1 | tail -3; then
+            warn "npm ci failed; falling back to npm install to refresh the lockfile."
+            npm install 2>&1 | tail -3
+        fi
+    else
+        step "Running npm install..."
+        npm install 2>&1 | tail -3
+    fi
 fi
 step "Frontend dependencies installed"
 
 # ESLint
-if has_cmd eslint; then
-    step "ESLint already installed"
+if [[ -x "$FRONTEND/node_modules/.bin/eslint" ]]; then
+    step "ESLint available locally: $FRONTEND/node_modules/.bin/eslint"
 else
-    step "Installing ESLint globally..."
-    npm install -g eslint 2>&1 | tail -1
-    has_cmd eslint && step "ESLint installed" || warn "ESLint global install may have failed"
+    warn "Local ESLint binary not found. VRAgent will bootstrap frontend dependencies on first ESLint scan."
 fi
 
 cd "$ROOT"
@@ -346,37 +331,18 @@ fi
 if [[ "$SKIP_DB" == false ]]; then
     header "Setting Up Database"
 
-    CONN_STR="postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
-
-    if has_cmd psql; then
-        step "Creating database '$DB_NAME' (if not exists)..."
-        export PGPASSWORD="$DB_PASSWORD"
-
-        # Check if database exists
-        DB_EXISTS=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres \
-            -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" 2>/dev/null || echo "")
-
-        if [[ "$DB_EXISTS" != "1" ]]; then
-            sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASSWORD';" 2>/dev/null || true
-            sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;" 2>/dev/null || true
-            sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" 2>/dev/null || true
-            step "Database created"
-        else
-            step "Database '$DB_NAME' already exists"
-        fi
-
-        unset PGPASSWORD
-    else
-        warn "psql not in PATH. Create the database manually:"
-        warn "  CREATE USER $DB_USER WITH PASSWORD '$DB_PASSWORD';"
-        warn "  CREATE DATABASE $DB_NAME OWNER $DB_USER;"
+    if [[ "$DB_PATH" != /* ]]; then
+        DB_PATH="$ROOT/$DB_PATH"
     fi
+    mkdir -p "$(dirname "$DB_PATH")"
+    CONN_STR="sqlite+aiosqlite:///${DB_PATH//\\//}"
+    step "Using SQLite database: $DB_PATH"
 
     # Run migrations
     step "Running database migrations..."
     cd "$BACKEND"
     export VRAGENT_DATABASE_URL="$CONN_STR"
-    alembic upgrade head 2>&1 | tail -1 || warn "Migration failed. Check PostgreSQL connection."
+    $PYTHON -m alembic upgrade head 2>&1 | tail -1 || warn "Migration failed. Check SQLite database path."
     cd "$ROOT"
 fi
 
@@ -395,7 +361,7 @@ check_item "Python backend"      "test -f $BACKEND/app/main.py"
 check_item "Frontend node_modules" "test -d $FRONTEND/node_modules"
 check_item "Semgrep"             "has_cmd semgrep"
 check_item "Bandit"              "has_cmd bandit"
-check_item "ESLint"              "has_cmd eslint"
+check_item "ESLint"              "test -x $FRONTEND/node_modules/.bin/eslint"
 check_item "CodeQL"              "test -f $BACKEND/tools/codeql/codeql"
 check_item "jadx"                "test -f $BACKEND/tools/jadx/bin/jadx"
 check_item "Semgrep rules"       "test $(find $BACKEND/data/semgrep-rules -name '*.yaml' 2>/dev/null | wc -l) -gt 100"

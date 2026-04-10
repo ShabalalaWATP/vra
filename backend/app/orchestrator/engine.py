@@ -23,7 +23,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import case, select
+from sqlalchemy.orm import selectinload
 
 from app.analysis.diagram import render_diagram_for_report
 from app.database import async_session
@@ -32,6 +33,7 @@ from app.models.llm_profile import LLMProfile
 from app.models.project import Project
 from app.models.report import Report
 from app.models.scan import Scan
+from app.api.scans import DEFAULT_SCANNERS, normalise_scanner_config
 from app.scanners.registry import get_available_scanners
 from app.orchestrator.agents.architecture import ArchitectureAgent
 from app.orchestrator.agents.dependency import DependencyRiskAgent
@@ -93,7 +95,13 @@ async def run_scan(scan_id: uuid.UUID) -> None:
 
     # ── Pre-scan validation ───────────────────────────────────────
     async with async_session() as session:
-        scan = await session.get(Scan, scan_id)
+        scan = (
+            await session.execute(
+                select(Scan)
+                .where(Scan.id == scan_id)
+                .options(selectinload(Scan.config))
+            )
+        ).scalar_one_or_none()
         if not scan:
             logger.error("Scan %s not found", scan_id)
             return
@@ -145,8 +153,23 @@ async def run_scan(scan_id: uuid.UUID) -> None:
         source_type=getattr(project, "source_type", "codebase"),
     )
 
-    # Create scanner instances once for the entire scan lifecycle
-    ctx.scanners = await get_available_scanners()
+    # Create scanner instances once for the entire scan lifecycle, honouring scan config.
+    ctx.scanner_config = normalise_scanner_config(
+        getattr(scan.config, "scanners", None) or DEFAULT_SCANNERS
+    )
+    available_scanners = await get_available_scanners()
+    ctx.scanners = {
+        name: scanner
+        for name, scanner in available_scanners.items()
+        if ctx.scanner_config.get(name, False)
+    }
+    for scanner_name, enabled in ctx.scanner_config.items():
+        if not enabled:
+            ctx.scanner_availability[scanner_name] = "disabled"
+        elif scanner_name in available_scanners:
+            ctx.scanner_availability[scanner_name] = "enabled"
+        else:
+            ctx.scanner_availability[scanner_name] = "unavailable"
 
     phase_errors: list[str] = []
 
@@ -384,6 +407,7 @@ async def _boost_vulnerable_dependency_files(ctx: ScanContext):
     This ensures the investigator prioritises code that uses vulnerable deps.
     """
     from app.models.dependency import Dependency, DependencyFinding
+    from app.orchestrator.agents.dependency import ACTIVE_DEPENDENCY_RELEVANCE
 
     try:
         async with async_session() as session:
@@ -392,16 +416,28 @@ async def _boost_vulnerable_dependency_files(ctx: ScanContext):
                 .join(Dependency, DependencyFinding.dependency_id == Dependency.id)
                 .where(
                     DependencyFinding.scan_id == ctx.scan_id,
-                    DependencyFinding.relevance == "likely_used",
+                    DependencyFinding.relevance.in_(ACTIVE_DEPENDENCY_RELEVANCE),
+                )
+                .order_by(
+                    case((DependencyFinding.risk_score.is_(None), 1), else_=0),
+                    DependencyFinding.risk_score.desc(),
                 )
             )
             for df, dep in result.all():
-                # Find files that import this package
-                pkg_lower = dep.name.lower().replace("-", "_")
+                usage_evidence = df.usage_evidence or []
+                if usage_evidence:
+                    for hit in usage_evidence:
+                        file_path = hit.get("file")
+                        if not file_path or file_path in ctx.files_inspected:
+                            continue
+                        boost = 6.0 if hit.get("kind") == "vulnerable_function" else 4.0
+                        ctx.boost_file(file_path, boost, f"dependency risk: {dep.name}")
+                    continue
+
+                # Fallback heuristic when reachability evidence is unavailable.
                 for file_path in ctx.file_queue:
                     if file_path in ctx.files_inspected:
                         continue
-                    # Heuristic: boost if file is in same ecosystem
                     if dep.ecosystem == "npm" and file_path.endswith((".js", ".ts", ".jsx", ".tsx")):
                         ctx.boost_file(file_path, 3.0, f"uses vulnerable {dep.name}")
                     elif dep.ecosystem == "pypi" and file_path.endswith(".py"):
@@ -432,6 +468,11 @@ async def _finish_scan(scan_id: uuid.UUID, status: str, *, error: str | None = N
 
 async def _create_minimal_report(ctx: ScanContext):
     """Create a minimal report when no LLM is available."""
+    degraded_note = (
+        " Scanner coverage was degraded for at least one tool; treat clean results as partial coverage."
+        if ctx.degraded_coverage
+        else ""
+    )
     async with async_session() as session:
         report = Report(
             scan_id=ctx.scan_id,
@@ -443,17 +484,41 @@ async def _create_minimal_report(ctx: ScanContext):
             ),
             methodology=(
                 "This scan was performed in scanner-only mode without AI analysis. "
-                f"The following scanners were used: {', '.join(ctx.scanner_hit_counts.keys())}."
+                f"The following scanners were used: {', '.join(ctx.scanner_runs.keys() or ctx.scanner_hit_counts.keys())}."
+                f"{degraded_note}"
             ),
             limitations=(
                 "No AI-driven code inspection, architecture understanding, "
                 "false positive reduction, or finding verification was performed. "
                 "All results are raw scanner output."
+                f"{degraded_note}"
             ),
             tech_stack={
                 "languages": ctx.languages,
                 "frameworks": ctx.frameworks,
                 "fingerprint": ctx.fingerprint,
+            },
+            scanner_hits=dict(ctx.scanner_hit_counts),
+            scan_coverage={
+                "total_files": ctx.files_total,
+                "files_indexed": ctx.files_total - getattr(ctx, "files_skipped_cap", 0),
+                "files_inspected_by_ai": len(ctx.files_inspected),
+                "files_skipped_size": getattr(ctx, "files_skipped_size", 0),
+                "files_skipped_cap": getattr(ctx, "files_skipped_cap", 0),
+                "scanners_used": list(ctx.scanner_runs.keys()) or list(ctx.scanner_hit_counts.keys()),
+                "scanner_runs": dict(ctx.scanner_runs),
+                "degraded_coverage": ctx.degraded_coverage,
+                "ai_calls_made": ctx.ai_calls_made,
+                "scan_mode": ctx.mode,
+                "obfuscated_files": len(ctx.obfuscated_files),
+                "is_monorepo": ctx.is_monorepo,
+                "is_apk": ctx.source_type in ("apk", "aab", "dex", "jar"),
+                "doc_files_read": len(ctx.doc_files_found),
+                "has_doc_intelligence": bool(ctx.doc_intelligence),
+                "ignored_file_count": ctx.ignored_file_count,
+                "ignored_paths": list(ctx.ignored_paths),
+                "managed_paths_ignored": list(ctx.managed_paths_ignored),
+                "repo_ignore_file": ctx.repo_ignore_file,
             },
         )
         session.add(report)

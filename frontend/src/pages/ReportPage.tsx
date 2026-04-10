@@ -30,7 +30,7 @@ import {
   MessageSquare,
   Search,
 } from "lucide-react";
-import { useState, useRef, useCallback, useEffect, createContext, useContext, Fragment } from "react";
+import { useState, useRef, useCallback, useEffect, Fragment } from "react";
 import ReactMarkdown from "react-markdown";
 import { api } from "@/api/client";
 import ChatWindow from "@/components/ChatWindow";
@@ -47,12 +47,15 @@ import {
 import type {
   Report,
   Finding,
+  RelatedAdvisory,
   SecretCandidate,
   DependencyFinding,
+  DependencyUsageEvidence,
   OWASPEntry,
   ComponentScore,
   SBOMData,
   ScanCoverage,
+  ScannerRunSummary,
 } from "@/types";
 
 const SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"];
@@ -116,6 +119,12 @@ export default function ReportPage() {
   });
 
   const activeSecrets = secrets?.filter((s) => !s.is_false_positive) ?? [];
+  const reachableDepCount = depFindings?.filter((d) => d.reachability_status === "reachable").length ?? 0;
+  const activeDepCount =
+    depFindings?.filter((d) => d.relevance === "used" || d.relevance === "likely_used").length ?? 0;
+  const functionMatchedDepCount =
+    depFindings?.filter((d) => (d.vulnerable_functions?.length ?? 0) > 0).length ?? 0;
+  const highRiskDepCount = depFindings?.filter((d) => (d.risk_score ?? 0) >= 700).length ?? 0;
 
   const [exportError, setExportError] = useState<string | null>(null);
 
@@ -139,6 +148,7 @@ export default function ReportPage() {
     languages?: string[];
     frameworks?: string[];
   } | null;
+  const architectureData = parseArchitecturePayload(report?.architecture, report?.diagram_spec);
 
   if (reportLoading) {
     return (
@@ -306,14 +316,8 @@ export default function ReportPage() {
                     <ChevronDown className="w-4 h-4 transition-transform group-open:rotate-0 -rotate-90" />
                     Architecture Analysis
                   </summary>
-                  <div className="mt-3 pl-6 prose prose-invert prose-sm max-w-none text-text-secondary
-                    prose-headings:text-text-primary prose-headings:font-semibold prose-headings:mt-3 prose-headings:mb-1
-                    prose-p:leading-relaxed prose-p:mb-2
-                    prose-ul:my-1 prose-li:my-0.5
-                    prose-strong:text-text-primary
-                    prose-code:text-accent-primary prose-code:bg-bg-secondary prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs
-                    max-h-[500px] overflow-y-auto">
-                    <ReactMarkdown>{report.architecture}</ReactMarkdown>
+                  <div className="mt-3 pl-6 max-h-[500px] overflow-y-auto">
+                    <ArchitectureAnalysisPanel data={architectureData} rawArchitecture={report.architecture} />
                   </div>
                 </details>
               )}
@@ -336,8 +340,12 @@ export default function ReportPage() {
       </div>
 
       {/* ── Architecture Diagrams ──────────────────────────────── */}
-      {report?.has_diagram_image && (
-        <DiagramViewer scanId={scanId!} architecture={report?.architecture} />
+      {(report?.has_diagram_image || architectureData.diagrams.length > 0 || report?.diagram_spec) && (
+        <DiagramViewer
+          scanId={scanId!}
+          architectureData={architectureData}
+          hasDiagramImage={report?.has_diagram_image ?? false}
+        />
       )}
 
       {/* ── Codebase Browser ────────────────────────────────── */}
@@ -354,7 +362,7 @@ export default function ReportPage() {
       {/* ── Scan Statistics ──────────────────────────────────── */}
       {(() => {
         const exploitableCount = findings?.filter((f) => f.exploit_template).length ?? 0;
-        const cveCount = findings?.filter((f) => f.related_cves && f.related_cves.length > 0).length ?? 0;
+        const advisoryCount = findings?.filter((f) => f.related_cves && f.related_cves.length > 0).length ?? 0;
         const critHighCount = (sevCounts["critical"] || 0) + (sevCounts["high"] || 0);
         return (
           <section className="grid grid-cols-2 md:grid-cols-5 gap-4">
@@ -362,7 +370,7 @@ export default function ReportPage() {
               { label: "Total Findings", value: findings?.length ?? 0, color: "text-accent-warning" },
               { label: "Critical / High", value: critHighCount, color: critHighCount > 0 ? "text-accent-danger" : "text-accent-success" },
               { label: "Exploitable (PoC)", value: exploitableCount, color: exploitableCount > 0 ? "text-accent-danger" : "text-text-muted" },
-              { label: "CVE Correlated", value: cveCount, color: cveCount > 0 ? "text-orange-400" : "text-text-muted" },
+              { label: "Advisory Correlated", value: advisoryCount, color: advisoryCount > 0 ? "text-orange-400" : "text-text-muted" },
               { label: "Dep. Risks", value: depFindings?.length ?? 0, color: (depFindings?.length ?? 0) > 0 ? "text-accent-warning" : "text-text-muted" },
             ].map((stat) => (
               <div key={stat.label} className="card-glow text-center py-4">
@@ -485,7 +493,7 @@ export default function ReportPage() {
                 .sort((a, b) => b[1] - a[1])
                 .slice(0, 5);
               const exploitable = findings.filter((f) => f.exploit_difficulty === "easy" || f.exploit_difficulty === "moderate");
-              const withCVEs = findings.filter((f) => f.related_cves && f.related_cves.length > 0);
+              const withAdvisories = findings.filter((f) => f.related_cves && f.related_cves.length > 0);
 
               return (
                 <>
@@ -528,10 +536,10 @@ export default function ReportPage() {
                     </>
                   )}
 
-                  {withCVEs.length > 0 && (
+                  {withAdvisories.length > 0 && (
                     <p>
-                      <strong className="text-text-primary">{withCVEs.length} findings</strong> were correlated with known CVE
-                      entries in the advisory database, indicating that similar vulnerability patterns have been publicly
+                      <strong className="text-text-primary">{withAdvisories.length} findings</strong> were correlated with known
+                      advisories in the offline vulnerability database, indicating that similar vulnerability patterns have been publicly
                       documented and may have known exploit techniques.
                     </p>
                   )}
@@ -539,8 +547,8 @@ export default function ReportPage() {
                   <h3 className="text-base font-semibold text-text-primary mt-4">Methodology</h3>
                   <p>
                     The analysis was performed using a multi-pass approach combining automated static analysis scanners
-                    (Semgrep, Bandit, ESLint, secrets detection, dependency audit) with AI-powered code investigation.
-                    The AI investigator inspected {report?.scan_coverage?.files_analysed || "multiple"} source files,
+                    (Semgrep, Bandit, ESLint, CodeQL, secrets detection, dependency audit) with AI-powered code investigation.
+                    The AI investigator inspected {report?.scan_coverage?.files_inspected_by_ai || "multiple"} source files,
                     tracing input validation paths, authentication boundaries, and data serialization flows from
                     user-controlled input sources to dangerous sinks (database queries, OS commands, file operations, HTML output).
                   </p>
@@ -670,21 +678,83 @@ export default function ReportPage() {
                         {f.description}
                       </p>
 
-                      {/* Related CVEs */}
+                      {/* Related advisories */}
                       {f.related_cves && f.related_cves.length > 0 && (
                         <div className="pl-10 space-y-1.5">
-                          <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium">Related CVEs</p>
-                          {f.related_cves.map((cve) => (
-                            <div key={cve.cve_id} className="flex items-start gap-2 text-xs bg-accent-danger/5 border border-accent-danger/10 rounded-lg px-3 py-2">
-                              <span className="font-mono text-accent-danger font-medium shrink-0">{cve.cve_id}</span>
-                              <span className="text-text-secondary">{cve.summary}</span>
-                              {cve.package && (
-                                <span className="ml-auto shrink-0 text-[10px] text-text-muted bg-bg-secondary px-1.5 py-0.5 rounded">
-                                  {cve.package}
-                                </span>
-                              )}
-                            </div>
-                          ))}
+                          <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium">Related Advisories</p>
+                          {f.related_cves.map((advisory, idx) => {
+                            const advisoryId =
+                              advisory.display_id || advisory.cve_id || advisory.advisory_id || `advisory-${idx + 1}`;
+                            return (
+                              <div key={`${advisoryId}-${idx}`} className="text-xs bg-accent-danger/5 border border-accent-danger/10 rounded-lg px-3 py-2">
+                                <div className="flex items-start gap-3">
+                                  <span className="font-mono text-accent-danger font-medium shrink-0">{advisoryId}</span>
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
+                                      <span className={`badge badge-${String(advisory.severity || "medium").toLowerCase()} text-[9px]`}>
+                                        {String(advisory.severity || "medium").toUpperCase()}
+                                      </span>
+                                      {advisory.evidence_strength && (
+                                        <AdvisoryStrengthBadge strength={advisory.evidence_strength} />
+                                      )}
+                                      {advisory.evidence_type && (
+                                        <AdvisoryEvidenceBadge evidenceType={advisory.evidence_type} />
+                                      )}
+                                      {typeof advisory.package_match_confidence === "number" && (
+                                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent-primary/10 text-accent-primary font-medium">
+                                          {Math.round(advisory.package_match_confidence * 100)}% package match
+                                        </span>
+                                      )}
+                                    </div>
+                                    <p className="text-text-secondary leading-relaxed">{advisory.summary}</p>
+                                    <div className="mt-2 flex flex-wrap gap-1.5">
+                                      {advisory.package && (
+                                        <span className="text-[10px] text-text-muted bg-bg-secondary px-1.5 py-0.5 rounded">
+                                          {advisory.package}
+                                          {advisory.ecosystem ? ` • ${advisory.ecosystem}` : ""}
+                                        </span>
+                                      )}
+                                      {advisory.import_module && (
+                                        <span className="text-[10px] text-text-muted bg-bg-secondary px-1.5 py-0.5 rounded">
+                                          import {advisory.import_module}
+                                        </span>
+                                      )}
+                                      {formatAdvisoryFunctionLabel(advisory) && (
+                                        <span className="text-[10px] text-text-muted bg-bg-secondary px-1.5 py-0.5 rounded">
+                                          {formatAdvisoryFunctionLabel(advisory)}
+                                        </span>
+                                      )}
+                                      {advisory.fixed_version && (
+                                        <span className="text-[10px] text-text-muted bg-bg-secondary px-1.5 py-0.5 rounded">
+                                          fix {advisory.fixed_version}
+                                        </span>
+                                      )}
+                                    </div>
+                                    {(advisory.evidence_sources?.length || advisory.cwe_ids?.length) && (
+                                      <div className="mt-2 flex flex-wrap gap-1.5">
+                                        {advisory.evidence_sources?.slice(0, 2).map((source) => (
+                                          <span
+                                            key={`${advisoryId}-${source}`}
+                                            className="text-[10px] text-accent-secondary bg-accent-secondary/10 px-1.5 py-0.5 rounded"
+                                          >
+                                            {formatDependencyLabel(source)}
+                                          </span>
+                                        ))}
+                                        {advisory.cwe_ids?.slice(0, 2).map((cwe) => (
+                                          <span
+                                            key={`${advisoryId}-${cwe}`}
+                                            className="text-[10px] text-accent-secondary bg-accent-secondary/10 px-1.5 py-0.5 rounded font-mono"
+                                          >
+                                            {cwe}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       )}
 
@@ -890,37 +960,131 @@ export default function ReportPage() {
               </span>
             </h2>
           </div>
+          <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mb-5">
+            {[
+              { label: "Reachable", value: reachableDepCount, tone: "text-accent-danger" },
+              { label: "Imported / likely used", value: activeDepCount, tone: "text-accent-warning" },
+              { label: "Function matches", value: functionMatchedDepCount, tone: "text-accent-primary" },
+              { label: "700+ risk score", value: highRiskDepCount, tone: "text-orange-400" },
+            ].map((stat) => (
+              <div key={stat.label} className="rounded-xl border border-border/40 bg-bg-secondary/40 px-4 py-3">
+                <p className={`text-lg font-bold font-mono ${stat.tone}`}>{stat.value}</p>
+                <p className="text-[10px] uppercase tracking-wider text-text-muted mt-1">{stat.label}</p>
+              </div>
+            ))}
+          </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border text-left">
                   <th className="pb-3 font-medium text-text-muted text-xs uppercase tracking-wider">Package</th>
-                  <th className="pb-3 font-medium text-text-muted text-xs uppercase tracking-wider">Installed</th>
-                  <th className="pb-3 font-medium text-text-muted text-xs uppercase tracking-wider">Severity</th>
                   <th className="pb-3 font-medium text-text-muted text-xs uppercase tracking-wider">Advisory</th>
-                  <th className="pb-3 font-medium text-text-muted text-xs uppercase tracking-wider">Fixed In</th>
-                  <th className="pb-3 font-medium text-text-muted text-xs uppercase tracking-wider">Relevance</th>
+                  <th className="pb-3 font-medium text-text-muted text-xs uppercase tracking-wider">Exposure</th>
+                  <th className="pb-3 font-medium text-text-muted text-xs uppercase tracking-wider">Risk</th>
+                  <th className="pb-3 font-medium text-text-muted text-xs uppercase tracking-wider">Assessment</th>
                 </tr>
               </thead>
               <tbody>
-                {depFindings.map((d) => (
+                {depFindings.map((d) => {
+                  const usageHits = d.usage_evidence?.slice(0, 3) ?? [];
+                  const remainingUsageHits = Math.max(0, (d.usage_evidence?.length ?? 0) - usageHits.length);
+                  const riskFactors = formatDependencyRiskFactors(d.risk_factors);
+
+                  return (
                   <tr key={d.id} className="border-b border-border/30 hover:bg-bg-hover/20">
-                    <td className="py-2.5 font-mono text-xs font-medium">{d.package_name}</td>
-                    <td className="py-2.5 text-text-muted font-mono text-xs">{d.installed_version}</td>
-                    <td className="py-2.5">
-                      {d.severity && (
-                        <span className={`badge badge-${d.severity}`}>
-                          {d.severity.toUpperCase()}
+                    <td className="py-3 align-top">
+                      <div className="font-mono text-xs font-medium">{d.package_name}</div>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        <span className="text-[10px] uppercase tracking-wide text-text-muted">
+                          {d.ecosystem}
                         </span>
+                        <span className="text-[10px] font-mono text-text-secondary">
+                          Installed {d.installed_version || "unknown"}
+                        </span>
+                        {d.fixed_version && (
+                          <span className="text-[10px] font-mono text-accent-success">
+                            Fix {d.fixed_version}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="py-3 align-top text-xs">
+                      <div className="font-mono text-text-secondary">{d.advisory_id || "Offline advisory"}</div>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        {d.severity && (
+                          <span className={`badge badge-${d.severity}`}>
+                            {d.severity.toUpperCase()}
+                          </span>
+                        )}
+                        {typeof d.cvss_score === "number" && (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-bg-secondary text-text-secondary font-mono">
+                            CVSS {d.cvss_score.toFixed(1)}
+                          </span>
+                        )}
+                      </div>
+                      {d.summary && (
+                        <p className="mt-2 max-w-xs text-xs text-text-secondary leading-relaxed">
+                          {truncateText(d.summary, 180)}
+                        </p>
+                      )}
+                      {d.affected_range && (
+                        <p className="mt-1 text-[10px] font-mono text-text-muted">
+                          Affected: {truncateText(d.affected_range, 48)}
+                        </p>
                       )}
                     </td>
-                    <td className="py-2.5 text-xs font-mono text-text-muted">{d.advisory_id}</td>
-                    <td className="py-2.5 text-accent-success font-mono text-xs">{d.fixed_version}</td>
-                    <td className="py-2.5">
-                      <RelevanceBadge relevance={d.relevance} />
+                    <td className="py-3 align-top">
+                      <div className="flex flex-wrap gap-1.5">
+                        <RelevanceBadge relevance={d.relevance} />
+                        <ReachabilityBadge
+                          status={d.reachability_status}
+                          confidence={d.reachability_confidence}
+                        />
+                        <EvidenceTypeBadge evidenceType={d.evidence_type} />
+                      </div>
+                      {d.usage_evidence && d.usage_evidence.length > 0 ? (
+                        <p className="mt-2 text-[10px] text-text-muted">
+                          {d.usage_evidence.length} code reference{d.usage_evidence.length === 1 ? "" : "s"} captured
+                        </p>
+                      ) : (
+                        <p className="mt-2 text-[10px] text-text-muted">
+                          No package usage evidence stored
+                        </p>
+                      )}
+                    </td>
+                    <td className="py-3 align-top">
+                      <DependencyRiskBadge score={d.risk_score} />
+                      {riskFactors.length > 0 && (
+                        <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+                          Factors: {riskFactors.join(", ")}
+                        </p>
+                      )}
+                    </td>
+                    <td className="py-3 align-top text-xs text-text-secondary leading-relaxed">
+                      <div>{d.ai_assessment || "No explicit usage evidence captured."}</div>
+                      {d.vulnerable_functions && d.vulnerable_functions.length > 0 && (
+                        <div className="mt-2 text-[10px] text-text-muted">
+                          Vulnerable functions: {d.vulnerable_functions.slice(0, 3).join(", ")}
+                        </div>
+                      )}
+                      {usageHits.length > 0 && (
+                        <details className="mt-2 group">
+                          <summary className="cursor-pointer text-[10px] font-medium text-accent-primary hover:text-accent-primary/80 transition-colors">
+                            Evidence details
+                          </summary>
+                          <ul className="mt-2 space-y-1 text-[10px] text-text-muted">
+                            {usageHits.map((hit, index) => (
+                              <li key={`${d.id}-usage-${index}`}>{formatDependencyUsageHit(hit)}</li>
+                            ))}
+                            {remainingUsageHits > 0 && (
+                              <li>... and {remainingUsageHits} more evidence item{remainingUsageHits === 1 ? "" : "s"}</li>
+                            )}
+                          </ul>
+                        </details>
+                      )}
                     </td>
                   </tr>
-                ))}
+                )})}
               </tbody>
             </table>
           </div>
@@ -982,9 +1146,6 @@ export default function ReportPage() {
       {/* ── AI Chat Window ────────────────────────────────────── */}
       <ChatWindow
         scanId={scanId!}
-        reportSummary={report?.app_summary || ""}
-        riskGrade={report?.risk_grade}
-        findingsCount={findings?.length ?? 0}
         currentFile={currentFile}
         currentFileContent={currentFileContent}
         initialPrompt={chatPrompt}
@@ -1039,13 +1200,17 @@ function DetailBlock({
 
 function RelevanceBadge({ relevance }: { relevance: string }) {
   const styles: Record<string, string> = {
+    used: "bg-accent-danger/10 text-accent-danger",
     likely_used: "bg-accent-danger/10 text-accent-danger",
+    transitive_only: "bg-accent-warning/10 text-accent-warning",
     unused: "bg-accent-success/10 text-accent-success",
     test_only: "bg-accent-primary/10 text-accent-primary",
     unknown: "bg-bg-secondary text-text-muted",
   };
   const labels: Record<string, string> = {
-    likely_used: "Used",
+    used: "Used",
+    likely_used: "Likely used",
+    transitive_only: "Transitive only",
     unused: "Unused",
     test_only: "Test only",
     unknown: "Unknown",
@@ -1055,6 +1220,231 @@ function RelevanceBadge({ relevance }: { relevance: string }) {
       {labels[relevance] || relevance}
     </span>
   );
+}
+
+function ReachabilityBadge({
+  status,
+  confidence,
+}: {
+  status: string;
+  confidence?: number | null;
+}) {
+  const styles: Record<string, string> = {
+    reachable: "bg-accent-danger/10 text-accent-danger",
+    potentially_reachable: "bg-orange-500/10 text-orange-400",
+    no_path_found: "bg-accent-primary/10 text-accent-primary",
+    not_applicable: "bg-accent-success/10 text-accent-success",
+    unknown: "bg-bg-secondary text-text-muted",
+  };
+  const label = formatDependencyLabel(status);
+  const confidenceLabel =
+    typeof confidence === "number" ? ` ${Math.round(confidence * 100)}%` : "";
+  return (
+    <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${styles[status] || styles.unknown}`}>
+      {label}
+      {confidenceLabel}
+    </span>
+  );
+}
+
+function EvidenceTypeBadge({ evidenceType }: { evidenceType: string }) {
+  const styles: Record<string, string> = {
+    exact_package_match: "bg-accent-danger/10 text-accent-danger",
+    canonical_package_match: "bg-accent-warning/10 text-accent-warning",
+    artifact_alias_match: "bg-accent-primary/10 text-accent-primary",
+  };
+  return (
+    <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${styles[evidenceType] || "bg-bg-secondary text-text-muted"}`}>
+      {formatDependencyLabel(evidenceType)}
+    </span>
+  );
+}
+
+function DependencyRiskBadge({ score }: { score?: number | null }) {
+  if (typeof score !== "number") {
+    return <span className="text-[10px] text-text-muted">No risk score</span>;
+  }
+
+  const tone =
+    score >= 800
+      ? { text: "text-accent-danger", bar: "bg-accent-danger" }
+      : score >= 600
+      ? { text: "text-orange-400", bar: "bg-orange-400" }
+      : score >= 350
+      ? { text: "text-accent-warning", bar: "bg-accent-warning" }
+      : { text: "text-accent-success", bar: "bg-accent-success" };
+
+  return (
+    <div>
+      <div className={`font-mono text-xs font-semibold ${tone.text}`}>
+        {Math.round(score)}/1000
+      </div>
+      <div className="mt-1 h-1.5 w-24 rounded-full bg-bg-secondary overflow-hidden">
+        <div
+          className={`h-full rounded-full ${tone.bar}`}
+          style={{ width: `${Math.max(4, Math.min(100, score / 10))}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function truncateText(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
+}
+
+function formatDependencyUsageHit(hit: DependencyUsageEvidence): string {
+  const kindMap: Record<string, string> = {
+    import: "Import detected",
+    reference: "Symbol reference",
+    vulnerable_function: "Vulnerable function",
+  };
+  const parts = [kindMap[hit.kind || ""] || formatDependencyLabel(hit.kind || "usage")];
+  if (hit.symbol) {
+    parts.push(hit.symbol);
+  }
+
+  const location = [hit.file, typeof hit.line === "number" ? String(hit.line) : null]
+    .filter(Boolean)
+    .join(":");
+  if (location) {
+    parts.push(`in ${location}`);
+  }
+  if (hit.source) {
+    parts.push(`via ${formatDependencyLabel(hit.source)}`);
+  }
+  if (typeof hit.confidence === "number") {
+    parts.push(`${Math.round(hit.confidence * 100)}% confidence`);
+  }
+  return parts.join(" | ");
+}
+
+function formatDependencyRiskFactors(
+  factors?: Record<string, number | string | boolean | null> | null
+): string[] {
+  if (!factors) {
+    return [];
+  }
+
+  const labels: Record<string, string> = {
+    base: "severity base",
+    reachability: "reachability",
+    relevance: "package usage",
+    vulnerable_function_match: "function match",
+    dev_dependency: "dev-only scope",
+    fix_available: "fix available",
+    hot_file_usage: "hot-file usage",
+  };
+
+  return Object.entries(factors)
+    .filter(
+      ([key, value]) =>
+        !["base", "final"].includes(key) &&
+        typeof value === "number" &&
+        Number.isFinite(value) &&
+        value !== 0
+    )
+    .map(([key, value]) => [key, value as number] as const)
+    .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+    .slice(0, 3)
+    .map(([key, value]) => `${labels[key] || formatDependencyLabel(key)} ${value > 0 ? "+" : ""}${Math.round(value)}`);
+}
+
+function formatDependencyLabel(value: string): string {
+  return value
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function formatAdvisoryFunctionLabel(advisory: RelatedAdvisory): string {
+  const functionName = advisory.function || advisory.imported_symbol || advisory.call_object;
+  if (!functionName) {
+    return "";
+  }
+  const line = typeof advisory.line === "number" ? ` line ${advisory.line}` : "";
+  return `call ${functionName}${line}`;
+}
+
+function AdvisoryStrengthBadge({ strength }: { strength: string }) {
+  const styles: Record<string, string> = {
+    strong: "bg-accent-danger/10 text-accent-danger",
+    medium: "bg-accent-warning/10 text-accent-warning",
+    contextual: "bg-accent-primary/10 text-accent-primary",
+    weak: "bg-bg-secondary text-text-muted",
+  };
+  return (
+    <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${styles[strength] || styles.weak}`}>
+      {formatDependencyLabel(strength)}
+    </span>
+  );
+}
+
+function AdvisoryEvidenceBadge({ evidenceType }: { evidenceType: string }) {
+  const styles: Record<string, string> = {
+    confirmed_vulnerable_dependency_function_match: "bg-accent-danger/10 text-accent-danger",
+    import_confirmed_function_match: "bg-accent-warning/10 text-accent-warning",
+    function_name_overlap: "bg-bg-secondary text-text-muted",
+    related_by_cwe: "bg-accent-primary/10 text-accent-primary",
+  };
+  return (
+    <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${styles[evidenceType] || "bg-bg-secondary text-text-muted"}`}>
+      {formatDependencyLabel(evidenceType)}
+    </span>
+  );
+}
+
+function parseArchitecturePayload(
+  architecture: string | null | undefined,
+  diagramSpec?: string | null
+): ArchitecturePayload {
+  const fallbackDiagrams = diagramSpec
+    ? [{ title: "Architecture Overview", description: "Primary report diagram", mermaid: diagramSpec }]
+    : [];
+
+  if (!architecture) {
+    return { diagrams: fallbackDiagrams };
+  }
+
+  try {
+    const parsed = JSON.parse(architecture) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") {
+      return { analysisMarkdown: architecture, diagrams: fallbackDiagrams };
+    }
+
+    const rawDiagrams = Array.isArray(parsed.diagrams) ? parsed.diagrams : [];
+    const diagrams = rawDiagrams
+      .map((diagram) => (diagram && typeof diagram === "object" ? diagram as Record<string, unknown> : null))
+      .filter(Boolean)
+      .map((diagram) => ({
+        title: String(diagram?.title || "Architecture"),
+        description: String(diagram?.description || ""),
+        mermaid: String(diagram?.mermaid || ""),
+        kind: diagram?.kind ? String(diagram.kind) : undefined,
+        highlights: Array.isArray(diagram?.highlights)
+          ? diagram.highlights.map((item) => String(item))
+          : undefined,
+      }))
+      .filter((diagram) => diagram.mermaid || fallbackDiagrams.length === 0);
+
+    return {
+      analysisMarkdown: typeof parsed.analysis_markdown === "string" ? parsed.analysis_markdown : null,
+      diagrams: diagrams.length > 0 ? diagrams : fallbackDiagrams,
+      components: Array.isArray(parsed.components) ? parsed.components as ArchitectureComponent[] : [],
+      auth_mechanisms: Array.isArray(parsed.auth_mechanisms) ? parsed.auth_mechanisms as ArchitectureAuthMechanism[] : [],
+      external_integrations: Array.isArray(parsed.external_integrations) ? parsed.external_integrations.map((item) => String(item)) : [],
+      trust_boundaries: Array.isArray(parsed.trust_boundaries) ? parsed.trust_boundaries.map((item) => String(item)) : [],
+      security_observations: Array.isArray(parsed.security_observations) ? parsed.security_observations.map((item) => String(item)) : [],
+      component_hotspots: Array.isArray(parsed.component_hotspots) ? parsed.component_hotspots as ArchitectureHotspot[] : [],
+      result_summary: parsed.result_summary && typeof parsed.result_summary === "object"
+        ? parsed.result_summary as Record<string, number>
+        : {},
+    };
+  } catch {
+    return {
+      analysisMarkdown: architecture,
+      diagrams: fallbackDiagrams,
+    };
+  }
 }
 
 const LANG_EMOJI: Record<string, string> = {
@@ -1765,7 +2155,226 @@ function SecretsSection({ secrets }: { secrets: SecretCandidate[] }) {
 
 /* ── Diagram Viewer with tabs, fullscreen, zoom/pan ─────────────── */
 
-function DiagramViewer({ scanId, architecture }: { scanId: string; architecture: string | null }) {
+type ArchitectureDiagram = {
+  title: string;
+  description?: string;
+  mermaid: string;
+  kind?: string;
+  highlights?: string[];
+};
+
+type ArchitectureComponent = {
+  name?: string;
+  purpose?: string;
+  criticality?: string;
+};
+
+type ArchitectureAuthMechanism = {
+  type?: string;
+  implementation?: string;
+  weaknesses?: string;
+};
+
+type ArchitectureHotspot = {
+  name?: string;
+  criticality?: string;
+  finding_count?: number;
+  critical_count?: number;
+  high_count?: number;
+};
+
+type ArchitecturePayload = {
+  analysisMarkdown?: string | null;
+  diagrams: ArchitectureDiagram[];
+  components?: ArchitectureComponent[];
+  auth_mechanisms?: ArchitectureAuthMechanism[];
+  external_integrations?: string[];
+  trust_boundaries?: string[];
+  security_observations?: string[];
+  component_hotspots?: ArchitectureHotspot[];
+  result_summary?: Record<string, number>;
+};
+
+function ArchitectureAnalysisPanel({
+  data,
+  rawArchitecture,
+}: {
+  data: ArchitecturePayload;
+  rawArchitecture: string | null;
+}) {
+  const hasStructuredContent =
+    Object.keys(data.result_summary || {}).length > 0 ||
+    (data.component_hotspots?.length ?? 0) > 0 ||
+    (data.trust_boundaries?.length ?? 0) > 0 ||
+    (data.auth_mechanisms?.length ?? 0) > 0 ||
+    (data.external_integrations?.length ?? 0) > 0 ||
+    (data.security_observations?.length ?? 0) > 0 ||
+    (data.components?.length ?? 0) > 0;
+
+  if (!hasStructuredContent) {
+    const markdown = data.analysisMarkdown || rawArchitecture;
+    if (!markdown) return null;
+    return (
+      <div className="prose prose-invert prose-sm max-w-none text-text-secondary
+        prose-headings:text-text-primary prose-headings:font-semibold prose-headings:mt-3 prose-headings:mb-1
+        prose-p:leading-relaxed prose-p:mb-2
+        prose-ul:my-1 prose-li:my-0.5
+        prose-strong:text-text-primary
+        prose-code:text-accent-primary prose-code:bg-bg-secondary prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs">
+        <ReactMarkdown>{markdown}</ReactMarkdown>
+      </div>
+    );
+  }
+
+  const resultSummary = data.result_summary || {};
+  const hotspots = data.component_hotspots || [];
+  const components = data.components || [];
+  const authMechanisms = data.auth_mechanisms || [];
+  const integrations = data.external_integrations || [];
+  const trustBoundaries = data.trust_boundaries || [];
+  const observations = data.security_observations || [];
+
+  return (
+    <div className="space-y-4 text-sm text-text-secondary">
+      {Object.keys(resultSummary).length > 0 && (
+        <div>
+          <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Result Summary</p>
+          <div className="flex flex-wrap gap-2">
+            {[
+              ["Verified findings", resultSummary.finding_count],
+              ["Critical", resultSummary.critical_count],
+              ["High", resultSummary.high_count],
+              ["Advisory correlated", resultSummary.advisory_correlated_count],
+              ["Reachable deps", resultSummary.reachable_dependency_count],
+              ["Function matches", resultSummary.function_matched_dependency_count],
+            ]
+              .filter(([, value]) => typeof value === "number" && value > 0)
+              .map(([label, value]) => (
+                <span key={label} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-bg-secondary px-2.5 py-1 text-xs">
+                  <span className="text-text-secondary">{label}</span>
+                  <span className="font-mono text-text-primary">{value}</span>
+                </span>
+              ))}
+          </div>
+        </div>
+      )}
+
+      {hotspots.length > 0 && (
+        <div>
+          <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Component Hotspots</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            {hotspots.slice(0, 4).map((component) => (
+              <div key={component.name} className="rounded-lg border border-border bg-bg-secondary/60 px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium text-text-primary">{component.name}</span>
+                  {component.criticality && (
+                    <span className="text-[10px] text-text-muted bg-bg-tertiary px-1.5 py-0.5 rounded">
+                      {formatDependencyLabel(component.criticality)}
+                    </span>
+                  )}
+                </div>
+                <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-text-muted">
+                  <span>{component.finding_count || 0} findings</span>
+                  {(component.critical_count || 0) > 0 && <span className="text-accent-danger">{component.critical_count} critical</span>}
+                  {(component.high_count || 0) > 0 && <span className="text-orange-400">{component.high_count} high</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {(trustBoundaries.length > 0 || authMechanisms.length > 0 || integrations.length > 0) && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {trustBoundaries.length > 0 && (
+            <div>
+              <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Trust Boundaries</p>
+              <div className="space-y-1">
+                {trustBoundaries.slice(0, 4).map((boundary) => (
+                  <div key={boundary} className="rounded-lg bg-bg-secondary/60 px-2.5 py-1.5 text-xs">
+                    {boundary}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {authMechanisms.length > 0 && (
+            <div>
+              <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Auth Controls</p>
+              <div className="space-y-1">
+                {authMechanisms.slice(0, 3).map((auth, index) => (
+                  <div key={`${auth.type || "auth"}-${index}`} className="rounded-lg bg-bg-secondary/60 px-2.5 py-1.5 text-xs">
+                    <div className="font-medium text-text-primary">{formatDependencyLabel(auth.type || "unknown")}</div>
+                    {auth.implementation && <div className="mt-1 text-text-muted">{truncateText(auth.implementation, 100)}</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {integrations.length > 0 && (
+            <div>
+              <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">External Integrations</p>
+              <div className="flex flex-wrap gap-1.5">
+                {integrations.slice(0, 6).map((integration) => (
+                  <span key={integration} className="rounded-lg bg-bg-secondary/60 px-2 py-1 text-xs">
+                    {integration}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {observations.length > 0 && (
+        <div>
+          <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Security Observations</p>
+          <div className="space-y-1">
+            {observations.slice(0, 5).map((observation, index) => (
+              <div key={`${index}-${observation.slice(0, 24)}`} className="rounded-lg bg-bg-secondary/60 px-2.5 py-1.5 text-xs leading-relaxed">
+                {observation}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {components.length > 0 && (
+        <div>
+          <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Architecture Components</p>
+          <div className="flex flex-wrap gap-1.5">
+            {components.slice(0, 8).map((component, index) => (
+              <span key={`${component.name || "component"}-${index}`} className="rounded-lg border border-border bg-bg-secondary px-2 py-1 text-xs">
+                {component.name || "Component"}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {data.analysisMarkdown && (
+        <div className="prose prose-invert prose-sm max-w-none text-text-secondary
+          prose-headings:text-text-primary prose-headings:font-semibold prose-headings:mt-3 prose-headings:mb-1
+          prose-p:leading-relaxed prose-p:mb-2
+          prose-ul:my-1 prose-li:my-0.5
+          prose-strong:text-text-primary
+          prose-code:text-accent-primary prose-code:bg-bg-secondary prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs">
+          <ReactMarkdown>{data.analysisMarkdown}</ReactMarkdown>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DiagramViewer({
+  scanId,
+  architectureData,
+  hasDiagramImage,
+}: {
+  scanId: string;
+  architectureData: ArchitecturePayload;
+  hasDiagramImage: boolean;
+}) {
   const [activeTab, setActiveTab] = useState(0);
   const [fullscreen, setFullscreen] = useState(false);
   const [zoom, setZoom] = useState(1);
@@ -1773,20 +2382,18 @@ function DiagramViewer({ scanId, architecture }: { scanId: string; architecture:
   const [dragging, setDragging] = useState(false);
   const dragStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const containerRef = useRef<HTMLDivElement>(null);
-
-  // Parse diagrams from architecture JSON
-  let diagrams: Array<{ title: string; description: string; mermaid: string }> = [];
-  try {
-    if (architecture) {
-      const arch = JSON.parse(architecture);
-      diagrams = arch.diagrams || [];
-    }
-  } catch {
-    // Not JSON — legacy single diagram
-  }
+  const diagrams =
+    architectureData.diagrams.length > 0
+      ? architectureData.diagrams
+      : hasDiagramImage
+      ? [{ title: "Architecture Overview", description: "Rendered report diagram", mermaid: "" }]
+      : [];
 
   // If no diagrams array, fall back to single diagram image
   const hasTabs = diagrams.length > 1;
+  if (diagrams.length === 0) {
+    return null;
+  }
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
@@ -1956,16 +2563,37 @@ function DiagramViewer({ scanId, architecture }: { scanId: string; architecture:
           <MermaidDiagram
             spec={diagrams[activeTab]?.mermaid || ""}
             id={`diagram-${activeTab}`}
-            fallbackImage={activeTab === 0 ? `/api/scans/${scanId}/report/diagram` : undefined}
+            fallbackImage={activeTab === 0 && hasDiagramImage ? `/api/scans/${scanId}/report/diagram` : undefined}
           />
         </div>
       </div>
 
       {/* Description */}
-      {diagrams[activeTab]?.description && (
-        <p className={`text-xs text-text-muted mt-2 ${fullscreen ? "px-6 pb-3" : ""}`}>
-          {diagrams[activeTab].description}
-        </p>
+      {(diagrams[activeTab]?.description || diagrams[activeTab]?.highlights?.length) && (
+        <div className={`mt-2 space-y-2 ${fullscreen ? "px-6 pb-3" : ""}`}>
+          {diagrams[activeTab]?.description && (
+            <p className="text-xs text-text-muted">{diagrams[activeTab].description}</p>
+          )}
+          {diagrams[activeTab]?.kind && (
+            <div className="flex flex-wrap gap-1.5">
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent-secondary/10 text-accent-secondary font-medium">
+                {formatDependencyLabel(diagrams[activeTab].kind || "diagram")}
+              </span>
+            </div>
+          )}
+          {diagrams[activeTab]?.highlights?.length ? (
+            <div className="flex flex-wrap gap-1.5">
+              {diagrams[activeTab].highlights!.slice(0, 4).map((highlight, index) => (
+                <span
+                  key={`${activeTab}-highlight-${index}`}
+                  className="text-[10px] px-2 py-1 rounded-lg bg-bg-secondary text-text-muted"
+                >
+                  {highlight}
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </div>
       )}
     </div>
   );
@@ -2345,6 +2973,7 @@ function ScanCoverageSection({ coverage }: { coverage: ScanCoverage }) {
   const aiPct = coverage.total_files > 0
     ? Math.round((coverage.files_inspected_by_ai / coverage.total_files) * 100)
     : 0;
+  const scannerRuns = Object.values(coverage.scanner_runs || {}) as ScannerRunSummary[];
 
   return (
     <section className="card-glow border-gradient">
@@ -2354,6 +2983,12 @@ function ScanCoverageSection({ coverage }: { coverage: ScanCoverage }) {
         </div>
         <h2 className="text-lg font-semibold">Scan Coverage</h2>
       </div>
+
+      {coverage.degraded_coverage && (
+        <div className="mb-4 rounded-xl border border-accent-warning/20 bg-accent-warning/10 px-4 py-3 text-sm text-accent-warning">
+          Scanner coverage was degraded. At least one scanner failed or completed with errors, so clean coverage should be treated as partial.
+        </div>
+      )}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="rounded-xl bg-bg-secondary/50 p-3 text-center">
@@ -2400,12 +3035,64 @@ function ScanCoverageSection({ coverage }: { coverage: ScanCoverage }) {
             {coverage.files_skipped_size} skipped (size)
           </span>
         )}
+        {(coverage.ignored_file_count || 0) > 0 && (
+          <span className="text-[10px] px-2 py-0.5 rounded bg-bg-secondary text-text-secondary font-mono">
+            {coverage.ignored_file_count} ignored by scope policy
+          </span>
+        )}
         {coverage.has_doc_intelligence && (
           <span className="text-[10px] px-2 py-0.5 rounded bg-accent-success/10 text-accent-success font-mono">
             {coverage.doc_files_read} docs analysed
           </span>
         )}
       </div>
+
+      {scannerRuns.length > 0 && (
+        <div className="mt-5 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          {scannerRuns.map((run) => {
+            const tone =
+              run.status === "failed"
+                ? "border-accent-danger/30 bg-accent-danger/10"
+                : run.status === "degraded"
+                ? "border-accent-warning/30 bg-accent-warning/10"
+                : "border-accent-success/20 bg-accent-success/10";
+            const textTone =
+              run.status === "failed"
+                ? "text-accent-danger"
+                : run.status === "degraded"
+                ? "text-accent-warning"
+                : "text-accent-success";
+            return (
+              <div key={run.scanner} className={`rounded-xl border p-3 ${tone}`}>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-xs font-semibold uppercase tracking-wide">{run.scanner}</span>
+                  <span className={`text-[10px] font-mono uppercase ${textTone}`}>{run.status}</span>
+                </div>
+                <div className="mt-2 flex items-center gap-3 text-xs text-text-secondary">
+                  <span>{run.hit_count} hits</span>
+                  <span>{run.duration_ms}ms</span>
+                </div>
+                {run.errors[0] && (
+                  <p className="mt-2 text-xs leading-relaxed text-text-secondary">
+                    {run.errors[0]}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {(coverage.repo_ignore_file || (coverage.managed_paths_ignored?.length ?? 0) > 0) && (
+        <div className="mt-4 text-xs text-text-muted space-y-1.5">
+          {coverage.repo_ignore_file && (
+            <p>Repo ignore file: <code>{coverage.repo_ignore_file}</code></p>
+          )}
+          {(coverage.managed_paths_ignored?.length ?? 0) > 0 && (
+            <p>Managed path exclusions: {coverage.managed_paths_ignored?.slice(0, 6).join(", ")}</p>
+          )}
+        </div>
+      )}
     </section>
   );
 }

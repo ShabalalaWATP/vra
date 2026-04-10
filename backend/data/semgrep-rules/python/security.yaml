@@ -224,18 +224,6 @@ rules:
       category: security
       confidence: MEDIUM
 
-  - id: python.xss.django-safe-filter
-    pattern: "|safe"
-    message: >
-      Django |safe filter disables auto-escaping. Ensure the content does
-      not contain user-controlled data to prevent XSS.
-    severity: WARNING
-    languages: [python]
-    metadata:
-      cwe: CWE-79
-      category: security
-      confidence: LOW
-
   # ── Authentication ─────────────────────────────────────────────
   - id: python.auth.flask-debug
     patterns:
@@ -255,7 +243,8 @@ rules:
   - id: python.auth.jwt-no-verify
     patterns:
       - pattern-either:
-          - pattern: jwt.decode(..., options={"verify_signature": False}, ...)
+          - pattern: |
+              jwt.decode(..., options={"verify_signature": False}, ...)
           - pattern: jwt.decode(..., verify=False, ...)
           - pattern: jwt.decode($TOKEN, algorithms=["none"], ...)
     message: >

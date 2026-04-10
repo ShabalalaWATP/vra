@@ -201,14 +201,17 @@ async def stream_chat(
         lines.append("")
         for i, f in enumerate(findings[:30], 1):  # Cap at 30 for context window
             cwe = f", CWE: {', '.join(f.cwe_ids)}" if f.cwe_ids else ""
-            cves = ""
+            advisories = ""
             if f.related_cves:
-                cve_ids = [c.get("cve_id", "") for c in f.related_cves[:2]]
-                cves = f", Related CVEs: {', '.join(cve_ids)}"
+                advisory_ids = [
+                    c.get("display_id") or c.get("cve_id") or c.get("advisory_id", "")
+                    for c in f.related_cves[:2]
+                ]
+                advisories = f", Related advisories: {', '.join(filter(None, advisory_ids))}"
             exploit = f", Exploit: {f.exploit_difficulty}" if f.exploit_difficulty else ""
             lines.append(
                 f"{i}. **[{f.severity.upper()}]** {f.title} "
-                f"(confidence: {f.confidence:.0%}{cwe}{cves}{exploit})"
+                f"(confidence: {f.confidence:.0%}{cwe}{advisories}{exploit})"
             )
             if f.description:
                 lines.append(f"   {f.description[:150]}")
@@ -273,7 +276,7 @@ async def stream_chat(
             "type": "function",
             "function": {
                 "name": "get_finding_details",
-                "description": "Get full details of a specific security finding including description, code snippet, evidence, exploit info, and related CVEs.",
+                "description": "Get full details of a specific security finding including description, code snippet, evidence, exploit info, and related advisories.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -370,8 +373,11 @@ async def stream_chat(
                 if f.attack_scenario:
                     parts.append(f"\nAttack Scenario: {f.attack_scenario[:300]}")
                 if f.related_cves:
-                    cve_strs = [f"{c['cve_id']}: {c['summary'][:80]}" for c in f.related_cves[:3]]
-                    parts.append(f"\nRelated CVEs:\n" + "\n".join(cve_strs))
+                    advisory_strs = []
+                    for advisory in f.related_cves[:3]:
+                        advisory_id = advisory.get("display_id") or advisory.get("cve_id") or advisory.get("advisory_id") or "advisory"
+                        advisory_strs.append(f"{advisory_id}: {advisory.get('summary', '')[:80]}")
+                    parts.append(f"\nRelated Advisories:\n" + "\n".join(advisory_strs))
                 if f.evidence:
                     sup = [e for e in f.evidence if e.type == "supporting"]
                     opp = [e for e in f.evidence if e.type == "opposing"]

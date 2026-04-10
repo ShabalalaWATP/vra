@@ -17,11 +17,22 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
+import yaml
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.11+ ships tomllib
     tomllib = None
 
+from app.analysis.advisory_db import load_ecosystem_advisories
+from app.analysis.package_identity import (
+    normalise_package_name,
+    package_index_keys,
+    package_lookup_keys,
+)
+from app.analysis.paths import load_repo_path_policy, should_skip_repo_path
 from app.config import settings
 from app.scanners.base import ScannerAdapter, ScannerHit, ScannerOutput
 
@@ -46,29 +57,115 @@ MANIFEST_PATTERNS = {
     "packages.config": "nuget",
     "composer.lock": "packagist",
     "composer.json": "packagist",
+    "pubspec.lock": "pub",
+    "mix.lock": "hex",
 }
 
 
-def parse_version(version_str: str) -> tuple:
-    """Parse a version string into a comparable tuple.
+QUALIFIER_REPLACEMENTS = {
+    r"(?<=\d)[._-]?final\b": "",
+    r"(?<=\d)[._-]?release\b": "",
+    r"(?<=\d)[._-]?ga\b": "",
+    r"(?<=\d)[._-]?preview\b": "rc",
+    r"(?<=\d)[._-]?pre\b": "rc",
+    r"(?<=\d)[._-]?cr\b": "rc",
+    r"(?<=\d)[._-]?alpha\b": "a",
+    r"(?<=\d)[._-]?beta\b": "b",
+    r"(?<=\d)[._-]?snapshot\b": ".dev0",
+}
 
-    Handles standard semver (1.2.3), pre-release tags (1.0.0-beta.1),
-    and non-standard versions (1.2.3.4).
-    """
-    # Strip leading 'v' or '=' prefix
-    version_str = version_str.lstrip("v=").strip()
-    # Split on hyphen to separate pre-release
-    base, *pre = version_str.split("-", 1)
+
+def _normalise_version_token(version_str: str) -> str:
+    value = str(version_str or "").strip().lstrip("=vV")
+    if not value:
+        return ""
+
+    lowered = value.lower()
+    for pattern, replacement in QUALIFIER_REPLACEMENTS.items():
+        lowered = re.sub(pattern, replacement, lowered)
+
+    lowered = re.sub(r"[._-]?(sp)(?=\d|$)", ".post", lowered)
+    lowered = re.sub(r"[._-]?(dev)(?=\d|$)", ".dev", lowered)
+    lowered = re.sub(r"\.+", ".", lowered).strip(".- _")
+    return lowered
+
+
+def _packaging_version(version_str: str) -> Version | None:
+    normalised = _normalise_version_token(version_str)
+    if not normalised:
+        return None
+
+    try:
+        return Version(normalised)
+    except InvalidVersion:
+        return None
+
+
+def parse_version(version_str: str) -> tuple:
+    """Parse a version string into a comparable tuple."""
+    parsed = _packaging_version(version_str)
+    if parsed is not None:
+        return tuple(parsed.release) + (0 if parsed.is_prerelease else 1,)
+
+    # Fallback for ecosystems with looser versioning (e.g. Maven qualifiers).
+    version_str = _normalise_version_token(version_str)
+    base, *pre = re.split(r"[-+]", version_str, maxsplit=1)
     parts = re.findall(r"\d+", base)
     nums = tuple(int(p) for p in parts)
-    # Pre-release versions sort before their release (1.0.0-beta < 1.0.0)
-    # Represent as: (1, 0, 0, 0) for pre-release, (1, 0, 0, 1) for release
     if pre:
         return nums + (0,)
     return nums + (1,)
 
 
-def version_in_range(version: str, affected_range: str) -> bool:
+def _compare_versions(left: str, right: str) -> int:
+    left_version = _packaging_version(left)
+    right_version = _packaging_version(right)
+    if left_version is not None and right_version is not None:
+        if left_version < right_version:
+            return -1
+        if left_version > right_version:
+            return 1
+        return 0
+
+    left_key = parse_version(left)
+    right_key = parse_version(right)
+    if left_key < right_key:
+        return -1
+    if left_key > right_key:
+        return 1
+    return 0
+
+
+def _pep440_in_range(version: str, affected_range: str) -> bool | None:
+    if not version or not affected_range:
+        return False
+    if affected_range.startswith(("~", "^")):
+        return None
+    if "||" in affected_range:
+        return any(_pep440_in_range(version, part.strip()) for part in affected_range.split("||"))
+
+    version_obj = _packaging_version(version)
+    if version_obj is None:
+        return None
+
+    affected_range = affected_range.strip()
+    if affected_range == "*":
+        return True
+
+    if not re.match(r"^[<>=!~]", affected_range):
+        candidate = _packaging_version(affected_range)
+        if candidate is None:
+            return None
+        return version_obj == candidate
+
+    try:
+        specifiers = SpecifierSet(affected_range.replace(" ", ""))
+    except InvalidSpecifier:
+        return None
+    return version_obj in specifiers
+
+
+def version_in_range(version: str, affected_range: str, ecosystem: str | None = None) -> bool:
     """Check if a version falls within an affected range.
 
     Supports:
@@ -85,8 +182,16 @@ def version_in_range(version: str, affected_range: str) -> bool:
     if affected_range == "*":
         return True
 
+    ecosystem = (ecosystem or "").strip().lower()
+    if ecosystem == "pypi":
+        pep440_match = _pep440_in_range(version, affected_range)
+        if pep440_match is not None:
+            return pep440_match
+
     try:
-        v = parse_version(version)
+        # Support OR-ed ranges produced when an advisory has multiple affected windows.
+        if "||" in affected_range:
+            return any(version_in_range(version, part.strip(), ecosystem) for part in affected_range.split("||"))
 
         # Handle tilde ranges: ~1.2.3 -> >=1.2.3, <1.3.0
         if affected_range.startswith("~"):
@@ -94,7 +199,7 @@ def version_in_range(version: str, affected_range: str) -> bool:
             base_parts = re.findall(r"\d+", base)
             if len(base_parts) >= 2:
                 upper = f"{base_parts[0]}.{int(base_parts[1]) + 1}.0"
-                return v >= parse_version(base) and v < parse_version(upper)
+                return _compare_versions(version, base) >= 0 and _compare_versions(version, upper) < 0
 
         # Handle caret ranges: ^1.2.3 -> >=1.2.3, <2.0.0
         if affected_range.startswith("^"):
@@ -108,7 +213,7 @@ def version_in_range(version: str, affected_range: str) -> bool:
                     upper = f"0.{int(base_parts[1]) + 1}.0"
                 else:
                     upper = "1.0.0"
-                return v >= parse_version(base) and v < parse_version(upper)
+                return _compare_versions(version, base) >= 0 and _compare_versions(version, upper) < 0
 
         # Handle constraint-based ranges
         for constraint in affected_range.split(","):
@@ -117,32 +222,52 @@ def version_in_range(version: str, affected_range: str) -> bool:
                 continue
 
             if constraint.startswith("!="):
-                if v == parse_version(constraint[2:]):
+                if _compare_versions(version, constraint[2:]) == 0:
                     return False
             elif constraint.startswith(">="):
-                if v < parse_version(constraint[2:]):
+                if _compare_versions(version, constraint[2:]) < 0:
                     return False
             elif constraint.startswith(">"):
-                if v <= parse_version(constraint[1:]):
+                if _compare_versions(version, constraint[1:]) <= 0:
                     return False
             elif constraint.startswith("<="):
-                if v > parse_version(constraint[2:]):
+                if _compare_versions(version, constraint[2:]) > 0:
                     return False
             elif constraint.startswith("<"):
-                if v >= parse_version(constraint[1:]):
+                if _compare_versions(version, constraint[1:]) >= 0:
                     return False
             elif constraint.startswith("==") or constraint.startswith("="):
                 eq_val = constraint.lstrip("=")
-                if v != parse_version(eq_val):
+                if _compare_versions(version, eq_val) != 0:
                     return False
             else:
                 # Bare version string = exact match
-                if "." in constraint and v != parse_version(constraint):
+                if "." in constraint and _compare_versions(version, constraint) != 0:
                     return False
 
         return True
     except Exception:
         return False
+
+
+def version_matches_advisory(version: str, advisory: dict, ecosystem: str | None = None) -> bool:
+    if not version or not advisory:
+        return False
+
+    affected_ranges = advisory.get("affected_ranges") or []
+    for affected_range in affected_ranges:
+        if isinstance(affected_range, str) and version_in_range(version, affected_range, ecosystem):
+            return True
+
+    affected_range = advisory.get("affected_range", "")
+    if isinstance(affected_range, str) and affected_range and version_in_range(version, affected_range, ecosystem):
+        return True
+
+    affected_versions = advisory.get("affected_versions") or []
+    if any(_compare_versions(version, str(candidate).strip()) == 0 for candidate in affected_versions if candidate):
+        return True
+
+    return False
 
 
 class DepAuditAdapter(ScannerAdapter):
@@ -194,22 +319,14 @@ class DepAuditAdapter(ScannerAdapter):
             return
 
         index: dict[str, list[dict]] = {}
-
-        for advisory_file in db_path.glob("*.json"):
-            try:
-                data = json.loads(advisory_file.read_text())
-                if not isinstance(data, list):
-                    data = [data]
-
-                for adv in data:
-                    pkg_name = adv.get("package", "").lower()
-                    if not pkg_name:
-                        continue
-                    if pkg_name not in index:
-                        index[pkg_name] = []
-                    index[pkg_name].append(adv)
-            except Exception:
+        for adv in load_ecosystem_advisories(settings.advisory_db_path, ecosystem):
+            pkg_name = adv.get("package", "")
+            if not pkg_name:
                 continue
+            for key in package_index_keys(pkg_name, ecosystem):
+                if key not in index:
+                    index[key] = []
+                index[key].append(adv)
 
         self._index[ecosystem] = index
         self._loaded_ecosystems.add(ecosystem)
@@ -218,53 +335,38 @@ class DepAuditAdapter(ScannerAdapter):
         """Check a single package@version against advisories. Returns matching advisories."""
         self._load_ecosystem(ecosystem)
         pkg_index = self._index.get(ecosystem, {})
-        advisories = pkg_index.get(package.lower(), [])
+        matched: dict[str, dict] = {}
+        priority = {
+            "exact_package_match": 3,
+            "canonical_package_match": 2,
+            "artifact_alias_match": 1,
+        }
 
-        matches = []
-        for adv in advisories:
-            affected = adv.get("affected_range", "")
-            if not affected:
-                continue
-            if self._version_in_range(version, affected):
+        for key, match_type in package_lookup_keys(package, ecosystem):
+            for adv in pkg_index.get(key, []):
+                if not version_matches_advisory(version, adv, ecosystem):
+                    continue
+
                 aliases = adv.get("aliases", [])
                 cve_id = next((a for a in aliases if a.startswith("CVE-")), None)
-                matches.append({
-                    "cve_id": cve_id or adv.get("id", ""),
+                advisory_id = adv.get("id", "")
+                existing = matched.get(advisory_id)
+                if existing and priority.get(existing["match_type"], 0) >= priority.get(match_type, 0):
+                    continue
+
+                matched[advisory_id] = {
+                    "advisory_id": advisory_id,
+                    "cve_id": cve_id or advisory_id,
                     "severity": adv.get("severity", ""),
                     "summary": (adv.get("summary") or "")[:200],
                     "fixed_version": adv.get("fixed_version"),
+                    "vulnerable_functions": adv.get("vulnerable_functions", []),
                     "package": package,
+                    "advisory_package": adv.get("package", ""),
                     "ecosystem": ecosystem,
-                })
-        return matches
-
-    @staticmethod
-    def _version_in_range(version: str, affected_range: str) -> bool:
-        """Simple version range check. Handles common formats like >=0,<4.6.5."""
-        try:
-            from packaging.version import Version
-            ver = Version(version)
-            # Parse comma-separated constraints
-            for constraint in affected_range.split(","):
-                constraint = constraint.strip()
-                if constraint.startswith(">="):
-                    if ver < Version(constraint[2:]):
-                        return False
-                elif constraint.startswith(">"):
-                    if ver <= Version(constraint[1:]):
-                        return False
-                elif constraint.startswith("<="):
-                    if ver > Version(constraint[2:]):
-                        return False
-                elif constraint.startswith("<"):
-                    if ver >= Version(constraint[1:]):
-                        return False
-                elif constraint.startswith("="):
-                    if ver != Version(constraint[1:]):
-                        return False
-            return True
-        except Exception:
-            return False
+                    "match_type": match_type,
+                }
+        return list(matched.values())
 
     async def run(
         self,
@@ -285,44 +387,55 @@ class DepAuditAdapter(ScannerAdapter):
         for eco in ecosystems_needed:
             self._load_ecosystem(eco)
 
-        # Lookup is now O(1) per package instead of O(n) scanning all advisories
+        # Lookup uses the pre-built alias index, keeping per-package work bounded.
         for pkg in packages:
             ecosystem = pkg["ecosystem"]
-            eco_index = self._index.get(ecosystem, {})
-            pkg_advisories = eco_index.get(pkg["name"].lower(), [])
+            matches = self.lookup_package(ecosystem, pkg["name"], pkg["version"])
 
-            for adv in pkg_advisories:
-                affected = adv.get("affected_range", "")
-                if version_in_range(pkg["version"], affected):
-                    aliases = adv.get("aliases", [])
-                    cve_id = next((a for a in aliases if a.startswith("CVE-")), None)
+            for match in matches:
+                advisories = self._index.get(ecosystem, {})
+                advisory = next(
+                    (
+                        adv
+                        for adv in advisories.get(normalise_package_name(match["advisory_package"], ecosystem), [])
+                        if adv.get("id") == match["advisory_id"]
+                    ),
+                    None,
+                )
+                if not advisory:
+                    continue
 
-                    hits.append(
-                        ScannerHit(
-                            rule_id=adv.get("id", "unknown"),
-                            severity=adv.get("severity", "medium").lower(),
-                            message=adv.get("summary", "Known vulnerability"),
-                            file_path=pkg["source_file"],
-                            start_line=0,
-                            metadata={
-                                "advisory_id": adv.get("id"),
-                                "cve_id": cve_id,
-                                "aliases": aliases,
-                                "cvss": adv.get("cvss_score"),
-                                "cvss_vector": adv.get("cvss_vector"),
-                                "affected_range": affected,
-                                "fixed_version": adv.get("fixed_version"),
-                                "package": pkg["name"],
-                                "ecosystem": ecosystem,
-                                "installed_version": pkg["version"],
-                                "cwes": adv.get("cwes", []),
-                                "details": adv.get("details", "")[:500],
-                                "references": adv.get("references", [])[:3],
-                                "vulnerable_functions": adv.get("vulnerable_functions", []),
-                                "is_dev": pkg.get("is_dev", False),
-                            },
-                        )
+                hits.append(
+                    ScannerHit(
+                        rule_id=advisory.get("id", "unknown"),
+                        severity=advisory.get("severity", "medium").lower(),
+                        message=advisory.get("summary", "Known vulnerability"),
+                        file_path=pkg["source_file"],
+                        start_line=0,
+                        metadata={
+                            "advisory_id": advisory.get("id"),
+                            "cve_id": match["cve_id"],
+                            "aliases": advisory.get("aliases", []),
+                            "cvss": advisory.get("cvss_score"),
+                            "cvss_vector": advisory.get("cvss_vector"),
+                            "affected_range": advisory.get("affected_range", ""),
+                            "affected_ranges": advisory.get("affected_ranges", []),
+                            "affected_versions": advisory.get("affected_versions", []),
+                            "fixed_version": advisory.get("fixed_version"),
+                            "fixed_versions": advisory.get("fixed_versions", []),
+                            "package": pkg["name"],
+                            "matched_package": advisory.get("package", ""),
+                            "ecosystem": ecosystem,
+                            "installed_version": pkg["version"],
+                            "cwes": advisory.get("cwes", []),
+                            "details": advisory.get("details", "")[:500],
+                            "references": advisory.get("references", [])[:3],
+                            "vulnerable_functions": advisory.get("vulnerable_functions", []),
+                            "match_type": match["match_type"],
+                            "is_dev": pkg.get("is_dev", False),
+                        },
                     )
+                )
 
         duration = int((time.monotonic() - start) * 1000)
         return ScannerOutput(
@@ -347,14 +460,15 @@ class DepAuditAdapter(ScannerAdapter):
             str(Path(f)).replace("\\", "/").strip("/")
             for f in (file_filter or [])
         }
+        policy = load_repo_path_policy(root)
 
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
+            if should_skip_repo_path(path, root, policy=policy):
+                continue
 
             rel_path = str(path.relative_to(root)).replace("\\", "/")
-            if "node_modules" in rel_path:
-                continue
             if allowed and rel_path not in allowed:
                 continue
 
@@ -373,7 +487,7 @@ class DepAuditAdapter(ScannerAdapter):
 
             key = (
                 ecosystem,
-                name.lower(),
+                normalise_package_name(name, ecosystem),
                 version,
                 pkg.get("source_file", ""),
                 bool(pkg.get("is_dev", False)),
@@ -425,6 +539,10 @@ class DepAuditAdapter(ScannerAdapter):
             return self._parse_composer_lock
         if name == "composer.json":
             return self._parse_composer_json
+        if name == "pubspec.lock":
+            return self._parse_pubspec_lock
+        if name == "mix.lock":
+            return self._parse_mix_lock
         return None
 
     @staticmethod
@@ -845,6 +963,67 @@ class DepAuditAdapter(ScannerAdapter):
                 )
                 if pkg:
                     pkgs.append(pkg)
+        return pkgs
+
+    def _parse_pubspec_lock(self, path: Path, rel_path: str) -> list[dict]:
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return []
+
+        packages = data.get("packages", {}) if isinstance(data, dict) else {}
+        if not isinstance(packages, dict):
+            return []
+
+        pkgs = []
+        for package_name, metadata in packages.items():
+            if not isinstance(metadata, dict):
+                continue
+
+            source = str(metadata.get("source", "")).strip().lower()
+            if source in {"path", "git"}:
+                continue
+
+            description = metadata.get("description")
+            if isinstance(description, dict):
+                package_name = description.get("name") or package_name
+
+            dependency_type = str(metadata.get("dependency", "")).strip().lower()
+            pkg = self._pkg(
+                package_name,
+                metadata.get("version"),
+                "pub",
+                rel_path,
+                is_dev="dev" in dependency_type,
+            )
+            if pkg:
+                pkgs.append(pkg)
+        return pkgs
+
+    def _parse_mix_lock(self, path: Path, rel_path: str) -> list[dict]:
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return []
+
+        hex_entry_pattern = re.compile(
+            r'"(?P<lock_name>[^"]+)"\s*(?:=>|:)\s*\{\s*:hex\s*,\s*'
+            r'(?::"(?P<quoted_atom>[^"]+)"|:(?P<atom>[A-Za-z0-9_]+)|"(?P<quoted_name>[^"]+)")\s*,\s*'
+            r'"(?P<version>[^"]+)"',
+            re.MULTILINE,
+        )
+
+        pkgs = []
+        for match in hex_entry_pattern.finditer(content):
+            package_name = (
+                match.group("quoted_atom")
+                or match.group("atom")
+                or match.group("quoted_name")
+                or match.group("lock_name")
+            )
+            pkg = self._pkg(package_name, match.group("version"), "hex", rel_path)
+            if pkg:
+                pkgs.append(pkg)
         return pkgs
 
     def _parse_setup_py(self, path: Path, rel_path: str) -> list[dict]:

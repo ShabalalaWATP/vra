@@ -2,10 +2,10 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Float, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.db_types import JSONType
 
 
 class File(Base):
@@ -19,7 +19,7 @@ class File(Base):
     size_bytes: Mapped[int | None] = mapped_column(Integer)
     line_count: Mapped[int | None] = mapped_column(Integer)
     priority_score: Mapped[float] = mapped_column(Float, default=0.0)
-    score_reasons: Mapped[dict | None] = mapped_column(JSONB)
+    score_reasons: Mapped[dict | None] = mapped_column(JSONType)
     is_test: Mapped[bool] = mapped_column(default=False)
     is_config: Mapped[bool] = mapped_column(default=False)
     is_generated: Mapped[bool] = mapped_column(default=False)

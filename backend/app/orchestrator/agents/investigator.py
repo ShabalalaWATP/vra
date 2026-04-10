@@ -13,6 +13,8 @@ Key improvements over naive single-pass:
 import logging
 from pathlib import Path
 
+from app.analysis.investigation_scope import should_investigate_file_path
+from app.analysis.dependency_context import dep_cache_entries, vulnerable_dependency_context_for_file
 from app.scanners.registry import get_available_scanners
 
 from app.orchestrator.agents.base import BaseAgent
@@ -32,6 +34,11 @@ Your task:
 5. Collect supporting AND opposing evidence
 6. Decide what related files you need to inspect next
 
+Non-executable files can still be security-critical. Treat configuration, manifests,
+lockfiles, templates, HTML/XML/YAML/JSON/TOML, container files, and IaC as part of
+the attack surface when they influence secrets, trust boundaries, dependency risk,
+runtime behavior, templating, or policy enforcement.
+
 For each potential finding, assess:
 - Is the input actually user-controlled? Trace the data source.
 - Is there validation or sanitisation between source and sink?
@@ -42,6 +49,8 @@ For each potential finding, assess:
 For data flow tracing, identify:
 - INPUT SOURCES: request parameters, form data, file uploads, environment variables, database reads, API responses
 - SINKS: SQL queries, OS commands, template rendering, file I/O, HTTP requests, serialisation, logging
+
+When taint flow or interprocedural reachability is ambiguous, use targeted CodeQL scans for semantic confirmation.
 
 Respond with JSON:
 {
@@ -82,6 +91,10 @@ Respond with JSON:
 
 
 class InvestigatorAgent(BaseAgent):
+    _MAX_TOOL_ROUNDS = 4
+    _SCANNER_CONTEXT_LIMIT = 40
+    _INLINE_SCANNER_HITS = 15
+
     @property
     def name(self) -> str:
         return "investigator"
@@ -300,38 +313,12 @@ class InvestigatorAgent(BaseAgent):
             ),
         )
 
-    # File extensions that should never be investigated (non-code, docs, assets)
-    _SKIP_EXTENSIONS = frozenset({
-        ".md", ".txt", ".rst", ".csv", ".json", ".yaml", ".yml", ".toml",
-        ".xml", ".html", ".htm", ".css", ".scss", ".less", ".sass",
-        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".bmp", ".webp",
-        ".woff", ".woff2", ".ttf", ".eot", ".otf",
-        ".pdf", ".doc", ".docx", ".xls", ".xlsx",
-        ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
-        ".mp3", ".mp4", ".avi", ".mov", ".wav",
-        ".lock", ".sum", ".map", ".min.js", ".min.css",
-        ".env.example", ".gitignore", ".dockerignore", ".editorconfig",
-        ".prettierrc", ".eslintignore",
-        ".dist", ".sample", ".bak", ".orig", ".swp",
-        ".db", ".sqlite", ".sqlite3",
-        ".log", ".pid",
-    })
-    _SKIP_FILENAMES = frozenset({
-        "LICENSE", "LICENCE", "COPYING", "CHANGELOG", "CHANGES", "AUTHORS",
-        "CONTRIBUTORS", "NOTICE", "Makefile", "Dockerfile", "docker-compose.yml",
-        "compose.yml", ".gitignore", ".dockerignore",
-        "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-        "Pipfile.lock", "poetry.lock", "composer.lock",
-    })
-
     async def _investigate_file(
         self, ctx: ScanContext, file_path: str, *, hops_remaining: int = 0
     ):
-        # Skip non-code files (docs, assets, config)
-        import os
-        basename = os.path.basename(file_path)
-        _, ext = os.path.splitext(file_path.lower())
-        if ext in self._SKIP_EXTENSIONS or basename in self._SKIP_FILENAMES:
+        # Skip only obviously irrelevant assets/docs; keep security-relevant config
+        # and template files in scope for deep review.
+        if not should_investigate_file_path(file_path):
             ctx.files_inspected.add(file_path)
             return
 
@@ -351,13 +338,18 @@ class InvestigatorAgent(BaseAgent):
         related_snippets = await self._get_related_file_snippets(ctx, file_path)
 
         scanner_context = await self._get_scanner_hits(ctx, file_path)
+        dep_context = self._get_dep_context_for_file(ctx, file_path)
 
         # Check for calls to known vulnerable functions (CVE-linked)
         vuln_func_context = []
         try:
             from app.analysis.cve_correlator import find_vulnerable_function_calls
             vuln_funcs = find_vulnerable_function_calls(
-                file_path, content, languages=list(ctx.languages) if ctx.languages else None
+                file_path,
+                content,
+                languages=list(ctx.languages) if ctx.languages else None,
+                import_resolutions=ctx.import_graph.get(file_path, []),
+                vulnerable_dependencies=dep_context,
             )
             vuln_func_context = vuln_funcs
         except Exception:
@@ -367,6 +359,7 @@ class InvestigatorAgent(BaseAgent):
             ctx, file_path, content, scanner_context,
             related_files=related_snippets,
             vuln_functions=vuln_func_context,
+            dep_context=dep_context,
         )
 
         try:
@@ -395,8 +388,9 @@ class InvestigatorAgent(BaseAgent):
                     "find_files_importing",
                     "run_semgrep_on_files",
                     "run_bandit_on_files",
+                    "run_codeql_on_files",
                 ],
-                max_tool_rounds=2,
+                max_tool_rounds=self._MAX_TOOL_ROUNDS,
             )
         except Exception as e:
             await self.emit(ctx, f"Investigation failed for {file_path}: {e}", level="warn")
@@ -477,19 +471,128 @@ class InvestigatorAgent(BaseAgent):
                     select(ScannerResult)
                     .where(ScannerResult.file_id == file_rec.id)
                     .order_by(ScannerResult.created_at.desc(), ScannerResult.id.desc())
-                    .limit(20)
+                    .limit(60)
                 )
                 for sr in result.scalars().all():
+                    metadata = sr.extra_data or {}
                     hits.append({
                         "scanner": sr.scanner,
                         "rule_id": sr.rule_id or "",
                         "message": sr.message or "",
                         "line": sr.start_line or 0,
+                        "end_line": sr.end_line,
                         "severity": sr.severity or "info",
+                        "snippet": self._summarise_scanner_snippet(sr.snippet),
+                        "metadata": metadata,
+                        "metadata_summary": self._summarise_scanner_metadata(sr.scanner, metadata),
                     })
         except Exception:
             pass
-        return hits
+        hits.sort(key=self._scanner_context_sort_key)
+        return hits[:self._SCANNER_CONTEXT_LIMIT]
+
+    @staticmethod
+    def _scanner_context_sort_key(hit: dict) -> tuple[int, int, int, int]:
+        scanner_rank = {
+            "codeql": 0,
+            "dep_audit": 1,
+            "semgrep": 2,
+            "bandit": 3,
+            "eslint": 4,
+            "secrets": 5,
+        }
+        severity_rank = {
+            "critical": 0,
+            "high": 1,
+            "medium": 2,
+            "low": 3,
+            "info": 4,
+        }
+        metadata = hit.get("metadata") or {}
+        richness = 0 if (metadata.get("data_flow_steps") or metadata.get("vulnerable_functions")) else 1
+        return (
+            scanner_rank.get(hit.get("scanner", ""), 9),
+            severity_rank.get(hit.get("severity", "info"), 4),
+            richness,
+            int(hit.get("line") or 0),
+        )
+
+    @staticmethod
+    def _summarise_scanner_snippet(snippet: str | None, max_lines: int = 6, max_chars: int = 320) -> str:
+        text = (snippet or "").strip()
+        if not text:
+            return ""
+        lines = text.splitlines()[:max_lines]
+        trimmed = "\n".join(lines)
+        if len(trimmed) > max_chars:
+            trimmed = trimmed[: max_chars - 3].rstrip() + "..."
+        return trimmed
+
+    @staticmethod
+    def _summarise_scanner_metadata(scanner: str, metadata: dict | None) -> str:
+        if not isinstance(metadata, dict) or not metadata:
+            return ""
+
+        scanner_name = (scanner or "").lower()
+        details: list[str] = []
+
+        if scanner_name == "codeql":
+            suites = metadata.get("matched_suites") or metadata.get("query_suites") or []
+            if suites:
+                details.append(f"Suites: {', '.join(str(s) for s in suites[:3])}")
+            cwes = metadata.get("cwes") or []
+            if cwes:
+                details.append(f"CWEs: {', '.join(str(cwe) for cwe in cwes[:4])}")
+            flow_steps = metadata.get("data_flow_steps") or []
+            if flow_steps:
+                rendered = []
+                for step in flow_steps[:5]:
+                    if not isinstance(step, dict):
+                        continue
+                    step_file = str(step.get("file", "?")).replace("\\", "/")
+                    rendered.append(f"{step_file}:{int(step.get('line') or 0)}")
+                if rendered:
+                    suffix = " -> ..." if len(flow_steps) > len(rendered) else ""
+                    details.append(f"Flow: {' -> '.join(rendered)}{suffix}")
+        elif scanner_name == "dep_audit":
+            package = metadata.get("package")
+            version = metadata.get("installed_version")
+            if package:
+                label = f"{package}@{version}" if version else str(package)
+                details.append(f"Dependency: {label}")
+            advisory_id = metadata.get("cve_id") or metadata.get("advisory_id")
+            if advisory_id:
+                details.append(f"Advisory: {advisory_id}")
+            if metadata.get("affected_range"):
+                details.append(f"Affected: {metadata['affected_range']}")
+            if metadata.get("fixed_version"):
+                details.append(f"Fixed in: {metadata['fixed_version']}")
+            if metadata.get("match_type"):
+                details.append(f"Evidence: {metadata['match_type']}")
+            vulnerable_functions = metadata.get("vulnerable_functions") or []
+            if vulnerable_functions:
+                details.append(
+                    f"Vulnerable functions: {', '.join(str(fn) for fn in vulnerable_functions[:4])}"
+                )
+        elif scanner_name == "bandit":
+            if metadata.get("test_name"):
+                details.append(f"Test: {metadata['test_name']}")
+            if metadata.get("confidence"):
+                details.append(f"Confidence: {metadata['confidence']}")
+            cwe = metadata.get("cwe")
+            if isinstance(cwe, dict) and cwe.get("id"):
+                details.append(f"CWE: CWE-{cwe['id']}")
+        else:
+            tags = metadata.get("tags") or []
+            if tags:
+                details.append(f"Tags: {', '.join(str(tag) for tag in tags[:4])}")
+            cwes = metadata.get("cwes") or metadata.get("cwe_ids") or []
+            if cwes:
+                details.append(f"CWEs: {', '.join(str(cwe) for cwe in cwes[:4])}")
+            if metadata.get("owasp"):
+                details.append(f"OWASP: {metadata['owasp']}")
+
+        return " | ".join(part for part in details if part)
 
     async def _persist_targeted_scan_hits(
         self,
@@ -641,8 +744,9 @@ class InvestigatorAgent(BaseAgent):
                     "get_callers_of",
                     "get_entry_points_reaching",
                     "get_resolved_imports",
+                    "run_codeql_on_files",
                 ],
-                max_tool_rounds=2,
+                max_tool_rounds=self._MAX_TOOL_ROUNDS,
             )
             self._process_investigation_result(ctx, result, source_file)
         except Exception as e:
@@ -684,8 +788,9 @@ class InvestigatorAgent(BaseAgent):
                     "trace_call_chain",
                     "get_callers_of",
                     "get_entry_points_reaching",
+                    "run_codeql_on_files",
                 ],
-                max_tool_rounds=2,
+                max_tool_rounds=self._MAX_TOOL_ROUNDS,
             )
             self._process_investigation_result(ctx, result, file_path)
         except Exception as e:
@@ -732,8 +837,9 @@ class InvestigatorAgent(BaseAgent):
                     "get_entry_points_reaching",
                     "get_resolved_imports",
                     "find_files_importing",
+                    "run_codeql_on_files",
                 ],
-                max_tool_rounds=2,
+                max_tool_rounds=self._MAX_TOOL_ROUNDS,
             )
             self._process_investigation_result(ctx, result, file_a)
         except Exception as e:
@@ -744,7 +850,7 @@ class InvestigatorAgent(BaseAgent):
         if hasattr(ctx, '_dep_cache') and ctx._dep_cache:
             return
 
-        ctx._dep_cache = {}  # package_name_lower -> [cve_info]
+        ctx._dep_cache = {"entries": [], "by_package": {}}
         try:
             from app.database import async_session
             from app.models.dependency import Dependency, DependencyFinding
@@ -757,9 +863,7 @@ class InvestigatorAgent(BaseAgent):
                 )
                 for df, dep in result.all():
                     key = dep.name.lower().replace("-", "_")
-                    if key not in ctx._dep_cache:
-                        ctx._dep_cache[key] = []
-                    ctx._dep_cache[key].append({
+                    entry = {
                         "package": dep.name,
                         "version": dep.version,
                         "ecosystem": dep.ecosystem,
@@ -772,11 +876,20 @@ class InvestigatorAgent(BaseAgent):
                         "cwes": df.cwes or [],
                         "references": (df.references or [])[:2],
                         "vulnerable_functions": df.vulnerable_functions or [],
+                        "evidence_type": df.evidence_type,
                         "ai_assessment": df.ai_assessment or "",
                         "relevance": df.relevance,
-                    })
+                        "reachability_status": df.reachability_status,
+                        "risk_score": df.risk_score,
+                    }
+                    ctx._dep_cache["entries"].append(entry)
+                    ctx._dep_cache["by_package"].setdefault(key, []).append(entry)
         except Exception:
             pass
+
+    @staticmethod
+    def _dep_cache_entries(ctx: ScanContext) -> list[dict]:
+        return dep_cache_entries(ctx)
 
     async def _get_related_file_snippets(
         self, ctx: ScanContext, file_path: str, max_files: int = 3, max_lines: int = 150
@@ -831,37 +944,7 @@ class InvestigatorAgent(BaseAgent):
         Check if this file imports any packages that have known CVEs.
         Uses the cached dep findings (loaded once per scan).
         """
-        if not hasattr(ctx, '_dep_cache') or not ctx._dep_cache:
-            return []
-
-        try:
-            full_path = Path(ctx.repo_path) / file_path
-            if not full_path.exists():
-                return []
-
-            content = full_path.read_text(encoding="utf-8", errors="ignore")[:5000].lower()
-
-            matches = []
-            for pkg_key, cves in ctx._dep_cache.items():
-                # Check if this package is imported in the file
-                # Handle common import patterns
-                variants = [pkg_key, pkg_key.replace("_", "-"), pkg_key.replace("-", "_")]
-                for variant in variants:
-                    if (
-                        f"import {variant}" in content
-                        or f"from {variant}" in content
-                        or f"require('{variant}" in content
-                        or f'require("{variant}' in content
-                        or f"import '{variant}" in content
-                        or f'import "{variant}' in content
-                    ):
-                        matches.extend(cves)
-                        break
-
-            return matches[:5]  # Cap to avoid prompt bloat
-
-        except Exception:
-            return []
+        return vulnerable_dependency_context_for_file(ctx, file_path)
 
     def _process_investigation_result(self, ctx: ScanContext, result: dict, default_file: str):
         """Process findings and taint flows from any investigation action."""
@@ -932,6 +1015,7 @@ class InvestigatorAgent(BaseAgent):
         self, ctx: ScanContext, file_path: str, content: str, scanner_hits: list[dict],
         *, related_files: list[dict] | None = None,
         vuln_functions: list[dict] | None = None,
+        dep_context: list[dict] | None = None,
     ) -> str:
         parts = [
             "## Application Context",
@@ -989,22 +1073,74 @@ class InvestigatorAgent(BaseAgent):
 
         if scanner_hits:
             parts.append(f"\nScanner signals for {file_path}:")
-            for h in scanner_hits:
-                parts.append(f"- [{h['scanner']}:{h['rule_id']}] {h['message']} (line {h['line']})")
-
-        # Known vulnerable function calls detected in this file (from CVE database)
-        if vuln_functions:
-            parts.append(f"\n### Known Vulnerable Function Calls in This File")
             parts.append(
-                "The following function calls match known CVE entries. "
-                "Verify whether the vulnerable code path is actually reachable:"
+                "Treat these as leads, not proof. Use them together with direct code reading, "
+                "call-graph evidence, and tool lookups if more scanner detail is needed."
             )
-            for vf in vuln_functions:
+            for h in scanner_hits[:self._INLINE_SCANNER_HITS]:
+                line = int(h.get("line") or 0)
+                end_line = int(h.get("end_line") or 0)
+                location = f"lines {line}-{end_line}" if end_line and end_line > line else f"line {line}"
+                label = h.get("rule_id") or "finding"
                 parts.append(
-                    f"- **{vf['function']}()** at line {vf['line']} — "
-                    f"{vf['cve_id']} ({vf['severity'].upper()}) in {vf['package']}: "
-                    f"{vf['summary']}"
+                    f"- [{str(h.get('severity', 'info')).upper()}] "
+                    f"{h.get('scanner', 'scanner')}::{label} at {location} — {h.get('message', '')}"
                 )
+                if h.get("metadata_summary"):
+                    parts.append(f"  Context: {h['metadata_summary']}")
+                if h.get("snippet"):
+                    parts.append(f"  Snippet:\n```text\n{h['snippet']}\n```")
+            remaining_hits = len(scanner_hits) - self._INLINE_SCANNER_HITS
+            if remaining_hits > 0:
+                parts.append(
+                    f"- ... {remaining_hits} additional scanner hits are available through the scanner tools."
+                )
+
+        # Known vulnerable function calls detected in this file (from advisory database)
+        if vuln_functions:
+            confirmed = [vf for vf in vuln_functions if vf.get("evidence_strength") == "strong"]
+            package_linked = [vf for vf in vuln_functions if vf.get("evidence_strength") == "medium"]
+            weak = [vf for vf in vuln_functions if vf.get("evidence_strength") == "weak"]
+
+            def add_vuln_group(title: str, intro: str, items: list[dict], *, limit: int = 5):
+                if not items:
+                    return
+                parts.append(f"\n### {title}")
+                parts.append(intro)
+                for vf in items[:limit]:
+                    advisory_id = vf.get("display_id") or vf.get("cve_id") or vf.get("advisory_id") or "advisory"
+                    evidence_bits = []
+                    if vf.get("import_module"):
+                        evidence_bits.append(f"via `{vf['import_module']}`")
+                    source = vf.get("package_evidence_source")
+                    if source and source not in {"function_name_only", ""}:
+                        evidence_bits.append(f"source: {source}")
+                    confidence = vf.get("package_match_confidence")
+                    if confidence is not None:
+                        evidence_bits.append(f"match {float(confidence):.2f}")
+                    evidence_suffix = f" [{'; '.join(evidence_bits)}]" if evidence_bits else ""
+                    parts.append(
+                        f"- **{vf['function']}()** at line {vf['line']} — "
+                        f"{advisory_id} ({vf.get('severity', 'medium').upper()}) in {vf.get('package', 'package')}: "
+                        f"{vf.get('summary', '')}{evidence_suffix}"
+                    )
+
+            add_vuln_group(
+                "Package-Confirmed Vulnerable Function Calls",
+                "These matches line up with a dependency already identified as vulnerable and imported by this file. Treat them as high-signal evidence, then verify reachability and guards.",
+                confirmed,
+            )
+            add_vuln_group(
+                "Imported-Package Vulnerable Function Leads",
+                "These matches line up with a package imported by this file, but the vulnerable version is not independently confirmed here. Treat them as hypotheses, not proof.",
+                package_linked,
+            )
+            add_vuln_group(
+                "Weak Advisory Function-Name Overlaps",
+                "These only match a known vulnerable symbol name. The vulnerable package is not confirmed as imported in this file, so do not treat them as proof without package evidence.",
+                weak,
+                limit=3,
+            )
 
         # Vulnerable technology versions detected in the codebase
         vuln_versions = ctx.fingerprint.get("vulnerable_versions", [])
@@ -1013,14 +1149,19 @@ class InvestigatorAgent(BaseAgent):
             if relevant:
                 parts.append(f"\n### Vulnerable Technology Versions in This File")
                 for v in relevant:
+                    advisory_id = v.get("cve_id") or v.get("advisory_id") or "advisory"
                     parts.append(
-                        f"- **{v['package']}** v{v['version']} — {v['cve_id']} ({v['severity'].upper()}): "
+                        f"- **{v['package']}** v{v['version']} — {advisory_id} ({v['severity'].upper()}): "
                         f"{v['summary']}"
                     )
+                    if v.get("vulnerable_functions"):
+                        parts.append(
+                            f"  Vulnerable functions: {', '.join(v['vulnerable_functions'][:5])}"
+                        )
 
-        # Vulnerable dependency context — tell the AI about specific CVEs
+        # Vulnerable dependency context — tell the AI about specific advisories
         # so it can check if vulnerable functions are actually called
-        dep_context = self._get_dep_context_for_file(ctx, file_path)
+        dep_context = dep_context if dep_context is not None else self._get_dep_context_for_file(ctx, file_path)
         if dep_context:
             parts.append(f"\n### Vulnerable Dependencies Imported by This File")
             for dc in dep_context:
@@ -1034,6 +1175,11 @@ class InvestigatorAgent(BaseAgent):
                     parts.append(f"  CWEs: {', '.join(dc['cwes'])}")
                 if dc.get("vulnerable_functions"):
                     parts.append(f"  Vulnerable functions: {', '.join(dc['vulnerable_functions'])}")
+                if dc.get("import_module"):
+                    parts.append(
+                        f"  Imported via: {dc['import_module']} "
+                        f"({dc.get('import_match_source', 'unknown')}, match {float(dc.get('import_match_confidence', 0.0)):.2f})"
+                    )
                 if dc.get("details"):
                     parts.append(f"  Details: {dc['details'][:250]}")
                 if dc.get("fixed_version"):
@@ -1041,9 +1187,11 @@ class InvestigatorAgent(BaseAgent):
                 if dc.get("ai_assessment"):
                     parts.append(f"  Assessment: {dc['ai_assessment'][:150]}")
             parts.append(
-                "\n**IMPORTANT**: Check if the vulnerable functions/features listed above are "
-                "called in this file. If they are, trace whether user input can reach them. "
-                "If vulnerable_functions are listed, search for those exact function calls."
+                "\n**IMPORTANT**: Package-confirmed vulnerable-function matches are high-signal leads. "
+                "Imported-package matches still need vulnerable-version confirmation. "
+                "Symbol-only overlaps are weak hints and must not be treated as proof. "
+                "For all of them, verify whether the vulnerable functions/features are actually called "
+                "and whether user-controlled input can reach them."
             )
 
         if ctx.key_observations:

@@ -2,10 +2,10 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Float, ForeignKey, String, Text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.db_types import JSONType
 
 
 class Finding(Base):
@@ -23,11 +23,11 @@ class Finding(Base):
     remediation: Mapped[str | None] = mapped_column(Text)
     code_snippet: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="confirmed")
-    cwe_ids: Mapped[list | None] = mapped_column(JSONB)
-    related_cves: Mapped[list | None] = mapped_column(JSONB)  # [{cve_id, summary, severity, package, fixed_version}]
+    cwe_ids: Mapped[list | None] = mapped_column(JSONType)
+    related_cves: Mapped[list | None] = mapped_column(JSONType)  # [{cve_id, summary, severity, package, fixed_version}]
     # Exploit evidence
     exploit_difficulty: Mapped[str | None] = mapped_column(String(20))
-    exploit_prerequisites: Mapped[list | None] = mapped_column(JSONB)
+    exploit_prerequisites: Mapped[list | None] = mapped_column(JSONType)
     exploit_template: Mapped[str | None] = mapped_column(Text)
     attack_scenario: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))

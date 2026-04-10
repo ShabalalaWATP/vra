@@ -1,0 +1,28 @@
+{
+  "pypi": {
+    "beautifulsoup4": ["bs4"],
+    "djangorestframework": ["rest_framework"],
+    "google-api-python-client": ["googleapiclient"],
+    "mysqlclient": ["mysqldb"],
+    "opencv-contrib-python": ["cv2"],
+    "opencv-python": ["cv2"],
+    "pillow": ["pil"],
+    "psycopg2-binary": ["psycopg2"],
+    "pycryptodome": ["crypto"],
+    "pyjwt": ["jwt"],
+    "pyopenssl": ["openssl"],
+    "python-dateutil": ["dateutil"],
+    "pyyaml": ["yaml"],
+    "ruamel-yaml": ["ruamel.yaml"],
+    "scikit-image": ["skimage"],
+    "scikit-learn": ["sklearn"],
+    "setuptools": ["pkg_resources"]
+  },
+  "maven": {
+    "com.fasterxml.jackson.core:jackson-databind": ["com.fasterxml.jackson.databind"],
+    "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml": ["com.fasterxml.jackson.dataformat.yaml"],
+    "com.google.code.gson:gson": ["com.google.gson"],
+    "com.squareup.okhttp3:okhttp": ["okhttp3"],
+    "org.apache.logging.log4j:log4j-core": ["org.apache.logging.log4j"]
+  }
+}

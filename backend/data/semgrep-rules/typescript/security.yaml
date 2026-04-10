@@ -26,15 +26,22 @@ rules:
 
   - id: typescript.nest.no-auth-guard
     patterns:
-      - pattern: |
+      - pattern-inside: |
           @Controller(...)
           class $CLASS {
-            @Get(...)
-            $METHOD(...) { ... }
+            ...
           }
+      - pattern: |
+          @Get(...)
+          $METHOD(...) { ... }
       - pattern-not-inside: |
           @UseGuards(...)
-          ...
+          $METHOD(...) { ... }
+      - pattern-not-inside: |
+          @UseGuards(...)
+          class $CLASS {
+            ...
+          }
     message: "NestJS endpoint without auth guard. Consider adding @UseGuards(AuthGuard)."
     severity: WARNING
     languages: [typescript]

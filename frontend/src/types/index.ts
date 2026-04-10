@@ -50,7 +50,7 @@ export interface Finding {
   code_snippet: string | null;
   status: string;
   cwe_ids: string[] | null;
-  related_cves: Array<{ cve_id: string; package: string; severity: string; summary: string; fixed_version?: string }> | null;
+  related_cves: RelatedAdvisory[] | null;
   exploit_difficulty: string | null;
   exploit_prerequisites: string[] | null;
   exploit_template: string | null;
@@ -89,6 +89,15 @@ export interface Report {
   sbom: SBOMData | null;
   scan_coverage: ScanCoverage | null;
   created_at: string;
+}
+
+export interface ScannerRunSummary {
+  scanner: string;
+  status: "completed" | "degraded" | "failed" | "skipped";
+  success: boolean;
+  hit_count: number;
+  duration_ms: number;
+  errors: string[];
 }
 
 export interface OWASPEntry {
@@ -131,6 +140,8 @@ export interface ScanCoverage {
   files_skipped_size: number;
   files_skipped_cap: number;
   scanners_used: string[];
+  scanner_runs?: Record<string, ScannerRunSummary>;
+  degraded_coverage?: boolean;
   ai_calls_made: number;
   scan_mode: string;
   obfuscated_files: number;
@@ -138,6 +149,10 @@ export interface ScanCoverage {
   is_apk: boolean;
   doc_files_read: number;
   has_doc_intelligence: boolean;
+  ignored_file_count?: number;
+  ignored_paths?: string[];
+  managed_paths_ignored?: string[];
+  repo_ignore_file?: string | null;
 }
 
 export interface LLMProfile {
@@ -167,6 +182,53 @@ export interface SecretCandidate {
   is_false_positive: boolean;
 }
 
+export interface RelatedAdvisory {
+  display_id?: string | null;
+  advisory_id?: string | null;
+  cve_id?: string | null;
+  package: string;
+  ecosystem?: string | null;
+  severity: string;
+  summary: string;
+  fixed_version?: string | null;
+  evidence_type?: string | null;
+  evidence_strength?: string | null;
+  package_evidence_source?: string | null;
+  package_match_confidence?: number | null;
+  import_module?: string | null;
+  imported_symbol?: string | null;
+  call_object?: string | null;
+  function?: string | null;
+  line?: number | null;
+  cwe_ids?: string[] | null;
+  evidence_types?: string[] | null;
+  evidence_sources?: string[] | null;
+}
+
+export type DependencyRelevance =
+  | "used"
+  | "likely_used"
+  | "transitive_only"
+  | "test_only"
+  | "unknown"
+  | "unused";
+
+export type DependencyReachability =
+  | "reachable"
+  | "potentially_reachable"
+  | "no_path_found"
+  | "not_applicable"
+  | "unknown";
+
+export interface DependencyUsageEvidence {
+  file: string;
+  kind?: string | null;
+  symbol?: string | null;
+  confidence?: number | null;
+  source?: string | null;
+  line?: number | null;
+}
+
 export interface DependencyFinding {
   id: string;
   package_name: string;
@@ -178,7 +240,14 @@ export interface DependencyFinding {
   summary: string | null;
   affected_range: string | null;
   fixed_version: string | null;
-  relevance: string;
+  vulnerable_functions?: string[] | null;
+  evidence_type: string;
+  relevance: DependencyRelevance | string;
+  usage_evidence?: DependencyUsageEvidence[] | null;
+  reachability_status: DependencyReachability | string;
+  reachability_confidence?: number | null;
+  risk_score?: number | null;
+  risk_factors?: Record<string, number | string | boolean | null> | null;
   ai_assessment: string | null;
 }
 

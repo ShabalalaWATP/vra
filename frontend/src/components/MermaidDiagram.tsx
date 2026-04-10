@@ -8,76 +8,16 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import mermaid from "mermaid";
-
-// ── FontAwesome CSS (provides fa:icon support in flowchart htmlLabels) ──
 import "@fortawesome/fontawesome-free/css/all.min.css";
+import type { IconifyJSON } from "@iconify/types";
 
-// ── Iconify icon packs (for post-processing fallback + architecture-beta) ──
-import { icons as fa6SolidIcons } from "@iconify-json/fa6-solid";
-import { icons as fa6BrandsIcons } from "@iconify-json/fa6-brands";
-import { icons as mdiIcons } from "@iconify-json/mdi";
+type MermaidApi = Awaited<typeof import("mermaid")>["default"];
 
-// ── Register for architecture-beta diagram support ──
-mermaid.registerIconPacks([
-  { name: "fa", icons: fa6SolidIcons },
-  { name: "fas", icons: fa6SolidIcons },
-  { name: "fab", icons: fa6BrandsIcons },
-  { name: "fa6-solid", icons: fa6SolidIcons },
-  { name: "fa6-brands", icons: fa6BrandsIcons },
-  { name: "mdi", icons: mdiIcons },
-]);
-
-mermaid.initialize({
-  startOnLoad: false,
-  theme: "dark",
-  securityLevel: "strict",
-  fontFamily: "'JetBrains Mono', ui-monospace, monospace",
-  flowchart: {
-    useMaxWidth: true,
-    htmlLabels: false,
-    curve: "basis",
-    nodeSpacing: 50,
-    rankSpacing: 50,
-  },
-  themeVariables: {
-    darkMode: true,
-    primaryColor: "#1e3a5f",
-    primaryTextColor: "#e2e8f0",
-    primaryBorderColor: "#38bdf8",
-    lineColor: "#64748b",
-    secondaryColor: "#1e293b",
-    secondaryTextColor: "#e2e8f0",
-    secondaryBorderColor: "#6366f1",
-    tertiaryColor: "#1a1a2e",
-    tertiaryTextColor: "#e2e8f0",
-    tertiaryBorderColor: "#818cf8",
-    background: "#0c0c14",
-    mainBkg: "#1e293b",
-    nodeBorder: "#38bdf8",
-    nodeTextColor: "#e2e8f0",
-    clusterBkg: "#0f172a",
-    clusterBorder: "#475569",
-    titleColor: "#f1f5f9",
-    edgeLabelBackground: "#0f172a",
-    labelTextColor: "#e2e8f0",
-    textColor: "#e2e8f0",
-    noteBkgColor: "#1e293b",
-    noteTextColor: "#e2e8f0",
-    noteBorderColor: "#475569",
-    fontSize: "13px",
-  },
-});
+let mermaidLoader: Promise<MermaidApi> | null = null;
+let mermaidConfigured = false;
 
 // ── Icon lookup map: prefix → { iconName → svgBody } ──
-const ICON_PACKS: Record<string, { icons: Record<string, { body: string }>; width?: number; height?: number }> = {
-  fa: fa6SolidIcons,
-  fas: fa6SolidIcons,
-  "fa6-solid": fa6SolidIcons,
-  fab: fa6BrandsIcons,
-  "fa6-brands": fa6BrandsIcons,
-  mdi: mdiIcons,
-};
+const ICON_PACKS: Record<string, IconifyJSON> = {};
 
 // ── Official brand colors for known icons ──
 const BRAND_COLORS: Record<string, string> = {
@@ -145,13 +85,92 @@ const BRAND_COLORS: Record<string, string> = {
   webhook: "#34d399",
   lan: "#60a5fa",
   web: "#34d399",
-  "file-code": "#a78bfa",
   "code-braces": "#a78bfa",
   incognito: "#a78bfa",
 };
 
 // Default color for unrecognized icons
 const DEFAULT_ICON_COLOR = "#38bdf8";
+
+async function getMermaid(): Promise<MermaidApi> {
+  if (!mermaidLoader) {
+    mermaidLoader = Promise.all([
+      import("mermaid"),
+      import("@iconify-json/fa6-solid"),
+      import("@iconify-json/fa6-brands"),
+      import("@iconify-json/mdi"),
+    ]).then(([mermaidModule, fa6SolidModule, fa6BrandsModule, mdiModule]) => {
+      const mermaid = mermaidModule.default;
+      const fa6SolidIcons = fa6SolidModule.icons;
+      const fa6BrandsIcons = fa6BrandsModule.icons;
+      const mdiIcons = mdiModule.icons;
+
+      ICON_PACKS.fa = fa6SolidIcons;
+      ICON_PACKS.fas = fa6SolidIcons;
+      ICON_PACKS["fa6-solid"] = fa6SolidIcons;
+      ICON_PACKS.fab = fa6BrandsIcons;
+      ICON_PACKS["fa6-brands"] = fa6BrandsIcons;
+      ICON_PACKS.mdi = mdiIcons;
+
+      if (!mermaidConfigured) {
+        mermaid.registerIconPacks([
+          { name: "fa", icons: fa6SolidIcons },
+          { name: "fas", icons: fa6SolidIcons },
+          { name: "fab", icons: fa6BrandsIcons },
+          { name: "fa6-solid", icons: fa6SolidIcons },
+          { name: "fa6-brands", icons: fa6BrandsIcons },
+          { name: "mdi", icons: mdiIcons },
+        ]);
+
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: "dark",
+          securityLevel: "strict",
+          fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+          flowchart: {
+            useMaxWidth: true,
+            htmlLabels: false,
+            curve: "basis",
+            nodeSpacing: 50,
+            rankSpacing: 50,
+          },
+          themeVariables: {
+            darkMode: true,
+            primaryColor: "#1e3a5f",
+            primaryTextColor: "#e2e8f0",
+            primaryBorderColor: "#38bdf8",
+            lineColor: "#64748b",
+            secondaryColor: "#1e293b",
+            secondaryTextColor: "#e2e8f0",
+            secondaryBorderColor: "#6366f1",
+            tertiaryColor: "#1a1a2e",
+            tertiaryTextColor: "#e2e8f0",
+            tertiaryBorderColor: "#818cf8",
+            background: "#0c0c14",
+            mainBkg: "#1e293b",
+            nodeBorder: "#38bdf8",
+            nodeTextColor: "#e2e8f0",
+            clusterBkg: "#0f172a",
+            clusterBorder: "#475569",
+            titleColor: "#f1f5f9",
+            edgeLabelBackground: "#0f172a",
+            labelTextColor: "#e2e8f0",
+            textColor: "#e2e8f0",
+            noteBkgColor: "#1e293b",
+            noteTextColor: "#e2e8f0",
+            noteBorderColor: "#475569",
+            fontSize: "13px",
+          },
+        });
+        mermaidConfigured = true;
+      }
+
+      return mermaid;
+    });
+  }
+
+  return mermaidLoader;
+}
 
 /**
  * Look up an icon's SVG body from the loaded icon packs.
@@ -237,6 +256,7 @@ export function MermaidDiagram({ spec, id, fallbackImage }: MermaidDiagramProps)
     let cancelled = false;
     (async () => {
       try {
+        const mermaid = await getMermaid();
         const { svg: rendered } = await mermaid.render(
           `mermaid-${id}-${++_mermaidIdCounter}`,
           cleanSpec,

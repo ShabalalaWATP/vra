@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from app.config import settings
@@ -90,6 +91,45 @@ ESLINT_RULE_GROUPS = {
     "crypto": ["no-restricted-properties"],
 }
 
+CODEQL_QUERY_GROUPS = {
+    "python": ["python-security-and-quality.qls", "python-security-experimental.qls"],
+    "javascript": ["javascript-security-and-quality.qls", "javascript-security-experimental.qls"],
+    "typescript": ["javascript-security-and-quality.qls", "javascript-security-experimental.qls"],
+    "java": ["java-security-and-quality.qls", "java-security-experimental.qls"],
+    "go": ["go-security-and-quality.qls", "go-security-experimental.qls"],
+    "ruby": ["ruby-security-and-quality.qls", "ruby-security-experimental.qls"],
+    "csharp": ["csharp-security-and-quality.qls", "csharp-security-experimental.qls"],
+    "cpp": ["cpp-security-and-quality.qls", "cpp-security-experimental.qls"],
+    "c": ["cpp-security-and-quality.qls", "cpp-security-experimental.qls"],
+    "swift": ["swift-security-and-quality.qls", "swift-security-experimental.qls"],
+}
+
+SEMGREP_DIR_SIGNAL_HINTS = {
+    "python/django": {"django"},
+    "python/flask": {"flask"},
+    "python/fastapi": {"fastapi"},
+    "python/sqlalchemy": {"sqlalchemy"},
+    "python/requests": {"requests"},
+    "python/boto3": {"boto3"},
+    "python/pymongo": {"pymongo"},
+    "python/jinja2": {"jinja2"},
+    "python/cryptography": {"cryptography"},
+    "python/pycryptodome": {"pycryptodome"},
+    "python/jwt": {"jwt", "pyjwt"},
+    "javascript/express": {"express"},
+    "javascript/react": {"react"},
+    "typescript/react": {"react"},
+    "javascript/browser": {"react", "vue", "angular", "nextjs", "nuxtjs", "vite", "tailwind", "svelte"},
+    "javascript/vue": {"vue", "nuxtjs"},
+    "javascript/angular": {"angular"},
+    "typescript/angular": {"angular"},
+    "typescript/nestjs": {"nestjs", "@nestjs/core", "@nestjs/common"},
+    "typescript/aws-cdk": {"aws-cdk", "aws-cdk-lib"},
+    "javascript/jsonwebtoken": {"jsonwebtoken"},
+    "javascript/jose": {"jose"},
+    "yaml/kubernetes": {"kubernetes", "helm"},
+}
+
 SYSTEM_PROMPT = """You are a security tool expert. Based on the application's technology stack,
 identified attack surface, and investigation focus areas, select the most relevant
 scanner rules to run in a targeted follow-up pass.
@@ -103,6 +143,7 @@ Respond with JSON:
   "risk_themes": ["risk theme names — e.g. 'sqli', 'xss', 'auth', 'jwt'"],
   "bandit_rules": ["bandit test IDs — e.g. 'B608', 'B602'"],
   "eslint_rules": ["ESLint rule names — e.g. 'no-eval', 'no-proto'"],
+  "codeql_queries": ["CodeQL suite names — e.g. 'python-security-experimental.qls'"],
   "target_files": ["specific files to scan, or empty for all"],
   "reasoning": "Why these rules were selected"
 }"""
@@ -142,46 +183,55 @@ class RuleSelectorAgent(BaseAgent):
         risk_themes = result.get("risk_themes", result.get("semgrep_rules", []))
         bandit_rules = result.get("bandit_rules", [])
         eslint_rules = result.get("eslint_rules", [])
+        codeql_queries = list(dict.fromkeys(result.get("codeql_queries", [])))
         target_files = result.get("target_files", [])
+        safe_target_files = target_files or ctx.get_hot_files(limit=12)
 
         # Resolve risk themes to directories
         for theme in risk_themes:
             if theme in RISK_THEME_DIRS:
                 semgrep_dirs.extend(RISK_THEME_DIRS[theme])
 
-        # Deduplicate
-        semgrep_dirs = list(dict.fromkeys(semgrep_dirs))
+        package_signals = set()
+        if "semgrep" in available:
+            try:
+                package_signals = available["semgrep"]._collect_package_signals(repo_path)
+            except Exception:
+                package_signals = set()
+
+        semgrep_dirs = self._optimise_semgrep_dirs(ctx, semgrep_dirs, package_signals=package_signals)
 
         runs_done = 0
 
         # Targeted Semgrep
         if semgrep_dirs and "semgrep" in available and runs_done < budget:
-            # Resolve to actual paths on disk
-            rules_path = settings.semgrep_rules_path
-            rule_paths = []
-            for d in semgrep_dirs:
-                full = rules_path / d
-                if full.exists():
-                    rule_paths.append(str(full))
-
-            if rule_paths:
+            if semgrep_dirs:
                 labels = [d.split("/")[-1] for d in semgrep_dirs[:4]]
                 ctx.current_task = f"Running targeted Semgrep ({', '.join(labels)})"
-                await self.emit(ctx, f"Running targeted Semgrep: {', '.join(labels)} ({len(rule_paths)} rule dirs)")
+                await self.emit(ctx, f"Running targeted Semgrep: {', '.join(labels)} ({len(semgrep_dirs)} rule dirs)")
 
                 output = await available["semgrep"].run_targeted(
                     repo_path,
-                    files=target_files or [],
-                    rules=rule_paths,
+                    files=safe_target_files or [],
+                    rules=semgrep_dirs,
                 )
 
+                summary = ctx.record_scanner_run(
+                    "semgrep_targeted",
+                    success=output.success,
+                    hit_count=len(output.hits),
+                    duration_ms=output.duration_ms,
+                    errors=output.errors,
+                )
                 if output.hits:
                     await self.emit(
                         ctx,
                         f"Targeted Semgrep found {len(output.hits)} additional hits",
+                        detail=summary,
                     )
-                    ctx.scanner_hit_counts["semgrep_targeted"] = len(output.hits)
                     await self._persist_targeted_hits(ctx, "semgrep_targeted", output.hits, repo_path)
+                elif summary["errors"]:
+                    await self.emit(ctx, "Targeted Semgrep completed with scanner errors", level="warn", detail=summary)
 
                 runs_done += 1
 
@@ -192,17 +242,26 @@ class RuleSelectorAgent(BaseAgent):
 
             output = await available["bandit"].run_targeted(
                 repo_path,
-                files=target_files or [],
+                files=safe_target_files or [],
                 rules=bandit_rules,
             )
 
+            summary = ctx.record_scanner_run(
+                "bandit_targeted",
+                success=output.success,
+                hit_count=len(output.hits),
+                duration_ms=output.duration_ms,
+                errors=output.errors,
+            )
             if output.hits:
                 await self.emit(
                     ctx,
                     f"Targeted Bandit found {len(output.hits)} additional hits",
+                    detail=summary,
                 )
-                ctx.scanner_hit_counts["bandit_targeted"] = len(output.hits)
                 await self._persist_targeted_hits(ctx, "bandit_targeted", output.hits, repo_path)
+            elif summary["errors"]:
+                await self.emit(ctx, "Targeted Bandit completed with scanner errors", level="warn", detail=summary)
 
             runs_done += 1
 
@@ -215,17 +274,56 @@ class RuleSelectorAgent(BaseAgent):
 
             output = await available["eslint"].run_targeted(
                 repo_path,
-                files=target_files or [],
+                files=safe_target_files or [],
                 rules=eslint_rules,
             )
 
+            summary = ctx.record_scanner_run(
+                "eslint_targeted",
+                success=output.success,
+                hit_count=len(output.hits),
+                duration_ms=output.duration_ms,
+                errors=output.errors,
+            )
             if output.hits:
                 await self.emit(
                     ctx,
                     f"Targeted ESLint found {len(output.hits)} additional hits",
+                    detail=summary,
                 )
-                ctx.scanner_hit_counts["eslint_targeted"] = len(output.hits)
                 await self._persist_targeted_hits(ctx, "eslint_targeted", output.hits, repo_path)
+            elif summary["errors"]:
+                await self.emit(ctx, "Targeted ESLint completed with scanner errors", level="warn", detail=summary)
+
+            runs_done += 1
+
+        # Targeted CodeQL
+        if codeql_queries and "codeql" in available and runs_done < budget:
+            ctx.current_task = f"Running targeted CodeQL ({', '.join(codeql_queries[:2])})"
+            await self.emit(ctx, f"Running targeted CodeQL: {', '.join(codeql_queries[:2])}")
+
+            output = await available["codeql"].run_targeted(
+                repo_path,
+                files=safe_target_files or [],
+                rules=codeql_queries,
+            )
+
+            summary = ctx.record_scanner_run(
+                "codeql_targeted",
+                success=output.success,
+                hit_count=len(output.hits),
+                duration_ms=output.duration_ms,
+                errors=output.errors,
+            )
+            if output.hits:
+                await self.emit(
+                    ctx,
+                    f"Targeted CodeQL found {len(output.hits)} additional hits",
+                    detail=summary,
+                )
+                await self._persist_targeted_hits(ctx, "codeql_targeted", output.hits, repo_path)
+            elif summary["errors"]:
+                await self.emit(ctx, "Targeted CodeQL completed with scanner errors", level="warn", detail=summary)
 
             runs_done += 1
 
@@ -236,7 +334,10 @@ class RuleSelectorAgent(BaseAgent):
             ctx,
             action="rule_selection_complete",
             reasoning=result.get("reasoning", ""),
-            output_summary=f"Selected {len(semgrep_dirs)} semgrep dirs, {len(bandit_rules)} bandit rules, {len(eslint_rules)} eslint rules",
+            output_summary=(
+                f"Selected {len(semgrep_dirs)} semgrep dirs, {len(bandit_rules)} bandit rules, "
+                f"{len(eslint_rules)} eslint rules, {len(codeql_queries)} codeql suites"
+            ),
         )
 
     async def _persist_targeted_hits(
@@ -329,9 +430,22 @@ class RuleSelectorAgent(BaseAgent):
             parts.append(f"  - {group}: {', '.join(rules)}")
         parts.append("  Other available: no-buffer-constructor, no-path-concat, no-caller, no-return-assign")
 
+        codeql_suites = []
+        for lang in ctx.languages:
+            codeql_suites.extend(CODEQL_QUERY_GROUPS.get(lang, []))
+        codeql_suites = list(dict.fromkeys(codeql_suites))
+        if codeql_suites:
+            parts.append(f"\nAvailable CodeQL follow-up suites:")
+            for suite in codeql_suites:
+                parts.append(f"  - {suite}")
+
         # Tell the AI what already ran in baseline so it doesn't repeat
         if ctx.baseline_rule_dirs:
-            parts.append(f"\nAlready scanned in baseline (DO NOT re-select):")
+            count_hint = (
+                f" (~{ctx.baseline_rule_count} rules across {len(ctx.baseline_rule_dirs)} packs)"
+                if ctx.baseline_rule_count else ""
+            )
+            parts.append(f"\nAlready scanned in baseline (DO NOT re-select){count_hint}:")
             for d in ctx.baseline_rule_dirs[:15]:
                 parts.append(f"  - {d}")
 
@@ -349,37 +463,61 @@ class RuleSelectorAgent(BaseAgent):
         dirs = []
         themes = []
         bandit = []
+        codeql = []
+        frameworks = {fw.lower() for fw in ctx.frameworks}
 
         if "python" in ctx.languages:
-            dirs.extend(["python/lang", "python/django", "python/flask", "python/fastapi"])
+            if "django" in frameworks:
+                dirs.append("python/django")
+            if "flask" in frameworks:
+                dirs.append("python/flask")
+            if "fastapi" in frameworks:
+                dirs.append("python/fastapi")
+            if "sqlalchemy" in frameworks:
+                dirs.append("python/sqlalchemy")
             themes.extend(["sqli", "command_injection", "deserialization"])
             bandit.extend(["B608", "B602", "B301", "B105"])
+            codeql.extend(CODEQL_QUERY_GROUPS["python"])
 
         eslint = []
 
         if any(l in ctx.languages for l in ("javascript", "typescript")):
-            dirs.extend(["javascript/lang", "javascript/express", "javascript/browser"])
+            if "express" in frameworks:
+                dirs.append("javascript/express")
+            if {"react", "vue", "angular", "nextjs", "nuxtjs", "vite", "tailwind"} & frameworks:
+                dirs.append("javascript/browser")
+            if "react" in frameworks:
+                dirs.append("typescript/react" if "typescript" in ctx.languages else "javascript/react")
+            if "angular" in frameworks and "typescript" in ctx.languages:
+                dirs.append("typescript/angular")
+            if "nestjs" in frameworks and "typescript" in ctx.languages:
+                dirs.append("typescript/nestjs")
             themes.extend(["xss", "ssrf", "open_redirect", "nosql"])
             eslint.extend(["no-eval", "no-implied-eval", "no-new-func", "no-script-url", "no-proto"])
+            if "typescript" in ctx.languages:
+                codeql.extend(CODEQL_QUERY_GROUPS["typescript"])
+            else:
+                codeql.extend(CODEQL_QUERY_GROUPS["javascript"])
 
         if "java" in ctx.languages:
             dirs.extend(["java/lang", "java/spring", "java/servlets"])
             themes.extend(["xxe", "deserialization"])
+            codeql.extend(CODEQL_QUERY_GROUPS["java"])
 
         if "go" in ctx.languages:
             dirs.append("go")
             themes.extend(["sqli", "command_injection"])
+            codeql.extend(CODEQL_QUERY_GROUPS["go"])
 
         if "ruby" in ctx.languages:
             dirs.append("ruby")
             themes.extend(["sqli", "xss", "csrf"])
+            codeql.extend(CODEQL_QUERY_GROUPS["ruby"])
 
         if "php" in ctx.languages:
             dirs.append("php")
             themes.extend(["sqli", "xss", "deserialization"])
 
-        # Always check secrets and generic
-        dirs.append("generic")
         themes.extend(["hardcoded_secrets"])
 
         return {
@@ -387,6 +525,82 @@ class RuleSelectorAgent(BaseAgent):
             "risk_themes": list(dict.fromkeys(themes)),
             "bandit_rules": list(set(bandit)),
             "eslint_rules": list(set(eslint)),
+            "codeql_queries": list(dict.fromkeys(codeql)),
             "target_files": [],
             "reasoning": "Heuristic selection based on detected stack",
         }
+
+    @staticmethod
+    def _canonical_rule_ref(rule: str, rules_path: Path) -> str:
+        if not rule:
+            return ""
+        value = str(rule).replace("\\", "/").strip("/")
+        candidate = Path(value)
+        if candidate.is_absolute():
+            try:
+                return str(candidate.resolve().relative_to(rules_path.resolve())).replace("\\", "/")
+            except Exception:
+                return ""
+        return value
+
+    def _expand_root_rule_dir(self, relative_dir: str, rules_path: Path) -> list[str]:
+        candidate = rules_path / relative_dir
+        if not candidate.exists() or not candidate.is_dir() or "/" in relative_dir:
+            return [relative_dir]
+        children = [
+            f"{relative_dir}/{child.name}"
+            for child in sorted(candidate.iterdir())
+            if child.is_dir()
+        ]
+        return children or [relative_dir]
+
+    @staticmethod
+    def _rule_dir_matches_ctx(relative_dir: str, ctx: ScanContext) -> bool:
+        if not relative_dir:
+            return False
+        languages = {lang.lower() for lang in getattr(ctx, "languages", [])}
+        head = relative_dir.split("/", 1)[0].lower()
+        if head in {"dockerfile", "terraform", "yaml", "generic"}:
+            return True
+        if head == "javascript":
+            return bool({"javascript", "typescript"} & languages)
+        if head == "typescript":
+            return "typescript" in languages
+        return head in languages
+
+    def _optimise_semgrep_dirs(
+        self,
+        ctx: ScanContext,
+        selected_dirs: list[str],
+        *,
+        package_signals: set[str] | None = None,
+    ) -> list[str]:
+        rules_path = settings.semgrep_rules_path
+        baseline = {
+            str(item).replace("\\", "/").strip("/")
+            for item in (ctx.baseline_rule_dirs or [])
+            if item
+        }
+        relevant_signals = {fw.lower() for fw in getattr(ctx, "frameworks", [])}
+        relevant_signals.update(signal.lower() for signal in (package_signals or set()))
+        optimised: list[str] = []
+        seen: set[str] = set()
+        for raw_rule in selected_dirs:
+            canonical = self._canonical_rule_ref(raw_rule, rules_path)
+            if not canonical:
+                continue
+            if os.name == "nt" and canonical == "generic":
+                continue
+            if not self._rule_dir_matches_ctx(canonical, ctx):
+                continue
+            for expanded in self._expand_root_rule_dir(canonical, rules_path):
+                if not expanded or expanded in baseline or expanded in seen:
+                    continue
+                if not (rules_path / expanded).exists():
+                    continue
+                required_signals = SEMGREP_DIR_SIGNAL_HINTS.get(expanded)
+                if required_signals and not (required_signals & relevant_signals):
+                    continue
+                seen.add(expanded)
+                optimised.append(expanded)
+        return optimised

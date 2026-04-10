@@ -2,10 +2,10 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Float, ForeignKey, Integer, LargeBinary, String, Text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.db_types import JSONType
 
 
 class Report(Base):
@@ -19,15 +19,15 @@ class Report(Base):
     diagram_image: Mapped[bytes | None] = mapped_column(LargeBinary)
     methodology: Mapped[str | None] = mapped_column(Text)
     limitations: Mapped[str | None] = mapped_column(Text)
-    tech_stack: Mapped[dict | None] = mapped_column(JSONB)
-    scanner_hits: Mapped[dict | None] = mapped_column(JSONB)
-    attack_surface: Mapped[dict | None] = mapped_column(JSONB)
+    tech_stack: Mapped[dict | None] = mapped_column(JSONType)
+    scanner_hits: Mapped[dict | None] = mapped_column(JSONType)
+    attack_surface: Mapped[dict | None] = mapped_column(JSONType)
     risk_score: Mapped[float | None] = mapped_column(Float)
     risk_grade: Mapped[str | None] = mapped_column(String(2))
-    owasp_mapping: Mapped[dict | None] = mapped_column(JSONB)
-    component_scores: Mapped[dict | None] = mapped_column(JSONB)
-    sbom: Mapped[dict | None] = mapped_column(JSONB)
-    scan_coverage: Mapped[dict | None] = mapped_column(JSONB)
+    owasp_mapping: Mapped[dict | None] = mapped_column(JSONType)
+    component_scores: Mapped[dict | None] = mapped_column(JSONType)
+    sbom: Mapped[dict | None] = mapped_column(JSONType)
+    scan_coverage: Mapped[dict | None] = mapped_column(JSONType)
     narrative: Mapped[str | None] = mapped_column(Text)
     report_html: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))

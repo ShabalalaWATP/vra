@@ -40,6 +40,184 @@ def _sort_findings(findings: list[Finding]) -> list[Finding]:
     return sorted(findings, key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), -(f.confidence or 0)))
 
 
+def _truncate_text(value: str | None, max_chars: int) -> str:
+    if not value:
+        return ""
+    text = value.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _sort_dependency_findings(dep_findings: list[tuple[DependencyFinding, Dependency]]) -> list[tuple[DependencyFinding, Dependency]]:
+    return sorted(
+        dep_findings,
+        key=lambda item: (
+            item[0].risk_score is None,
+            -(item[0].risk_score or 0.0),
+            SEVERITY_ORDER.get((item[0].severity or "info").lower(), 9),
+            item[1].name.lower(),
+        ),
+    )
+
+
+def _humanise_dependency_label(value: str | None) -> str:
+    if not value:
+        return ""
+    return value.replace("_", " ").strip().title()
+
+
+def _format_dependency_risk_score(score: float | None) -> str:
+    return f"{round(score)}/1000" if score is not None else "n/a"
+
+
+def _format_dependency_exposure(df: DependencyFinding) -> str:
+    reachability = _humanise_dependency_label(df.reachability_status)
+    if reachability and df.reachability_confidence is not None:
+        reachability = f"{reachability} ({round(df.reachability_confidence * 100)}%)"
+
+    parts = [
+        _humanise_dependency_label(df.relevance),
+        reachability,
+        _humanise_dependency_label(df.evidence_type),
+    ]
+    return " | ".join(part for part in parts if part)
+
+
+def _summarise_dependency_usage(usage_evidence: list | None, limit: int = 2) -> str:
+    if not usage_evidence:
+        return ""
+
+    kind_labels = {
+        "import": "import",
+        "reference": "reference",
+        "vulnerable_function": "vulnerable function",
+    }
+    parts: list[str] = []
+    for hit in usage_evidence[:limit]:
+        if not isinstance(hit, dict):
+            continue
+        label = kind_labels.get(str(hit.get("kind", "")), _humanise_dependency_label(str(hit.get("kind", "usage"))).lower())
+        symbol = str(hit.get("symbol", "")).strip()
+        location = str(hit.get("file", "")).strip()
+        line = hit.get("line")
+        if location and isinstance(line, int):
+            location = f"{location}:{line}"
+        summary = label
+        if symbol:
+            summary += f" {symbol}"
+        if location:
+            summary += f" in {location}"
+        parts.append(summary)
+
+    return "; ".join(part for part in parts if part)
+
+
+def _summarise_dependency_risk_factors(risk_factors: dict | None, limit: int = 3) -> str:
+    if not isinstance(risk_factors, dict):
+        return ""
+
+    labels = {
+        "reachability": "reachability",
+        "relevance": "package usage",
+        "vulnerable_function_match": "function match",
+        "dev_dependency": "dev-only scope",
+        "fix_available": "fix available",
+        "hot_file_usage": "hot-file usage",
+    }
+    items = [
+        (key, value)
+        for key, value in risk_factors.items()
+        if key not in {"base", "final"} and isinstance(value, (int, float)) and value != 0
+    ]
+    items.sort(key=lambda item: abs(float(item[1])), reverse=True)
+    return ", ".join(
+        f"{labels.get(key, _humanise_dependency_label(key).lower())} {'+' if value > 0 else ''}{round(float(value))}"
+        for key, value in items[:limit]
+    )
+
+
+def _format_dependency_notes(df: DependencyFinding) -> str:
+    notes: list[str] = []
+    if df.ai_assessment:
+        notes.append(_truncate_text(df.ai_assessment, 180))
+    elif df.summary:
+        notes.append(_truncate_text(df.summary, 180))
+
+    usage = _summarise_dependency_usage(df.usage_evidence)
+    if usage:
+        notes.append(f"Usage: {usage}")
+
+    if df.vulnerable_functions:
+        notes.append(f"Functions: {', '.join(df.vulnerable_functions[:3])}")
+
+    factors = _summarise_dependency_risk_factors(df.risk_factors)
+    if factors:
+        notes.append(f"Factors: {factors}")
+
+    if df.fixed_version:
+        notes.append(f"Fix: {df.fixed_version}")
+
+    return " ".join(note for note in notes if note)
+
+
+def _format_related_advisory(advisory: dict) -> str:
+    advisory_id = (
+        advisory.get("display_id")
+        or advisory.get("cve_id")
+        or advisory.get("advisory_id")
+        or "advisory"
+    )
+    parts = [str(advisory_id)]
+
+    severity = str(advisory.get("severity") or "").strip()
+    if severity:
+        parts.append(severity.upper())
+
+    package = str(advisory.get("package") or "").strip()
+    ecosystem = str(advisory.get("ecosystem") or "").strip()
+    if package:
+        package_label = package
+        if ecosystem:
+            package_label += f" ({ecosystem})"
+        parts.append(package_label)
+
+    evidence_strength = str(advisory.get("evidence_strength") or "").strip()
+    evidence_type = str(advisory.get("evidence_type") or "").strip()
+    evidence_bits = [bit for bit in [
+        _humanise_dependency_label(evidence_strength),
+        _humanise_dependency_label(evidence_type),
+    ] if bit]
+    if evidence_bits:
+        parts.append(", ".join(evidence_bits))
+
+    if advisory.get("import_module"):
+        parts.append(f"import {advisory['import_module']}")
+    if advisory.get("function"):
+        function_label = f"call {advisory['function']}"
+        if isinstance(advisory.get("line"), int):
+            function_label += f" line {advisory['line']}"
+        parts.append(function_label)
+    if advisory.get("fixed_version"):
+        parts.append(f"fix {advisory['fixed_version']}")
+
+    summary = _truncate_text(str(advisory.get("summary") or "").strip(), 120)
+    if summary:
+        parts.append(summary)
+
+    return " | ".join(part for part in parts if part)
+
+
+def _format_related_advisories(advisories: list | None, limit: int = 3) -> list[str]:
+    if not advisories:
+        return []
+    lines: list[str] = []
+    for advisory in advisories[:limit]:
+        if isinstance(advisory, dict):
+            lines.append(_format_related_advisory(advisory))
+    return [line for line in lines if line]
+
+
 async def generate_export(report: Report, format: str, db: AsyncSession) -> ExportArtifact:
     findings_result = await db.execute(
         select(Finding).where(Finding.scan_id == report.scan_id).order_by(Finding.severity)
@@ -59,7 +237,7 @@ async def generate_export(report: Report, format: str, db: AsyncSession) -> Expo
         .join(Dependency, DependencyFinding.dependency_id == Dependency.id)
         .where(DependencyFinding.scan_id == report.scan_id)
     )
-    dep_findings = dep_findings_result.all()
+    dep_findings = _sort_dependency_findings(dep_findings_result.all())
 
     report_data = {
         "report": report,
@@ -186,11 +364,11 @@ async def _generate_docx(data: dict, output_path: Path):
         p.add_run(f"Exploitable findings with PoC: ").bold = True
         p.add_run(str(len(exploitable)))
 
-    cve_count = len([f for f in findings if f.related_cves])
-    if cve_count:
+    advisory_count = len([f for f in findings if f.related_cves])
+    if advisory_count:
         p = doc.add_paragraph()
-        p.add_run(f"Findings with CVE correlations: ").bold = True
-        p.add_run(str(cve_count))
+        p.add_run(f"Findings with advisory correlations: ").bold = True
+        p.add_run(str(advisory_count))
 
     # ── Application Overview ───────────────────────────────────
     n = sec()
@@ -283,9 +461,9 @@ async def _generate_docx(data: dict, output_path: Path):
 
             if f.related_cves:
                 p = doc.add_paragraph()
-                p.add_run("Related CVEs: ").bold = True
-                cve_strs = [c.get("cve_id", "?") for c in f.related_cves[:5]]
-                p.add_run(", ".join(cve_strs))
+                p.add_run("Related advisories: ").bold = True
+                advisory_lines = _format_related_advisories(f.related_cves, limit=3)
+                p.add_run(" ; ".join(advisory_lines))
 
     # ── Medium Findings (Concise) ──────────────────────────────
     if medium:
@@ -388,19 +566,27 @@ async def _generate_docx(data: dict, output_path: Path):
     if dep_findings:
         n = sec()
         doc.add_heading(f"{n}. Dependency Risks ({len(dep_findings)})", level=1)
-        table = doc.add_table(rows=1, cols=5)
+        reachable = sum(1 for df, _ in dep_findings if df.reachability_status == "reachable")
+        active = sum(1 for df, _ in dep_findings if df.relevance in {"used", "likely_used"})
+        doc.add_paragraph(
+            "Dependency issues are ranked by combined risk score rather than advisory severity alone. "
+            f"{reachable} are marked reachable and {active} show direct or likely package usage."
+        )
+
+        table = doc.add_table(rows=1, cols=6)
         table.style = "Light Grid Accent 1"
-        for i, h in enumerate(["Package", "Version", "Severity", "Advisory", "Fixed In"]):
+        for i, h in enumerate(["Package", "Advisory", "Severity", "Exposure", "Risk", "Notes"]):
             table.rows[0].cells[i].text = h
-        for df, dep in dep_findings[:30]:
+        for df, dep in dep_findings[:20]:
             row = table.add_row().cells
-            row[0].text = dep.name
-            row[1].text = dep.version or ""
+            row[0].text = f"{dep.name}\n{dep.version or 'unknown'} ({dep.ecosystem})"
+            row[1].text = df.cve_id or df.advisory_id or ""
             row[2].text = (df.severity or "").upper()
-            row[3].text = df.cve_id or df.advisory_id or ""
-            row[4].text = df.fixed_version or ""
-        if len(dep_findings) > 30:
-            doc.add_paragraph(f"... and {len(dep_findings) - 30} additional dependency risks.")
+            row[3].text = _format_dependency_exposure(df)
+            row[4].text = _format_dependency_risk_score(df.risk_score)
+            row[5].text = _truncate_text(_format_dependency_notes(df) or "No package usage context captured.", 220)
+        if len(dep_findings) > 20:
+            doc.add_paragraph(f"... and {len(dep_findings) - 20} additional dependency risks.")
 
     # ── Scan Coverage ─────────────────────────────────────────
     if report.scan_coverage:
@@ -607,8 +793,8 @@ def _render_report_html(data: dict) -> str:
                 parts.append(f"<p><strong>Proof of Concept:</strong></p>")
                 parts.append(f"<pre class='poc-block'><code>{_esc(_truncate_code(f.exploit_template, 6))}</code></pre>")
             if f.related_cves:
-                cve_strs = [c.get("cve_id", "?") for c in f.related_cves[:5]]
-                parts.append(f"<p><strong>Related CVEs:</strong> {', '.join(cve_strs)}</p>")
+                advisory_lines = ", ".join(_esc(line) for line in _format_related_advisories(f.related_cves, limit=3))
+                parts.append(f"<p><strong>Related advisories:</strong> {advisory_lines}</p>")
             parts.append("</div>")
 
     # ── Medium Findings ────────────────────────────────────────
@@ -671,12 +857,27 @@ def _render_report_html(data: dict) -> str:
     if dep_findings:
         n = sec()
         parts.append(f"<h1>{n}. Dependency Risks ({len(dep_findings)})</h1>")
-        parts.append("<table><tr><th>Package</th><th>Version</th><th>Severity</th><th>Advisory</th><th>Fixed</th></tr>")
-        for df, dep in dep_findings[:30]:
-            parts.append(f"<tr><td>{_esc(dep.name)}</td><td>{_esc(dep.version or '')}</td><td class='sev-{df.severity or 'info'}'>{(df.severity or '').upper()}</td><td>{_esc(df.cve_id or df.advisory_id or '')}</td><td>{_esc(df.fixed_version or '')}</td></tr>")
+        reachable = sum(1 for df, _ in dep_findings if df.reachability_status == "reachable")
+        active = sum(1 for df, _ in dep_findings if df.relevance in {"used", "likely_used"})
+        parts.append(
+            "<p>Dependency issues are ranked by combined risk score rather than advisory severity alone. "
+            f"{reachable} are marked reachable and {active} show direct or likely package usage.</p>"
+        )
+        parts.append("<table><tr><th>Package</th><th>Advisory</th><th>Severity</th><th>Exposure</th><th>Risk</th><th>Notes</th></tr>")
+        for df, dep in dep_findings[:20]:
+            notes = _truncate_text(_format_dependency_notes(df) or "No package usage context captured.", 220)
+            package = _esc(f"{dep.name} ({dep.version or 'unknown'} | {dep.ecosystem})")
+            parts.append(
+                f"<tr><td>{package}</td>"
+                f"<td>{_esc(df.cve_id or df.advisory_id or '')}</td>"
+                f"<td class='sev-{df.severity or 'info'}'>{(df.severity or '').upper()}</td>"
+                f"<td>{_esc(_format_dependency_exposure(df))}</td>"
+                f"<td>{_esc(_format_dependency_risk_score(df.risk_score))}</td>"
+                f"<td>{_esc(notes)}</td></tr>"
+            )
         parts.append("</table>")
-        if len(dep_findings) > 30:
-            parts.append(f"<p><em>... and {len(dep_findings) - 30} additional risks</em></p>")
+        if len(dep_findings) > 20:
+            parts.append(f"<p><em>... and {len(dep_findings) - 20} additional risks</em></p>")
 
     # ── Scan Coverage ──────────────────────────────────────────
     if report.scan_coverage:

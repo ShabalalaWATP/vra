@@ -502,36 +502,89 @@ export function DependencyRiskDonut({
   depFindings,
   size = 200,
 }: {
-  depFindings: Array<{ severity?: string | null }>;
+  depFindings: Array<{
+    severity?: string | null;
+    reachability_status?: string | null;
+    risk_score?: number | null;
+  }>;
   size?: number;
 }) {
-  const data = useMemo(() => {
+  const chartState = useMemo(() => {
     if (!depFindings?.length) return null;
 
+    const hasReachability = depFindings.some(
+      (d) => d.reachability_status && d.reachability_status !== "unknown"
+    );
     const counts: Record<string, number> = {};
+
+    if (hasReachability) {
+      depFindings.forEach((d) => {
+        const status = d.reachability_status || "unknown";
+        counts[status] = (counts[status] || 0) + 1;
+      });
+
+      const labels: Record<string, string> = {
+        reachable: "Reachable",
+        potentially_reachable: "Potential",
+        no_path_found: "No path",
+        not_applicable: "Not applicable",
+        unknown: "Unknown",
+      };
+      const colors: Record<string, string> = {
+        reachable: "#ef4444",
+        potentially_reachable: "#f97316",
+        no_path_found: "#06b6d4",
+        not_applicable: "#22c55e",
+        unknown: "#6b7280",
+      };
+
+      const entries = Object.entries(counts).filter(([, v]) => v > 0);
+      if (!entries.length) return null;
+
+      return {
+        title: "Dependency Reachability",
+        centerLabel: "packages",
+        data: {
+          labels: entries.map(([status]) => labels[status] || status),
+          datasets: [
+            {
+              data: entries.map(([, v]) => v),
+              backgroundColor: entries.map(([status]) => (colors[status] || "#6b7280") + "bb"),
+              borderColor: entries.map(([status]) => colors[status] || "#6b7280"),
+              borderWidth: 2,
+              spacing: 2,
+            },
+          ],
+        },
+      };
+    }
+
     depFindings.forEach((d) => {
       const sev = d.severity || "unknown";
       counts[sev] = (counts[sev] || 0) + 1;
     });
-
     const entries = Object.entries(counts).filter(([, v]) => v > 0);
     if (!entries.length) return null;
 
     return {
-      labels: entries.map(([s]) => s.charAt(0).toUpperCase() + s.slice(1)),
-      datasets: [
-        {
-          data: entries.map(([, v]) => v),
-          backgroundColor: entries.map(([s]) => (SEV_COLORS[s] || "#6b7280") + "bb"),
-          borderColor: entries.map(([s]) => SEV_COLORS[s] || "#6b7280"),
-          borderWidth: 2,
-          spacing: 2,
-        },
-      ],
+      title: "Dependency Severity",
+      centerLabel: "vulns",
+      data: {
+        labels: entries.map(([s]) => s.charAt(0).toUpperCase() + s.slice(1)),
+        datasets: [
+          {
+            data: entries.map(([, v]) => v),
+            backgroundColor: entries.map(([s]) => (SEV_COLORS[s] || "#6b7280") + "bb"),
+            borderColor: entries.map(([s]) => SEV_COLORS[s] || "#6b7280"),
+            borderWidth: 2,
+            spacing: 2,
+          },
+        ],
+      },
     };
   }, [depFindings]);
 
-  if (!data) return null;
+  if (!chartState) return null;
 
   const total = depFindings.length;
 
@@ -548,12 +601,12 @@ export function DependencyRiskDonut({
   };
 
   return (
-    <ChartContainer title="Dependency Risks" maxWidth={size} maxHeight={size + 60}>
+    <ChartContainer title={chartState.title} maxWidth={size} maxHeight={size + 60}>
       <div className="relative">
-        <Doughnut data={data} options={options} />
+        <Doughnut data={chartState.data} options={options} />
         <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none" style={{ paddingBottom: 40 }}>
           <span className="text-xl font-bold text-text-primary">{total}</span>
-          <span className="text-[9px] text-text-muted">vulnerabilities</span>
+          <span className="text-[9px] text-text-muted">{chartState.centerLabel}</span>
         </div>
       </div>
     </ChartContainer>

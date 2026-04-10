@@ -17,8 +17,10 @@ rules:
   - id: javascript.express.session-insecure
     patterns:
       - pattern-either:
-          - pattern: session({..., cookie: {secure: false}, ...})
-          - pattern: session({..., cookie: {httpOnly: false}, ...})
+          - pattern: |
+              session({..., cookie: {secure: false}, ...})
+          - pattern: |
+              session({..., cookie: {httpOnly: false}, ...})
     message: "Express session cookies should use secure:true and httpOnly:true."
     severity: WARNING
     languages: [javascript, typescript]
@@ -38,7 +40,8 @@ rules:
 
   # ── React ──────────────────────────────────────────────────────
   - id: javascript.react.href-xss
-    pattern: <a href={$VAR}>
+    pattern: |
+      <a ... href={$VAR} ...>...</a>
     message: "Dynamic href could enable javascript: protocol XSS. Validate URL scheme."
     severity: WARNING
     languages: [javascript, typescript]
@@ -88,10 +91,14 @@ rules:
   - id: javascript.nosql-injection.mongo-query
     patterns:
       - pattern-either:
-          - pattern: $COLLECTION.find({$FIELD: req.body.$PARAM})
-          - pattern: $COLLECTION.findOne({$FIELD: req.query.$PARAM})
-          - pattern: $COLLECTION.updateOne({$FIELD: req.body.$PARAM}, ...)
-          - pattern: $COLLECTION.deleteOne({$FIELD: req.body.$PARAM})
+          - pattern: |
+              $COLLECTION.find({$FIELD: req.body.$PARAM})
+          - pattern: |
+              $COLLECTION.findOne({$FIELD: req.query.$PARAM})
+          - pattern: |
+              $COLLECTION.updateOne({$FIELD: req.body.$PARAM}, ...)
+          - pattern: |
+              $COLLECTION.deleteOne({$FIELD: req.body.$PARAM})
     message: "NoSQL injection: user input directly in MongoDB query. Sanitise with mongo-sanitize."
     severity: ERROR
     languages: [javascript, typescript]
@@ -128,8 +135,10 @@ rules:
   - id: javascript.upload.no-validation
     patterns:
       - pattern-either:
-          - pattern: multer({dest: $DIR})
-          - pattern: multer({storage: $STORAGE})
+          - pattern: |
+              multer({dest: $DIR})
+          - pattern: |
+              multer({storage: $STORAGE})
     pattern-not-inside: |
       multer({..., fileFilter: $FILTER, ...})
     message: "File upload without fileFilter. Validate file types to prevent malicious uploads."
@@ -141,8 +150,10 @@ rules:
   - id: javascript.express.cors-credentials-wildcard
     patterns:
       - pattern-either:
-          - pattern: cors({origin: "*", credentials: true})
-          - pattern: cors({origin: true, credentials: true})
+          - pattern: |
+              cors({origin: "*", credentials: true})
+          - pattern: |
+              cors({origin: true, credentials: true})
     message: "CORS with wildcard origin AND credentials. Browsers block this but misconfig is common."
     severity: ERROR
     languages: [javascript, typescript]

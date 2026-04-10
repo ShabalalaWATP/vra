@@ -487,30 +487,64 @@ class LLMClient:
         messages: list[dict[str, str]],
         output_budget: int,
     ) -> list[dict[str, str]]:
-        """Truncate the largest message to fit within context window."""
+        """Truncate multiple oversized messages while preserving both head and tail context."""
         available = self.context_window - output_budget - SAFETY_MARGIN_TOKENS
+        result = [dict(message) for message in messages]
 
-        msg_sizes = [(i, estimate_tokens(m.get("content", ""))) for i, m in enumerate(messages)]
-        msg_sizes.sort(key=lambda x: x[1], reverse=True)
+        def total_tokens() -> int:
+            return sum(estimate_tokens(message.get("content", "")) for message in result)
 
-        total = sum(s for _, s in msg_sizes)
-        overage = total - available
+        def truncatable_indices(include_system: bool) -> list[int]:
+            indices = []
+            for index, message in enumerate(result):
+                role = message.get("role", "")
+                content = message.get("content", "")
+                if not content:
+                    continue
+                if not include_system and role == "system":
+                    continue
+                if estimate_tokens(content) <= 150:
+                    continue
+                indices.append(index)
+            indices.sort(key=lambda idx: estimate_tokens(result[idx].get("content", "")), reverse=True)
+            return indices
 
+        overage = total_tokens() - available
         if overage <= 0:
-            return messages
+            return result
 
-        result = list(messages)
-        idx, size = msg_sizes[0]
-        target_size = max(500, size - overage)
-        max_chars = int(target_size * CHARS_PER_TOKEN)
-        content = result[idx]["content"]
+        marker = f"\n\n[... content truncated to fit {self.context_window}-token context window ...]\n\n"
 
-        if len(content) > max_chars:
-            truncated_text = content[:max_chars]
-            last_nl = truncated_text.rfind("\n")
-            if last_nl > max_chars * 0.8:
-                truncated_text = truncated_text[:last_nl]
-            truncated_text += f"\n\n[... content truncated to fit {self.context_window}-token context window ...]"
-            result[idx] = {**result[idx], "content": truncated_text}
+        for include_system in (False, True):
+            for idx in truncatable_indices(include_system):
+                if overage <= 0:
+                    break
+
+                content = result[idx].get("content", "")
+                current_tokens = estimate_tokens(content)
+                min_tokens = 220 if result[idx].get("role") == "system" else 120
+                removable_tokens = max(0, current_tokens - min_tokens)
+                if removable_tokens <= 0:
+                    continue
+
+                tokens_to_trim = min(removable_tokens, max(overage, 80))
+                target_tokens = max(min_tokens, current_tokens - tokens_to_trim)
+                max_chars = max(80, int(target_tokens * CHARS_PER_TOKEN))
+
+                if len(content) <= max_chars:
+                    continue
+
+                keep_chars = max(0, max_chars - len(marker))
+                head_chars = max(40, keep_chars // 2)
+                tail_chars = max(40, keep_chars - head_chars)
+                if head_chars + tail_chars >= len(content):
+                    continue
+
+                truncated = content[:head_chars].rstrip() + marker + content[-tail_chars:].lstrip()
+                result[idx]["content"] = truncated
+                overage = total_tokens() - available
+
+            if overage <= 0:
+                break
 
         return result

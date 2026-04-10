@@ -8,7 +8,10 @@ import asyncio
 import json
 import shutil
 import time
+from tempfile import TemporaryDirectory
 from pathlib import Path
+
+import yaml
 
 from app.analysis.paths import normalise_path, relative_to_repo
 from app.config import settings
@@ -37,8 +40,50 @@ LANG_TO_RULE_DIR = {
     "swift": "swift",
 }
 
+COMMON_MANIFEST_DIRS = ("", "backend", "frontend", "client", "server", "web", "api", "app")
+
+FRAMEWORK_BASELINE_RULE_DIRS = {
+    "django": ["python/django"],
+    "flask": ["python/flask"],
+    "fastapi": ["python/fastapi"],
+    "sqlalchemy": ["python/sqlalchemy"],
+    "express": ["javascript/express"],
+    "react": ["javascript/browser", "javascript/react", "typescript/react"],
+    "vue": ["javascript/browser", "javascript/vue"],
+    "angular": ["javascript/browser", "javascript/angular", "typescript/angular"],
+    "nextjs": ["javascript/browser", "javascript/react", "typescript/react"],
+    "nuxtjs": ["javascript/browser", "javascript/vue"],
+    "vite": ["javascript/browser"],
+    "tailwind": ["javascript/browser"],
+    "kubernetes": ["yaml/kubernetes"],
+}
+
+PACKAGE_BASELINE_RULE_DIRS = {
+    "requests": ["python/requests"],
+    "boto3": ["python/boto3"],
+    "pymongo": ["python/pymongo"],
+    "jinja2": ["python/jinja2"],
+    "cryptography": ["python/cryptography"],
+    "pycryptodome": ["python/pycryptodome"],
+    "twilio": ["python/twilio"],
+    "pyjwt": ["python/jwt"],
+    "jwt": ["python/jwt"],
+    "jsonwebtoken": ["javascript/jsonwebtoken"],
+    "jose": ["javascript/jose"],
+    "@nestjs/core": ["typescript/nestjs"],
+    "@nestjs/common": ["typescript/nestjs"],
+    "aws-cdk": ["typescript/aws-cdk"],
+    "aws-cdk-lib": ["typescript/aws-cdk"],
+}
+
+JS_FRONTEND_SIGNALS = {"react", "vue", "angular", "nextjs", "nuxtjs", "vite", "tailwind", "svelte"}
+
 
 class SemgrepAdapter(ScannerAdapter):
+    def __init__(self):
+        self._temp_dirs: list[TemporaryDirectory] = []
+        self._prepared_config_labels: dict[str, str] = {}
+
     @staticmethod
     def _normalise_repo_files(target_path: Path, files: list[str]) -> list[str]:
         """Keep only repo-local files and return normalised relative paths."""
@@ -70,6 +115,173 @@ class SemgrepAdapter(ScannerAdapter):
     def name(self) -> str:
         return "semgrep"
 
+    @staticmethod
+    def _is_valid_top_level_config(config_path: Path) -> bool:
+        """Validate the full YAML file so malformed bundled configs are skipped."""
+        try:
+            yaml.safe_load(config_path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return False
+        return True
+
+    def _collect_valid_top_level_configs(self, lang_dir: Path) -> list[str]:
+        configs: list[str] = []
+        for top_yaml in sorted(list(lang_dir.glob("*.yaml")) + list(lang_dir.glob("*.yml"))):
+            prepared = self._prepare_top_level_config(top_yaml)
+            if prepared:
+                configs.append(prepared)
+        return configs
+
+    @staticmethod
+    def _sanitise_rule_file(config_path: Path) -> tuple[TemporaryDirectory, str] | str | None:
+        """Drop known-bad bundled rules while keeping the rest of the config available."""
+        try:
+            raw_content = config_path.read_text(encoding="utf-8", errors="ignore")
+            payload = yaml.safe_load(raw_content)
+        except Exception:
+            return None
+
+        if not isinstance(payload, dict):
+            return str(config_path)
+
+        rules = payload.get("rules")
+        if not isinstance(rules, list):
+            return str(config_path)
+
+        legacy_broken_nest_rule = (
+            config_path.name == "security.yaml"
+            and "typescript.nest.no-auth-guard" in raw_content
+            and "@UseGuards(...)\n          ..." in raw_content
+        )
+
+        if not legacy_broken_nest_rule:
+            return str(config_path)
+
+        filtered_rules = [
+            rule for rule in rules
+            if isinstance(rule, dict) and rule.get("id") != "typescript.nest.no-auth-guard"
+        ]
+        if len(filtered_rules) == len(rules):
+            return str(config_path)
+
+        temp_dir = TemporaryDirectory(prefix="vragent-semgrep-")
+        temp_path = Path(temp_dir.name) / config_path.name
+        temp_path.write_text(
+            yaml.safe_dump({"rules": filtered_rules}, sort_keys=False),
+            encoding="utf-8",
+        )
+        return temp_dir, str(temp_path)
+
+    def _prepare_top_level_config(self, config_path: Path) -> str | None:
+        if not self._is_valid_top_level_config(config_path):
+            return None
+
+        prepared = self._sanitise_rule_file(config_path)
+        if prepared is None:
+            return None
+        if isinstance(prepared, tuple):
+            temp_dir, temp_path = prepared
+            self._temp_dirs.append(temp_dir)
+            self._prepared_config_labels[temp_path] = str(config_path)
+            return temp_path
+        return prepared
+
+    @staticmethod
+    def _candidate_manifest_paths(target_path: Path, manifest_name: str) -> list[Path]:
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+        for subdir in COMMON_MANIFEST_DIRS:
+            base = target_path if not subdir else target_path / subdir
+            candidate = base / manifest_name
+            if candidate in seen or not candidate.exists() or not candidate.is_file():
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+        return candidates
+
+    def _collect_package_signals(self, target_path: Path | None) -> set[str]:
+        if target_path is None:
+            return set()
+
+        signals: set[str] = set()
+
+        for package_json in self._candidate_manifest_paths(target_path, "package.json"):
+            try:
+                payload = json.loads(package_json.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+                deps = payload.get(section, {})
+                if isinstance(deps, dict):
+                    signals.update(str(dep).lower() for dep in deps)
+
+        tracked_python_packages = {
+            key for key, value in PACKAGE_BASELINE_RULE_DIRS.items()
+            if any(entry.startswith("python/") for entry in value)
+        }
+        tracked_python_packages.update({"django", "flask", "fastapi", "sqlalchemy"})
+        for manifest_name in ("requirements.txt", "pyproject.toml", "poetry.lock"):
+            for manifest in self._candidate_manifest_paths(target_path, manifest_name):
+                try:
+                    content = manifest.read_text(encoding="utf-8", errors="ignore").lower()
+                except Exception:
+                    continue
+                for package in tracked_python_packages:
+                    if package in content:
+                        signals.add(package)
+
+        return signals
+
+    @staticmethod
+    def _rule_dir_matches_languages(relative_path: str, languages: set[str]) -> bool:
+        if not relative_path:
+            return False
+        head = relative_path.split("/", 1)[0]
+        if head in {"dockerfile", "terraform", "yaml", "generic"}:
+            return True
+        if head == "javascript":
+            return bool({"javascript", "typescript"} & languages)
+        if head == "typescript":
+            return "typescript" in languages
+        mapped = LANG_TO_RULE_DIR.get(head, head)
+        return mapped in languages or head in languages
+
+    def _select_framework_rule_dirs(
+        self,
+        rules_path: Path,
+        languages: list[str] | None,
+        frameworks: list[str] | None,
+        target_path: Path | None,
+    ) -> list[str]:
+        language_set = {lang.lower() for lang in (languages or [])}
+        framework_signals = {fw.lower() for fw in (frameworks or [])}
+        package_signals = self._collect_package_signals(target_path)
+        configs: list[str] = []
+
+        if {"javascript", "typescript"} & language_set and (framework_signals | package_signals) & JS_FRONTEND_SIGNALS:
+            browser_dir = rules_path / "javascript" / "browser"
+            if browser_dir.exists():
+                configs.append(str(browser_dir))
+
+        framework_like_signals = framework_signals | {
+            signal for signal in package_signals
+            if signal in FRAMEWORK_BASELINE_RULE_DIRS
+        }
+
+        for signal_source, mapping in (
+            (framework_like_signals, FRAMEWORK_BASELINE_RULE_DIRS),
+            (package_signals, PACKAGE_BASELINE_RULE_DIRS),
+        ):
+            for signal in sorted(signal_source):
+                for relative_path in mapping.get(signal, []):
+                    if not self._rule_dir_matches_languages(relative_path, language_set):
+                        continue
+                    candidate = rules_path / relative_path
+                    if candidate.exists():
+                        configs.append(str(candidate))
+
+        return configs
+
     async def is_available(self) -> bool:
         return shutil.which(settings.semgrep_binary) is not None
 
@@ -90,6 +302,7 @@ class SemgrepAdapter(ScannerAdapter):
         target_path: Path,
         *,
         languages: list[str] | None = None,
+        frameworks: list[str] | None = None,
         rules: list[str] | None = None,
         file_filter: list[str] | None = None,
     ) -> ScannerOutput:
@@ -111,7 +324,12 @@ class SemgrepAdapter(ScannerAdapter):
                 duration_ms=0,
             )
 
-        config_paths = self._get_baseline_configs(rules_path, languages, target_path)
+        config_paths = self._get_baseline_configs(
+            rules_path,
+            languages,
+            target_path,
+            frameworks=frameworks,
+        )
 
         if not config_paths:
             config_paths = [str(rules_path)]
@@ -188,6 +406,8 @@ class SemgrepAdapter(ScannerAdapter):
     def _get_baseline_configs(
         self, rules_path: Path, languages: list[str] | None,
         target_path: Path | None = None,
+        *,
+        frameworks: list[str] | None = None,
     ) -> list[str]:
         """
         Get the Semgrep --config paths for a LEAN baseline scan.
@@ -228,70 +448,138 @@ class SemgrepAdapter(ScannerAdapter):
                 if lang_core.exists():
                     configs.append(str(lang_core))
 
-                # Include top-level yaml files in the language dir
-                # but validate them first (malformed YAML causes semgrep to skip everything)
-                for top_yaml in list(lang_dir.glob("*.yaml")) + list(lang_dir.glob("*.yml")):
-                    try:
-                        import yaml
-                        yaml.safe_load(top_yaml.read_text(encoding="utf-8", errors="ignore")[:5000])
-                        configs.append(str(top_yaml))
-                    except Exception:
-                        pass  # Skip malformed YAML files
+                configs.extend(self._collect_valid_top_level_configs(lang_dir))
 
             # JS and TS share core rules
             if "javascript" in languages:
                 ts_lang = rules_path / "typescript" / "lang"
                 if ts_lang.exists():
                     configs.append(str(ts_lang))
-                for top_yaml in list((rules_path / "typescript").glob("*.yaml")) + list((rules_path / "typescript").glob("*.yml")):
-                    configs.append(str(top_yaml))
+                configs.extend(self._collect_valid_top_level_configs(rules_path / "typescript"))
             if "typescript" in languages:
                 js_lang = rules_path / "javascript" / "lang"
                 if js_lang.exists():
                     configs.append(str(js_lang))
-                for top_yaml in (rules_path / "javascript").glob("*.yaml"):
-                    configs.append(str(top_yaml))
+                configs.extend(self._collect_valid_top_level_configs(rules_path / "javascript"))
+
+        configs.extend(self._select_framework_rule_dirs(rules_path, languages, frameworks, target_path))
 
         # Include infra rules ONLY if the repo contains those file types.
         # Use quick top-level checks instead of rglob (which is O(n) on huge repos).
         if target_path:
+            common_dirs = (
+                "backend", "frontend", "docker", "deploy", "infra", ".docker",
+                "build", "api", "server", "client", "web", "app", "iac",
+            )
             has_dockerfile = (target_path / "Dockerfile").exists() or (target_path / "dockerfile").exists()
             has_terraform = any(target_path.glob("*.tf")) or (target_path / "terraform").is_dir()
-            has_yaml_configs = (target_path / ".github").is_dir() or any(target_path.glob("*.yaml"))
+            has_compose = any(
+                (target_path / name).exists()
+                for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+            )
+            has_github_actions = (target_path / ".github" / "workflows").is_dir()
+            has_kubernetes = any((target_path / name).is_dir() for name in ("k8s", "kubernetes", "helm", "charts"))
+            has_openapi = any(
+                (target_path / name).exists()
+                for name in ("openapi.yaml", "openapi.yml", "swagger.yaml", "swagger.yml")
+            )
             # If not found at root, do a shallow check (1 level deep only)
             if not has_dockerfile:
                 has_dockerfile = any(
                     (target_path / d / "Dockerfile").exists()
-                    for d in ("docker", "deploy", "infra", ".docker", "build")
+                    for d in common_dirs
                     if (target_path / d).is_dir()
                 )
             if not has_terraform:
                 has_terraform = any(
                     any((target_path / d).glob("*.tf"))
-                    for d in ("terraform", "infra", "deploy", "iac")
+                    for d in ("terraform", "infra", "deploy", "iac", "backend")
+                    if (target_path / d).is_dir()
+                )
+            if not has_compose:
+                has_compose = any(
+                    any((target_path / d / name).exists() for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"))
+                    for d in common_dirs
+                    if (target_path / d).is_dir()
+                )
+            if not has_openapi:
+                has_openapi = any(
+                    any((target_path / d / name).exists() for name in ("openapi.yaml", "openapi.yml", "swagger.yaml", "swagger.yml"))
+                    for d in common_dirs
                     if (target_path / d).is_dir()
                 )
         else:
             has_dockerfile = True
             has_terraform = True
-            has_yaml_configs = True
+            has_compose = True
+            has_github_actions = True
+            has_kubernetes = True
+            has_openapi = True
 
         if has_dockerfile:
-            df_dir = rules_path / "dockerfile"
+            df_dir = rules_path / "dockerfile" / "security"
             if df_dir.exists():
                 configs.append(str(df_dir))
+            configs.extend(self._collect_valid_top_level_configs(rules_path / "dockerfile"))
 
         if has_terraform:
-            tf_dir = rules_path / "terraform"
+            tf_dir = rules_path / "terraform" / "lang"
             if tf_dir.exists():
                 configs.append(str(tf_dir))
+            configs.extend(self._collect_valid_top_level_configs(rules_path / "terraform"))
 
-        if has_yaml_configs:
-            yaml_dir = rules_path / "yaml"
+        if has_compose:
+            yaml_dir = rules_path / "yaml" / "docker-compose"
+            if yaml_dir.exists():
+                configs.append(str(yaml_dir))
+        if has_github_actions:
+            yaml_dir = rules_path / "yaml" / "github-actions"
+            if yaml_dir.exists():
+                configs.append(str(yaml_dir))
+        if has_kubernetes:
+            yaml_dir = rules_path / "yaml" / "kubernetes"
+            if yaml_dir.exists():
+                configs.append(str(yaml_dir))
+        if has_openapi:
+            yaml_dir = rules_path / "yaml" / "openapi"
             if yaml_dir.exists():
                 configs.append(str(yaml_dir))
 
         return list(dict.fromkeys(configs))
+
+    def describe_config_paths(self, config_paths: list[str], *, rules_path: Path | None = None) -> list[str]:
+        base = (rules_path or settings.semgrep_rules_path).resolve()
+        labels: list[str] = []
+        seen: set[str] = set()
+        for config in config_paths:
+            original = self._prepared_config_labels.get(config, config)
+            try:
+                label = str(Path(original).resolve().relative_to(base)).replace("\\", "/")
+            except Exception:
+                label = str(original).replace("\\", "/")
+            if label in seen:
+                continue
+            seen.add(label)
+            labels.append(label)
+        return labels
+
+    @staticmethod
+    def _count_rules_in_path(config_path: Path) -> int:
+        try:
+            if config_path.is_dir():
+                return sum(
+                    SemgrepAdapter._count_rules_in_path(child)
+                    for child in config_path.rglob("*")
+                    if child.is_file() and child.suffix in {".yaml", ".yml"}
+                )
+            if config_path.is_file():
+                return config_path.read_text(encoding="utf-8", errors="ignore").count("- id:")
+        except Exception:
+            return 0
+        return 0
+
+    def count_rules(self, config_paths: list[str]) -> int:
+        return sum(self._count_rules_in_path(Path(config)) for config in config_paths)
 
     def _resolve_rule_path(self, rule: str, rules_path: Path) -> str | None:
         """
@@ -397,3 +685,11 @@ class SemgrepAdapter(ScannerAdapter):
                 errors=[str(e)],
                 duration_ms=duration,
             )
+
+    def cleanup(self):
+        for temp_dir in self._temp_dirs:
+            try:
+                temp_dir.cleanup()
+            except Exception:
+                pass
+        self._temp_dirs.clear()

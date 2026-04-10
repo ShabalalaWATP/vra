@@ -1,9 +1,13 @@
 """Reporter Agent — generate final report and narratives."""
 
+import json
 import logging
+import re
+from collections import Counter
 
 from app.config import settings
 from app.database import async_session
+from app.analysis.dependency_inventory import dependency_identity_key
 from app.models.report import Report
 from app.orchestrator.agents.base import BaseAgent
 from app.orchestrator.scan_context import ScanContext
@@ -48,7 +52,9 @@ class ReporterAgent(BaseAgent):
         await self.emit(ctx, "Generating final report...")
 
         # Build report prompt (executive summary + methodology + limitations)
-        user_content = self._build_report_prompt(ctx)
+        dep_findings = await self._load_dependency_findings(ctx)
+        dependency_summary = self._build_dependency_report_context(dep_findings)
+        user_content = self._build_report_prompt(ctx, dependency_summary)
 
         try:
             result = await self.llm.chat_json(SYSTEM_PROMPT, user_content, max_tokens=4096)
@@ -58,6 +64,11 @@ class ReporterAgent(BaseAgent):
             await self.emit_progress(ctx, task="Report narrative generation failed — using fallback")
             confirmed = [f for f in ctx.candidate_findings if f.status != "dismissed"]
             scanners_used = ", ".join(ctx.scanner_hit_counts.keys()) or "offline scanners"
+            degraded_note = (
+                " Scanner coverage was degraded for at least one tool; incomplete scanner coverage should be assumed."
+                if ctx.degraded_coverage
+                else ""
+            )
             result = {
                 "executive_summary": ctx.app_summary or "Report generation encountered an error.",
                 "methodology": (
@@ -77,6 +88,7 @@ class ReporterAgent(BaseAgent):
                     f"Phase 5 — Verification: Candidate findings were verified through adversarial analysis, "
                     f"checking for sanitisation, framework protection, and reachability.\n\n"
                     f"Phase 6 — Report Generation: Findings were scored, deduplicated, and mapped to CWE/OWASP."
+                    f"{degraded_note}"
                 ),
                 "limitations": (
                     "This assessment is based on static analysis of source code only. No runtime testing, "
@@ -86,9 +98,16 @@ class ReporterAgent(BaseAgent):
                     "lower-confidence findings may be false positives and should be manually verified. "
                     "The scan does not cover third-party library internals, compiled binaries, or obfuscated code. "
                     "Test files and non-production code paths were excluded from investigation."
+                    f"{degraded_note}"
                 ),
                 "finding_narratives": [],
             }
+
+        architecture_payload = self._build_architecture_payload(ctx, dep_findings)
+        ctx.architecture_notes = json.dumps(architecture_payload)
+        diagrams = architecture_payload.get("diagrams") or []
+        if diagrams:
+            ctx.diagram_spec = diagrams[0].get("mermaid", "") or ctx.diagram_spec
 
         # Compute enrichment data
         risk_score, risk_grade = self._compute_risk_score(ctx)
@@ -533,18 +552,64 @@ class ReporterAgent(BaseAgent):
             )
             vulns = vuln_result.scalars().all()
 
-        # Index vulns by dependency_id
-        vuln_by_dep: dict[str, list] = {}
-        for v in vulns:
-            dep_id = str(v.dependency_id)
-            if dep_id not in vuln_by_dep:
-                vuln_by_dep[dep_id] = []
-            vuln_by_dep[dep_id].append({
-                "advisory_id": v.advisory_id,
-                "cve_id": v.cve_id,
-                "severity": v.severity,
-                "summary": v.summary,
-                "fixed_version": v.fixed_version,
+        return self._build_sbom_payload(deps, vulns)
+
+    @staticmethod
+    def _build_sbom_payload(deps: list, vulns: list) -> dict:
+        """Build SBOM output while collapsing duplicate dependency rows by package identity."""
+        grouped_components: dict[tuple[str, str, str, str, bool], dict] = {}
+        dep_id_to_key: dict[str, tuple[str, str, str, str, bool]] = {}
+
+        for dep in deps:
+            dep_key = dependency_identity_key(
+                ecosystem=dep.ecosystem,
+                name=dep.name,
+                version=dep.version,
+                source_file=dep.source_file,
+                is_dev=dep.is_dev,
+            )
+            dep_id_to_key[str(dep.id)] = dep_key
+            component = grouped_components.setdefault(
+                dep_key,
+                {
+                    "name": dep.name,
+                    "version": dep.version,
+                    "ecosystem": dep.ecosystem,
+                    "source_file": dep.source_file,
+                    "is_dev": dep.is_dev,
+                    "vulnerabilities": [],
+                },
+            )
+            # Prefer richer display values if the first row was sparse.
+            if dep.name and not component["name"]:
+                component["name"] = dep.name
+            if dep.version and not component["version"]:
+                component["version"] = dep.version
+
+        seen_vulns: set[tuple[tuple[str, str, str, str, bool], str, str, str, str]] = set()
+        for vuln in vulns:
+            dep_key = dep_id_to_key.get(str(vuln.dependency_id))
+            if dep_key is None:
+                continue
+            component = grouped_components.get(dep_key)
+            if component is None:
+                continue
+            vuln_key = (
+                dep_key,
+                vuln.advisory_id or "",
+                vuln.cve_id or "",
+                vuln.summary or "",
+                vuln.fixed_version or "",
+            )
+            if vuln_key in seen_vulns:
+                continue
+            seen_vulns.add(vuln_key)
+            component["vulnerabilities"].append({
+                "advisory_id": vuln.advisory_id,
+                "cve_id": vuln.cve_id,
+                "severity": vuln.severity,
+                "summary": vuln.summary,
+                "fixed_version": vuln.fixed_version,
             })
 
         # Build component list
@@ -552,20 +617,20 @@ class ReporterAgent(BaseAgent):
         ecosystems: dict[str, int] = {}
         vulnerable_count = 0
 
-        for dep in deps:
-            dep_id = str(dep.id)
-            dep_vulns = vuln_by_dep.get(dep_id, [])
+        for component in grouped_components.values():
+            dep_vulns = component["vulnerabilities"]
             if dep_vulns:
                 vulnerable_count += 1
 
-            ecosystems[dep.ecosystem] = ecosystems.get(dep.ecosystem, 0) + 1
+            ecosystem = component["ecosystem"] or "unknown"
+            ecosystems[ecosystem] = ecosystems.get(ecosystem, 0) + 1
 
             components.append({
-                "name": dep.name,
-                "version": dep.version,
-                "ecosystem": dep.ecosystem,
-                "source_file": dep.source_file,
-                "is_dev": dep.is_dev,
+                "name": component["name"],
+                "version": component["version"],
+                "ecosystem": ecosystem,
+                "source_file": component["source_file"],
+                "is_dev": component["is_dev"],
                 "vulnerable": len(dep_vulns) > 0,
                 "vulnerability_count": len(dep_vulns),
                 "vulnerabilities": dep_vulns[:3],  # Cap to avoid huge payloads
@@ -587,7 +652,10 @@ class ReporterAgent(BaseAgent):
             "files_inspected_by_ai": len(ctx.files_inspected),
             "files_skipped_size": getattr(ctx, "files_skipped_size", 0),
             "files_skipped_cap": getattr(ctx, "files_skipped_cap", 0),
-            "scanners_used": list(ctx.scanner_hit_counts.keys()),
+            "scanners_used": list(ctx.scanner_runs.keys()) or list(ctx.scanner_hit_counts.keys()),
+            "scanner_runs": dict(ctx.scanner_runs),
+            "scanner_availability": dict(ctx.scanner_availability),
+            "degraded_coverage": ctx.degraded_coverage,
             "ai_calls_made": ctx.ai_calls_made,
             "scan_mode": ctx.mode,
             "obfuscated_files": len(ctx.obfuscated_files),
@@ -595,9 +663,549 @@ class ReporterAgent(BaseAgent):
             "is_apk": ctx.source_type in ("apk", "aab", "dex", "jar"),
             "doc_files_read": len(ctx.doc_files_found),
             "has_doc_intelligence": bool(ctx.doc_intelligence),
+            "ignored_file_count": ctx.ignored_file_count,
+            "ignored_paths": list(ctx.ignored_paths),
+            "managed_paths_ignored": list(ctx.managed_paths_ignored),
+            "repo_ignore_file": ctx.repo_ignore_file,
         }
 
-    def _build_report_prompt(self, ctx: ScanContext) -> str:
+    @staticmethod
+    def _truncate_dependency_text(value: str | None, max_chars: int = 220) -> str:
+        if not value:
+            return ""
+        text = value.strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."
+
+    @staticmethod
+    def _summarise_dependency_usage(usage_evidence: list[dict] | None, limit: int = 2) -> str:
+        if not usage_evidence:
+            return ""
+
+        kind_labels = {
+            "import": "import",
+            "reference": "reference",
+            "vulnerable_function": "vulnerable function",
+        }
+        parts: list[str] = []
+        for hit in usage_evidence[:limit]:
+            if not isinstance(hit, dict):
+                continue
+            label = kind_labels.get(str(hit.get("kind", "")), str(hit.get("kind", "usage")).replace("_", " "))
+            symbol = str(hit.get("symbol", "")).strip()
+            location = str(hit.get("file", "")).strip()
+            line = hit.get("line")
+            if location and isinstance(line, int):
+                location = f"{location}:{line}"
+            summary = label
+            if symbol:
+                summary += f" {symbol}"
+            if location:
+                summary += f" in {location}"
+            parts.append(summary)
+        return "; ".join(part for part in parts if part)
+
+    @staticmethod
+    def _summarise_dependency_risk_factors(risk_factors: dict | None, limit: int = 3) -> str:
+        if not isinstance(risk_factors, dict):
+            return ""
+
+        labels = {
+            "reachability": "reachability",
+            "relevance": "package usage",
+            "vulnerable_function_match": "function match",
+            "dev_dependency": "dev-only scope",
+            "fix_available": "fix available",
+            "hot_file_usage": "hot-file usage",
+        }
+        items = [
+            (key, value)
+            for key, value in risk_factors.items()
+            if key not in {"base", "final"} and isinstance(value, (int, float)) and value != 0
+        ]
+        items.sort(key=lambda item: abs(float(item[1])), reverse=True)
+        return ", ".join(
+            f"{labels.get(key, key.replace('_', ' '))} {'+' if value > 0 else ''}{round(float(value))}"
+            for key, value in items[:limit]
+        )
+
+    async def _load_dependency_findings(self, ctx: ScanContext) -> list[tuple]:
+        from sqlalchemy import case, select
+
+        from app.models.dependency import Dependency, DependencyFinding
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(DependencyFinding, Dependency)
+                .join(Dependency, DependencyFinding.dependency_id == Dependency.id)
+                .where(DependencyFinding.scan_id == ctx.scan_id)
+                .order_by(
+                    case((DependencyFinding.risk_score.is_(None), 1), else_=0),
+                    DependencyFinding.risk_score.desc(),
+                    DependencyFinding.severity.desc(),
+                )
+            )
+            return result.all()
+
+    def _build_dependency_report_context(self, dep_findings: list[tuple]) -> str:
+
+        if not dep_findings:
+            return ""
+
+        reachable = sum(1 for df, _ in dep_findings if df.reachability_status == "reachable")
+        active = sum(1 for df, _ in dep_findings if df.relevance in {"used", "likely_used"})
+        transitive = sum(1 for df, _ in dep_findings if df.relevance == "transitive_only")
+        function_matches = sum(1 for df, _ in dep_findings if df.vulnerable_functions)
+
+        parts = [
+            "\n## Dependency Risk Summary",
+            f"Total dependency findings: {len(dep_findings)}",
+            f"Reachable: {reachable}",
+            f"Imported or likely used: {active}",
+            f"Transitive only: {transitive}",
+            f"Vulnerable function matches: {function_matches}",
+            "Dependency discussion must distinguish manifest-only or transitive issues from imported or reachable issues.",
+            "Do not describe a dependency as directly exposed unless usage or reachability evidence supports it.",
+            "",
+            "Top dependency risks:",
+        ]
+
+        for df, dep in dep_findings[:8]:
+            risk_score = f"{round(df.risk_score)}/1000" if df.risk_score is not None else "n/a"
+            advisory_id = df.cve_id or df.advisory_id or "offline advisory"
+            reachability = df.reachability_status
+            if df.reachability_confidence is not None:
+                reachability += f" ({round(df.reachability_confidence * 100)}%)"
+            parts.append(
+                f"- {dep.name} {dep.version or 'unknown'} [{df.severity or 'unknown'}] "
+                f"{advisory_id} risk={risk_score} relevance={df.relevance} "
+                f"reachability={reachability} evidence={df.evidence_type}"
+            )
+
+            assessment = self._truncate_dependency_text(df.ai_assessment or df.summary)
+            if assessment:
+                parts.append(f"  Assessment: {assessment}")
+
+            usage = self._summarise_dependency_usage(df.usage_evidence)
+            if usage:
+                parts.append(f"  Usage: {usage}")
+
+            if df.vulnerable_functions:
+                parts.append(f"  Functions: {', '.join(df.vulnerable_functions[:3])}")
+
+            factors = self._summarise_dependency_risk_factors(df.risk_factors)
+            if factors:
+                parts.append(f"  Risk factors: {factors}")
+
+        return "\n".join(parts)
+
+    def _build_architecture_payload(self, ctx: ScanContext, dep_findings: list[tuple]) -> dict:
+        payload = self._parse_architecture_payload(ctx.architecture_notes)
+        confirmed = [f for f in ctx.candidate_findings if f.status != "dismissed"]
+        severity_counts = Counter(str(f.severity).lower() for f in confirmed)
+
+        components = payload.get("components")
+        if not isinstance(components, list) or not components:
+            components = ctx.components or []
+            payload["components"] = components
+
+        component_hotspots = self._build_component_hotspots(components, confirmed)
+        dependency_summary = self._summarise_dependency_findings(dep_findings)
+        result_summary = {
+            "finding_count": len(confirmed),
+            "critical_count": severity_counts.get("critical", 0),
+            "high_count": severity_counts.get("high", 0),
+            "medium_count": severity_counts.get("medium", 0),
+            "advisory_correlated_count": sum(1 for f in confirmed if f.related_cves),
+            "reachable_dependency_count": dependency_summary["reachable"],
+            "active_dependency_count": dependency_summary["active"],
+            "function_matched_dependency_count": dependency_summary["function_matches"],
+            "high_risk_dependency_count": dependency_summary["high_risk"],
+        }
+
+        security_observations = []
+        for value in payload.get("security_observations") or []:
+            text = str(value).strip()
+            if text and text not in security_observations:
+                security_observations.append(text)
+        for finding in sorted(
+            confirmed,
+            key=lambda item: (
+                {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}.get(str(item.severity).lower(), 9),
+                -float(item.confidence or 0.0),
+            ),
+        )[:5]:
+            note = f"{finding.title} in {finding.file_path}"
+            if note not in security_observations:
+                security_observations.append(note)
+        for note in ctx.key_observations[:6]:
+            text = str(note).strip()
+            if text and text not in security_observations:
+                security_observations.append(text)
+
+        payload["result_summary"] = result_summary
+        payload["trust_boundaries"] = payload.get("trust_boundaries") or ctx.trust_boundaries or []
+        payload["entry_points"] = payload.get("entry_points") or ctx.entry_points or []
+        payload["security_observations"] = security_observations[:12]
+        payload["component_hotspots"] = component_hotspots
+        payload["dependency_summary"] = dependency_summary
+        payload["diagrams"] = self._merge_diagrams(
+            self._build_result_aware_diagrams(
+                payload,
+                confirmed,
+                component_hotspots,
+                dependency_summary,
+            ),
+            payload.get("diagrams") or [],
+        )
+        return payload
+
+    @staticmethod
+    def _parse_architecture_payload(raw: str | None) -> dict:
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {"analysis_markdown": str(raw)}
+        except Exception:
+            return {"analysis_markdown": str(raw)}
+
+    @staticmethod
+    def _merge_diagrams(primary: list[dict], existing: list[dict], max_diagrams: int = 5) -> list[dict]:
+        merged: list[dict] = []
+        seen_titles: set[str] = set()
+        for candidate in [*primary, *existing]:
+            if not isinstance(candidate, dict):
+                continue
+            title = str(candidate.get("title") or "").strip()
+            mermaid = str(candidate.get("mermaid") or "").strip()
+            if not title or not mermaid:
+                continue
+            key = title.lower()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            merged.append(candidate)
+            if len(merged) >= max_diagrams:
+                break
+        return merged
+
+    @staticmethod
+    def _build_component_hotspots(components: list[dict], findings: list) -> list[dict]:
+        hotspots: list[dict] = []
+        for component in components or []:
+            if not isinstance(component, dict):
+                continue
+            paths = [str(path) for path in component.get("files", []) if path]
+            matched = []
+            for finding in findings:
+                if any(finding.file_path == path or finding.file_path.startswith(f"{path}/") for path in paths):
+                    matched.append(finding)
+            severity_counts = Counter(str(item.severity).lower() for item in matched)
+            hotspots.append(
+                {
+                    "name": str(component.get("name") or "Component"),
+                    "criticality": str(component.get("criticality") or "medium"),
+                    "finding_count": len(matched),
+                    "critical_count": severity_counts.get("critical", 0),
+                    "high_count": severity_counts.get("high", 0),
+                    "medium_count": severity_counts.get("medium", 0),
+                    "in_attack_surface": bool(component.get("in_attack_surface")),
+                }
+            )
+        hotspots.sort(
+            key=lambda item: (
+                -item["critical_count"],
+                -item["high_count"],
+                -item["finding_count"],
+                item["name"].lower(),
+            )
+        )
+        return hotspots[:8]
+
+    def _summarise_dependency_findings(self, dep_findings: list[tuple]) -> dict:
+        summary = {
+            "total": len(dep_findings),
+            "reachable": 0,
+            "active": 0,
+            "function_matches": 0,
+            "high_risk": 0,
+            "top_packages": [],
+            "hot_files": [],
+        }
+        if not dep_findings:
+            return summary
+
+        package_rows: list[dict] = []
+        hot_files: Counter = Counter()
+        for df, dep in dep_findings:
+            if df.reachability_status == "reachable":
+                summary["reachable"] += 1
+            if df.relevance in {"used", "likely_used"}:
+                summary["active"] += 1
+            if df.vulnerable_functions:
+                summary["function_matches"] += 1
+            if (df.risk_score or 0) >= 700:
+                summary["high_risk"] += 1
+            package_rows.append(
+                {
+                    "package": dep.name,
+                    "ecosystem": dep.ecosystem,
+                    "severity": df.severity or "unknown",
+                    "risk_score": float(df.risk_score or 0.0),
+                    "reachability_status": df.reachability_status,
+                    "evidence_type": df.evidence_type,
+                    "fixed_version": df.fixed_version,
+                }
+            )
+            for hit in df.usage_evidence or []:
+                if isinstance(hit, dict) and hit.get("file"):
+                    hot_files[str(hit.get("file"))] += 1
+
+        package_rows.sort(
+            key=lambda item: (
+                -item["risk_score"],
+                {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}.get(item["severity"], 0),
+                item["package"].lower(),
+            )
+        )
+        summary["top_packages"] = package_rows[:5]
+        summary["hot_files"] = [
+            {"file": path, "hits": count}
+            for path, count in hot_files.most_common(4)
+        ]
+        return summary
+
+    def _build_result_aware_diagrams(
+        self,
+        payload: dict,
+        findings: list,
+        component_hotspots: list[dict],
+        dependency_summary: dict,
+    ) -> list[dict]:
+        diagrams = [self._build_overview_diagram(payload, findings, component_hotspots, dependency_summary)]
+        trust_diagram = self._build_trust_boundary_diagram(payload, findings, component_hotspots, dependency_summary)
+        if trust_diagram:
+            diagrams.append(trust_diagram)
+        dependency_diagram = self._build_dependency_diagram(dependency_summary)
+        if dependency_diagram:
+            diagrams.append(dependency_diagram)
+        return diagrams
+
+    def _build_overview_diagram(
+        self,
+        payload: dict,
+        findings: list,
+        component_hotspots: list[dict],
+        dependency_summary: dict,
+    ) -> dict:
+        summary = payload.get("result_summary") or {}
+        components = component_hotspots[:3] or [{"name": "Application", "criticality": "high", "finding_count": len(findings)}]
+        component_ids = []
+        lines = [
+            "flowchart TD",
+            "    U((fa:user External Users))",
+            f"    EP([fa:globe Entry Points {len(payload.get('entry_points') or []) or 1}])",
+            f"    TB{{fa:shield Trust Boundaries {len(payload.get('trust_boundaries') or []) or 1}}}",
+            f"    FIND{{fa:bug Verified Findings {summary.get('critical_count', 0)} critical {summary.get('high_count', 0)} high}}",
+            f"    DEP[(fa:database Dependency Risks {dependency_summary.get('reachable', 0)} reachable)]",
+            f"    STORE[(fa:database Data Stores {len(payload.get('external_integrations') or []) or 1})]",
+        ]
+        for index, component in enumerate(components, start=1):
+            node_id = f"C{index}"
+            component_ids.append(node_id)
+            label = self._mermaid_label(component.get("name"), fallback=f"Component {index}", limit=28)
+            icon = "fa:lock" if str(component.get("criticality")) == "critical" else "fa:server"
+            lines.append(f"    {node_id}[{icon} {label}]")
+
+        lines.extend([
+            "    U --> EP",
+            "    EP --> TB",
+            f"    TB --> {component_ids[0]}",
+        ])
+        for left, right in zip(component_ids, component_ids[1:]):
+            lines.append(f"    {left} --> {right}")
+        lines.append(f"    {component_ids[-1]} --> STORE")
+        for node_id in component_ids[:2]:
+            lines.append(f"    FIND -.-> {node_id}")
+        lines.append(f"    DEP -.-> {component_ids[min(1, len(component_ids) - 1)]}")
+        lines.extend(self._mermaid_class_defs())
+        lines.append("    class FIND danger")
+        lines.append("    class DEP,STORE store")
+        lines.append("    class TB safe")
+        lines.append(f"    class {','.join(component_ids)} warn")
+
+        highlights = [
+            f"{summary.get('finding_count', len(findings))} verified findings across {len(component_hotspots) or len(components)} mapped components",
+            f"{dependency_summary.get('reachable', 0)} reachable dependency risks and {dependency_summary.get('function_matches', 0)} vulnerable function matches",
+        ]
+        if component_hotspots:
+            top = component_hotspots[0]
+            highlights.append(
+                f"{top.get('name')} is the hottest component with {top.get('finding_count', 0)} linked findings"
+            )
+
+        return {
+            "title": "Verified Security Overview",
+            "description": "Result-aware overview combining verified findings, trust boundaries, hotspots, and dependency risk.",
+            "kind": "result_overview",
+            "highlights": highlights,
+            "mermaid": "\n".join(lines),
+        }
+
+    def _build_trust_boundary_diagram(
+        self,
+        payload: dict,
+        findings: list,
+        component_hotspots: list[dict],
+        dependency_summary: dict,
+    ) -> dict | None:
+        entry_points = payload.get("entry_points") or []
+        trust_boundaries = payload.get("trust_boundaries") or []
+        auth_mechanisms = payload.get("auth_mechanisms") or []
+        if not entry_points and not trust_boundaries and not findings:
+            return None
+
+        hotspot_names = [self._mermaid_label(item.get("name"), fallback="Component", limit=26) for item in component_hotspots[:2]]
+        entry_labels = [
+            self._mermaid_label(
+                ep.get("path") or ep.get("function") or ep.get("file") or f"Entry {index + 1}",
+                fallback=f"Entry {index + 1}",
+                limit=24,
+            )
+            for index, ep in enumerate(entry_points[:3])
+        ] or ["Primary Entry"]
+        boundary_label = self._mermaid_label(trust_boundaries[0], fallback="Trust Boundary", limit=28) if trust_boundaries else "Trust Boundary"
+        auth_label = self._mermaid_label(
+            (auth_mechanisms[0] or {}).get("type") if auth_mechanisms else "Access Control",
+            fallback="Access Control",
+            limit=22,
+        )
+
+        lines = [
+            "flowchart LR",
+            "    USER((fa:user Browser Or Client))",
+            "    ATT((fa:bug Attack Paths))",
+            f"    BOUND{{fa:shield {boundary_label}}}",
+            f"    AUTH{{fa:lock {auth_label}}}",
+            f"    HOT1[fa:fire {hotspot_names[0] if hotspot_names else 'Hot Component'}]",
+            f"    DEP[(fa:database Reachable Dependencies {dependency_summary.get('reachable', 0)})]",
+        ]
+        for index, label in enumerate(entry_labels, start=1):
+            lines.append(f"    EP{index}([fa:globe {label}])")
+        if len(hotspot_names) > 1:
+            lines.append(f"    HOT2[fa:fire {hotspot_names[1]}]")
+
+        lines.append("    USER --> EP1")
+        for index in range(1, len(entry_labels) + 1):
+            lines.append(f"    EP{index} --> BOUND")
+            lines.append(f"    ATT -.-> EP{index}")
+        lines.append("    BOUND --> AUTH")
+        lines.append("    AUTH --> HOT1")
+        if len(hotspot_names) > 1:
+            lines.append("    HOT1 --> HOT2")
+            lines.append("    DEP -.-> HOT2")
+        else:
+            lines.append("    DEP -.-> HOT1")
+        lines.extend(self._mermaid_class_defs())
+        lines.append("    class ATT danger")
+        lines.append("    class BOUND,AUTH safe")
+        hotspot_class_targets = ["HOT1"] + (["HOT2"] if len(hotspot_names) > 1 else [])
+        lines.append(f"    class {','.join(hotspot_class_targets)} warn")
+        lines.append("    class DEP store")
+
+        highlights = [
+            f"{len(entry_points)} mapped entry points and {len(trust_boundaries)} trust boundaries carried into final reporting",
+            f"{dependency_summary.get('reachable', 0)} reachable dependency issues remain attached to the same hot paths",
+        ]
+        if auth_mechanisms:
+            highlights.append(f"Primary auth mechanism observed: {auth_mechanisms[0].get('type', 'unknown')}")
+
+        return {
+            "title": "Trust Boundaries And Hotspots",
+            "description": "Routes user entry paths through trust boundaries, access controls, and the hottest verified components.",
+            "kind": "trust_boundaries",
+            "highlights": highlights,
+            "mermaid": "\n".join(lines),
+        }
+
+    def _build_dependency_diagram(self, dependency_summary: dict) -> dict | None:
+        if dependency_summary.get("total", 0) <= 0:
+            return None
+
+        hot_files = dependency_summary.get("hot_files") or []
+        top_packages = dependency_summary.get("top_packages") or []
+        lines = [
+            "flowchart LR",
+            f"    MAN[fa:folder Dependency Manifests {dependency_summary.get('total', 0)} findings]",
+            f"    IMP[fa:code Imported Packages {dependency_summary.get('active', 0)}]",
+            f"    REACH{{fa:bug Reachable Packages {dependency_summary.get('reachable', 0)}}}",
+            f"    FUNC([fa:fire Function Hits {dependency_summary.get('function_matches', 0)}])",
+        ]
+
+        package_nodes = []
+        for index, pkg in enumerate(top_packages[:2], start=1):
+            node_id = f"P{index}"
+            package_nodes.append(node_id)
+            label = self._mermaid_label(pkg.get("package"), fallback=f"Package {index}", limit=20)
+            lines.append(f"    {node_id}[(fa:database {label})]")
+        file_nodes = []
+        for index, item in enumerate(hot_files[:2], start=1):
+            node_id = f"F{index}"
+            file_nodes.append(node_id)
+            label = self._mermaid_label(item.get("file"), fallback=f"File {index}", limit=24)
+            lines.append(f"    {node_id}[fa:file {label}]")
+
+        lines.append("    MAN --> IMP")
+        lines.append("    IMP --> REACH")
+        lines.append("    REACH --> FUNC")
+        for node_id in package_nodes:
+            lines.append(f"    IMP --> {node_id}")
+            lines.append(f"    {node_id} --> REACH")
+        for node_id in file_nodes:
+            lines.append(f"    FUNC -.-> {node_id}")
+        lines.extend(self._mermaid_class_defs())
+        lines.append("    class REACH,FUNC danger")
+        if package_nodes:
+            lines.append(f"    class {','.join(package_nodes)} store")
+        if file_nodes:
+            lines.append(f"    class {','.join(file_nodes)} warn")
+
+        highlights = [
+            f"{dependency_summary.get('active', 0)} imported or likely-used vulnerable packages",
+            f"{dependency_summary.get('reachable', 0)} reachable packages and {dependency_summary.get('function_matches', 0)} vulnerable function matches",
+        ]
+        if top_packages:
+            highlights.append(
+                "Top package risks: " + ", ".join(self._mermaid_label(pkg.get("package"), fallback="package", limit=18) for pkg in top_packages[:3])
+            )
+
+        return {
+            "title": "Dependency Exposure And Reachability",
+            "description": "Shows how manifest findings collapse into imported, reachable, and function-level dependency risk.",
+            "kind": "dependency_risk",
+            "highlights": highlights,
+            "mermaid": "\n".join(lines),
+        }
+
+    @staticmethod
+    def _mermaid_class_defs() -> list[str]:
+        return [
+            "    classDef danger fill:#7f1d1d,stroke:#f87171,color:#fecaca",
+            "    classDef warn fill:#7c2d12,stroke:#fb923c,color:#fed7aa",
+            "    classDef safe fill:#14532d,stroke:#4ade80,color:#bbf7d0",
+            "    classDef store fill:#1e3a5f,stroke:#60a5fa,color:#bfdbfe",
+        ]
+
+    @staticmethod
+    def _mermaid_label(value: str | None, *, fallback: str, limit: int = 28) -> str:
+        text = re.sub(r"[^A-Za-z0-9 /:-]+", " ", str(value or fallback))
+        text = re.sub(r"\s+", " ", text).strip(" -:/")
+        text = text or fallback
+        return text[:limit].rstrip()
+
+    def _build_report_prompt(self, ctx: ScanContext, dependency_summary: str = "") -> str:
         parts = [
             "## Application",
             ctx.app_summary or "No application summary available.",
@@ -609,6 +1217,31 @@ class ReporterAgent(BaseAgent):
             f"Scan mode: {ctx.mode}",
             f"Documentation files analysed: {len(ctx.doc_files_found)}",
         ]
+
+        if ctx.scanner_runs:
+            parts.append("\n## Scanner Run Health")
+            for scanner_name, summary in ctx.scanner_runs.items():
+                parts.append(
+                    f"- {scanner_name}: status={summary.get('status')} "
+                    f"hits={summary.get('hit_count', 0)} duration_ms={summary.get('duration_ms', 0)} "
+                        f"errors={len(summary.get('errors', []))}"
+                )
+        if ctx.scanner_availability:
+            parts.append("\n## Scanner Availability")
+            for scanner_name, status in sorted(ctx.scanner_availability.items()):
+                parts.append(f"- {scanner_name}: {status}")
+        if ctx.degraded_coverage:
+            parts.append(
+                "\nNOTE: One or more scanners completed in a degraded state or failed. "
+                "The methodology and limitations sections must state that scanner coverage was incomplete."
+            )
+        if ctx.ignored_file_count > 0:
+            parts.append(
+                f"\nIgnored repo paths/files: {ctx.ignored_file_count}. "
+                f"Managed exclusions: {', '.join(ctx.managed_paths_ignored[:5]) or 'none'}."
+            )
+            if ctx.repo_ignore_file:
+                parts.append(f"Repo ignore file: {ctx.repo_ignore_file}")
 
         # ── Documentation intelligence ─────────────────────────────
         if ctx.doc_intelligence:
@@ -784,5 +1417,8 @@ class ReporterAgent(BaseAgent):
         parts.append(f"\n## Scanner Results")
         for scanner, count in ctx.scanner_hit_counts.items():
             parts.append(f"- {scanner}: {count} hits")
+
+        if dependency_summary:
+            parts.append(dependency_summary)
 
         return "\n".join(parts)

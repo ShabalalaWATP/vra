@@ -65,7 +65,14 @@ class DependencyFindingOut(BaseModel):
     summary: str | None
     affected_range: str | None
     fixed_version: str | None
+    vulnerable_functions: list[str] | None = None
+    evidence_type: str
     relevance: str
+    usage_evidence: list[dict] | None = None
+    reachability_status: str
+    reachability_confidence: float | None = None
+    risk_score: float | None = None
+    risk_factors: dict | None = None
     ai_assessment: str | None
 
     model_config = {"from_attributes": True}

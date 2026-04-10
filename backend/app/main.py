@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +19,7 @@ async def _auto_migrate():
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "alembic", "upgrade", "head",
+            sys.executable, "-m", "alembic", "upgrade", "head",
             cwd=str(Path(__file__).parent.parent),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -40,6 +41,7 @@ async def _auto_migrate():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     settings.export_dir.mkdir(parents=True, exist_ok=True)
 

@@ -17,6 +17,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.analysis.paths import load_repo_path_policy, should_skip_repo_path
 from app.scanners.base import ScannerAdapter, ScannerHit, ScannerOutput
 
 # ── Pattern definitions ──────────────────────────────────────────
@@ -294,10 +295,11 @@ class SecretsScanner(ScannerAdapter):
 
     def _collect_files(self, root: Path) -> list[Path]:
         files = []
+        policy = load_repo_path_policy(root)
         for path in root.rglob("*"):
             if path.is_dir():
                 continue
-            if any(skip in path.parts for skip in SKIP_DIRS):
+            if should_skip_repo_path(path, root, policy=policy):
                 continue
             if path.suffix.lower() in SKIP_EXTENSIONS:
                 continue
