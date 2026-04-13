@@ -1,8 +1,8 @@
 {
   "source": "OSV (https://osv.dev)",
   "license": "CC-BY-4.0",
-  "synced_at": "2026-04-10T00:39:22.369351",
-  "total_advisories": 258904,
+  "synced_at": "2026-04-12T15:14:07.036401",
+  "total_advisories": 269920,
   "ecosystems": [
     "npm",
     "pypi",
@@ -17,6 +17,6 @@
   ],
   "enrichment": {
     "artifact": "enrichment.json",
-    "strategy_version": 1
+    "strategy_version": 3
   }
 }
