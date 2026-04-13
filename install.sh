@@ -37,9 +37,16 @@ OFFLINE_TOOLS="$OFFLINE_ROOT/tools"
 VENDOR_ROOT="$ROOT/vendor/ubuntu"
 VENDOR_PYTHON="$VENDOR_ROOT/python"
 VENDOR_NODE="$VENDOR_ROOT/node_modules.tar.gz"
+VENDOR_NODE_PART_GLOB="$VENDOR_ROOT/node_modules.tar.gz.part-*"
 VENDOR_SCANNERS="$VENDOR_ROOT/tools/python_vendor"
+VENDOR_SCANNERS_ARCHIVE="$VENDOR_ROOT/tools/python_vendor.tar.gz"
+VENDOR_SCANNERS_PART_GLOB="$VENDOR_ROOT/tools/python_vendor.tar.gz.part-*"
 VENDOR_CODEQL="$VENDOR_ROOT/tools/codeql"
+VENDOR_CODEQL_ARCHIVE="$VENDOR_ROOT/tools/codeql.tar.gz"
+VENDOR_CODEQL_PART_GLOB="$VENDOR_ROOT/tools/codeql.tar.gz.part-*"
 VENDOR_JADX="$VENDOR_ROOT/tools/jadx"
+VENDOR_JADX_ARCHIVE="$VENDOR_ROOT/tools/jadx.tar.gz"
+VENDOR_JADX_PART_GLOB="$VENDOR_ROOT/tools/jadx.tar.gz.part-*"
 LOCAL_SCANNERS="$BACKEND/tools/python_vendor"
 
 OFFLINE=false
@@ -87,12 +94,39 @@ warn()   { echo -e "  ${YELLOW}[!]${NC} $1"; }
 err()    { echo -e "  ${RED}[X]${NC} $1"; }
 
 has_cmd() { command -v "$1" &>/dev/null; }
+glob_exists() { compgen -G "$1" > /dev/null; }
 
 copy_tree() {
     local src="$1"
     local dest="$2"
     mkdir -p "$dest"
     cp -R "$src"/. "$dest/"
+}
+
+extract_tar_archive_into() {
+    local archive_path="$1"
+    local dest_root="$2"
+    mkdir -p "$dest_root"
+    tar xzf "$archive_path" -C "$dest_root"
+}
+
+extract_tar_archive_parts_into() {
+    local part_glob="$1"
+    local dest_root="$2"
+    local temp_archive
+    local parts=()
+    shopt -s nullglob
+    parts=($part_glob)
+    shopt -u nullglob
+    if [[ "${#parts[@]}" -eq 0 ]]; then
+        return 1
+    fi
+
+    temp_archive="$(mktemp "${TMPDIR:-/tmp}/vragent-node-modules.XXXXXX.tar.gz")"
+    cat "${parts[@]}" > "$temp_archive"
+    mkdir -p "$dest_root"
+    tar xzf "$temp_archive" -C "$dest_root"
+    rm -f "$temp_archive"
 }
 
 header() {
@@ -182,6 +216,14 @@ if [[ -d "$VENDOR_SCANNERS" ]]; then
     rm -rf "$LOCAL_SCANNERS"
     mkdir -p "$(dirname "$LOCAL_SCANNERS")"
     copy_tree "$VENDOR_SCANNERS" "$LOCAL_SCANNERS"
+elif [[ -f "$VENDOR_SCANNERS_ARCHIVE" ]] || glob_exists "$VENDOR_SCANNERS_PART_GLOB"; then
+    step "Restoring bundled Python scanners from vendored archive..."
+    rm -rf "$LOCAL_SCANNERS"
+    if [[ -f "$VENDOR_SCANNERS_ARCHIVE" ]]; then
+        extract_tar_archive_into "$VENDOR_SCANNERS_ARCHIVE" "$BACKEND/tools"
+    else
+        extract_tar_archive_parts_into "$VENDOR_SCANNERS_PART_GLOB" "$BACKEND/tools"
+    fi
 elif [[ "$OFFLINE" == true && -d "$OFFLINE_TOOLS/python_vendor" ]]; then
     step "Restoring bundled Python scanners from offline bundle..."
     rm -rf "$LOCAL_SCANNERS"
@@ -227,17 +269,23 @@ cd "$FRONTEND"
 if [[ "$OFFLINE" == true ]]; then
     if [[ -f "$VENDOR_NODE" ]]; then
         step "Extracting vendored Ubuntu node_modules..."
-        tar xzf "$VENDOR_NODE"
+        extract_tar_archive_into "$VENDOR_NODE" "$FRONTEND"
+    elif glob_exists "$VENDOR_NODE_PART_GLOB"; then
+        step "Extracting vendored Ubuntu node_modules from split archive..."
+        extract_tar_archive_parts_into "$VENDOR_NODE_PART_GLOB" "$FRONTEND"
     elif [[ -f "$OFFLINE_NODE" ]]; then
         step "Extracting offline node_modules..."
-        tar xzf "$OFFLINE_NODE"
+        extract_tar_archive_into "$OFFLINE_NODE" "$FRONTEND"
     else
         err "No vendored Ubuntu node_modules archive or offline node_modules archive found."
         exit 1
     fi
 elif [[ -f "$VENDOR_NODE" ]]; then
     step "Extracting vendored Ubuntu node_modules..."
-    tar xzf "$VENDOR_NODE"
+    extract_tar_archive_into "$VENDOR_NODE" "$FRONTEND"
+elif glob_exists "$VENDOR_NODE_PART_GLOB"; then
+    step "Extracting vendored Ubuntu node_modules from split archive..."
+    extract_tar_archive_parts_into "$VENDOR_NODE_PART_GLOB" "$FRONTEND"
 else
     if [[ -f "$FRONTEND/package-lock.json" ]]; then
         step "Running npm ci..."
@@ -270,6 +318,17 @@ elif [[ -f "$VENDOR_CODEQL/codeql" ]]; then
     step "Restoring CodeQL from $VENDOR_CODEQL"
     rm -rf "$BACKEND/tools/codeql"
     copy_tree "$VENDOR_CODEQL" "$BACKEND/tools/codeql"
+    chmod +x "$BACKEND/tools/codeql/codeql" || true
+    step "CodeQL restored to $BACKEND/tools/codeql/codeql"
+elif [[ -f "$VENDOR_CODEQL_ARCHIVE" ]] || glob_exists "$VENDOR_CODEQL_PART_GLOB"; then
+    header "CodeQL (Vendored Ubuntu Archive)"
+    step "Restoring CodeQL from vendored archive"
+    rm -rf "$BACKEND/tools/codeql"
+    if [[ -f "$VENDOR_CODEQL_ARCHIVE" ]]; then
+        extract_tar_archive_into "$VENDOR_CODEQL_ARCHIVE" "$BACKEND/tools"
+    else
+        extract_tar_archive_parts_into "$VENDOR_CODEQL_PART_GLOB" "$BACKEND/tools"
+    fi
     chmod +x "$BACKEND/tools/codeql/codeql" || true
     step "CodeQL restored to $BACKEND/tools/codeql/codeql"
 elif [[ "$SKIP_CODEQL" == false && "$OFFLINE" == false ]]; then
@@ -326,6 +385,17 @@ elif [[ -f "$VENDOR_JADX/bin/jadx" ]]; then
     step "Restoring jadx from $VENDOR_JADX"
     rm -rf "$BACKEND/tools/jadx"
     copy_tree "$VENDOR_JADX" "$BACKEND/tools/jadx"
+    chmod +x "$BACKEND/tools/jadx/bin/jadx" || true
+    step "jadx restored to $BACKEND/tools/jadx/bin/jadx"
+elif [[ -f "$VENDOR_JADX_ARCHIVE" ]] || glob_exists "$VENDOR_JADX_PART_GLOB"; then
+    header "jadx (Vendored Ubuntu Archive)"
+    step "Restoring jadx from vendored archive"
+    rm -rf "$BACKEND/tools/jadx"
+    if [[ -f "$VENDOR_JADX_ARCHIVE" ]]; then
+        extract_tar_archive_into "$VENDOR_JADX_ARCHIVE" "$BACKEND/tools"
+    else
+        extract_tar_archive_parts_into "$VENDOR_JADX_PART_GLOB" "$BACKEND/tools"
+    fi
     chmod +x "$BACKEND/tools/jadx/bin/jadx" || true
     step "jadx restored to $BACKEND/tools/jadx/bin/jadx"
 elif [[ "$OFFLINE" == false ]]; then
@@ -436,7 +506,7 @@ fi
 header "Installation Complete"
 
 check_item() {
-    if $2; then
+    if eval "$2"; then
         step "$1"
     else
         warn "$1 — not found"
@@ -445,8 +515,9 @@ check_item() {
 
 check_item "Python backend"      "test -f $BACKEND/app/main.py"
 check_item "Vendored Ubuntu wheelhouse" "test -d $VENDOR_PYTHON"
-check_item "Vendored Ubuntu CodeQL" "test -f $VENDOR_CODEQL/codeql"
-check_item "Vendored Ubuntu jadx" "test -f $VENDOR_JADX/bin/jadx"
+check_item "Vendored Ubuntu scanners" "test -d '$VENDOR_SCANNERS' || test -f '$VENDOR_SCANNERS_ARCHIVE' || compgen -G '$VENDOR_SCANNERS_PART_GLOB' > /dev/null"
+check_item "Vendored Ubuntu CodeQL" "test -f '$VENDOR_CODEQL/codeql' || test -f '$VENDOR_CODEQL_ARCHIVE' || compgen -G '$VENDOR_CODEQL_PART_GLOB' > /dev/null"
+check_item "Vendored Ubuntu jadx" "test -f '$VENDOR_JADX/bin/jadx' || test -f '$VENDOR_JADX_ARCHIVE' || compgen -G '$VENDOR_JADX_PART_GLOB' > /dev/null"
 check_item "Frontend node_modules" "test -d $FRONTEND/node_modules"
 check_item "Bundled Semgrep"     "test -f $BACKEND/tools/bin/run_semgrep.py -a -d $BACKEND/tools/python_vendor"
 check_item "Bundled Bandit"      "test -f $BACKEND/tools/bin/run_bandit.py -a -d $BACKEND/tools/python_vendor"

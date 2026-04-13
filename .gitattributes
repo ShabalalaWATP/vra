@@ -3,6 +3,7 @@ backend/data/advisories/**/*.gz binary
 backend/data/vragent.db binary
 vendor/ubuntu/**/*.whl binary
 vendor/ubuntu/**/*.tar.gz binary
+vendor/ubuntu/**/*.part-* binary
 vendor/ubuntu/**/*.zip binary
 vendor/ubuntu/**/*.jar binary
 vendor/ubuntu/**/*.so binary

@@ -783,11 +783,11 @@ If you want a plain `git clone` on Ubuntu to carry the scanner/runtime dependenc
 
 ```text
 vendor/ubuntu/
-├── python/              # wheelhouse for backend deps + semgrep + bandit
-├── tools/python_vendor/ # pre-bundled Semgrep + Bandit runtime
-├── tools/codeql/        # Linux CodeQL bundle
-├── tools/jadx/          # jadx distribution
-└── node_modules.tar.gz  # optional frontend tooling archive
+├── python/                    # wheelhouse for backend deps + semgrep + bandit
+├── tools/python_vendor.tar.gz # pre-bundled Semgrep + Bandit runtime
+├── tools/codeql.tar.gz.part-* # split Linux CodeQL bundle
+├── tools/jadx.tar.gz          # jadx distribution
+└── node_modules.tar.gz        # optional frontend tooling archive
 ```
 
 Prepare that tree on a connected Ubuntu machine:
@@ -813,11 +813,13 @@ If you intentionally want to use your internal mirrors for backend/frontend pack
 In clone-only mode, a plain GitHub clone carries:
 - the Semgrep rules
 - the advisory database
-- the bundled Semgrep + Bandit runtime
-- the Linux CodeQL bundle
-- jadx
+- the bundled Semgrep + Bandit runtime archive
+- the split Linux CodeQL bundle archive
+- the jadx archive
 - a Python wheelhouse containing backend deps plus Semgrep and Bandit
 - optionally a frontend `node_modules` archive
+
+`install.sh` automatically extracts those vendored archives into `backend/tools/` during setup, and it reassembles `*.part-*` chunks automatically when a tool bundle is too large for a single Git blob.
 
 The large npm advisory feed also has a repo-safe mirror at `backend/data/advisories/npm/advisories.json.gz`. If the clone does not have `git-lfs`, the app automatically falls back to that gzip copy, so the advisory database still loads on Ubuntu.
 

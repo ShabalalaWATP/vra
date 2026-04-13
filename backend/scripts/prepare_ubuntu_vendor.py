@@ -10,6 +10,14 @@ import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.bundle_python_scanners import PACKAGES as SCANNER_PACKAGES
+
+MAX_GIT_BLOB_BYTES = 95 * 1024 * 1024
+NODE_ARCHIVE_BASENAME = "node_modules.tar.gz"
+SCANNERS_ARCHIVE_BASENAME = "python_vendor.tar.gz"
+CODEQL_ARCHIVE_BASENAME = "codeql.tar.gz"
+JADX_ARCHIVE_BASENAME = "jadx.tar.gz"
+
 
 def log(message: str) -> None:
     print(f"[+] {message}")
@@ -48,9 +56,8 @@ def build_python_wheelhouse(backend_dir: Path, wheelhouse: Path) -> None:
         str(wheelhouse),
         "setuptools",
         "wheel",
-        "semgrep",
-        "bandit",
         ".[dev]",
+        *SCANNER_PACKAGES,
     ]
     run(cmd, cwd=backend_dir, description=f"Downloading Ubuntu wheelhouse into {wheelhouse}")
 
@@ -78,6 +85,61 @@ def archive_node_modules(frontend_dir: Path, archive_path: Path) -> None:
     log(f"Packing frontend/node_modules into {archive_path}")
     with tarfile.open(archive_path, "w:gz") as archive:
         archive.add(node_modules, arcname="node_modules")
+
+
+def remove_split_archive_parts(archive_path: Path) -> None:
+    for part in archive_path.parent.glob(f"{archive_path.name}.part-*"):
+        part.unlink()
+
+
+def remove_archive_and_parts(archive_path: Path) -> None:
+    if archive_path.exists():
+        archive_path.unlink()
+    remove_split_archive_parts(archive_path)
+
+
+def split_archive_if_needed(archive_path: Path) -> list[Path]:
+    if not archive_path.exists():
+        return []
+
+    size = archive_path.stat().st_size
+    if size <= MAX_GIT_BLOB_BYTES:
+        remove_split_archive_parts(archive_path)
+        return [archive_path]
+
+    parts: list[Path] = []
+    remove_split_archive_parts(archive_path)
+    log(
+        f"Archive {archive_path.name} is {size / 1024 / 1024:.1f} MB; "
+        f"splitting into <= {MAX_GIT_BLOB_BYTES / 1024 / 1024:.0f} MB parts for Git compatibility"
+    )
+    with archive_path.open("rb") as src:
+        index = 0
+        while True:
+            chunk = src.read(MAX_GIT_BLOB_BYTES)
+            if not chunk:
+                break
+            part_path = archive_path.parent / f"{archive_path.name}.part-{index:03d}"
+            part_path.write_bytes(chunk)
+            parts.append(part_path)
+            index += 1
+
+    archive_path.unlink()
+    return parts
+
+
+def archive_directory(source_dir: Path, archive_path: Path) -> list[Path]:
+    if not source_dir.exists():
+        remove_archive_and_parts(archive_path)
+        return []
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    remove_archive_and_parts(archive_path)
+    log(f"Packing {source_dir.name} into {archive_path}")
+    with tarfile.open(archive_path, "w:gz") as archive:
+        archive.add(source_dir, arcname=source_dir.name)
+    shutil.rmtree(source_dir)
+    return split_archive_if_needed(archive_path)
 
 
 def stage_tool(
@@ -119,10 +181,10 @@ def write_manifest(
     manifest_path: Path,
     *,
     wheelhouse: Path,
-    scanner_dir: Path,
-    node_archive: Path | None,
-    codeql_dir: Path,
-    jadx_dir: Path,
+    scanner_archives: list[Path],
+    node_archives: list[Path],
+    codeql_archives: list[Path],
+    jadx_archives: list[Path],
 ) -> None:
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -134,10 +196,14 @@ def write_manifest(
         "intended_target": "Ubuntu/Linux host with the same CPU architecture",
         "included": {
             "python_wheels": len(list(wheelhouse.iterdir())) if wheelhouse.exists() else 0,
-            "python_scanners": scanner_dir.exists(),
-            "node_modules_archive": bool(node_archive and node_archive.exists()),
-            "codeql": codeql_dir.exists(),
-            "jadx": jadx_dir.exists(),
+            "python_scanners": bool(scanner_archives),
+            "python_scanners_archive_parts": [path.name for path in scanner_archives],
+            "node_modules_archive": bool(node_archives),
+            "node_modules_archive_parts": [path.name for path in node_archives],
+            "codeql": bool(codeql_archives),
+            "codeql_archive_parts": [path.name for path in codeql_archives],
+            "jadx": bool(jadx_archives),
+            "jadx_archive_parts": [path.name for path in jadx_archives],
         },
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -191,9 +257,12 @@ def main() -> int:
     vendor_python = vendor_root / "python"
     vendor_tools = vendor_root / "tools"
     vendor_scanners = vendor_tools / "python_vendor"
+    vendor_scanners_archive = vendor_tools / SCANNERS_ARCHIVE_BASENAME
     vendor_codeql = vendor_tools / "codeql"
+    vendor_codeql_archive = vendor_tools / CODEQL_ARCHIVE_BASENAME
     vendor_jadx = vendor_tools / "jadx"
-    vendor_node = vendor_root / "node_modules.tar.gz"
+    vendor_jadx_archive = vendor_tools / JADX_ARCHIVE_BASENAME
+    vendor_node = vendor_root / NODE_ARCHIVE_BASENAME
 
     vendor_root.mkdir(parents=True, exist_ok=True)
     vendor_tools.mkdir(parents=True, exist_ok=True)
@@ -204,15 +273,26 @@ def main() -> int:
         output_dir=vendor_scanners,
         wheelhouse=vendor_python,
     )
+    scanner_archives = archive_directory(vendor_scanners, vendor_scanners_archive)
 
     if args.include_node_modules:
         ensure_frontend_modules(frontend_dir)
         archive_node_modules(frontend_dir, vendor_node)
+        node_archives = split_archive_if_needed(vendor_node)
     elif vendor_node.exists():
         vendor_node.unlink()
+        remove_split_archive_parts(vendor_node)
+        node_archives = []
+    else:
+        remove_split_archive_parts(vendor_node)
+        node_archives = []
 
     if args.skip_codeql:
         warn("Skipping CodeQL vendoring")
+        if vendor_codeql.exists():
+            shutil.rmtree(vendor_codeql)
+        remove_archive_and_parts(vendor_codeql_archive)
+        codeql_archives = []
     else:
         stage_tool(
             backend_dir=backend_dir,
@@ -220,9 +300,14 @@ def main() -> int:
             module_name="scripts.download_codeql",
             description=f"Downloading Ubuntu CodeQL bundle into {vendor_codeql}",
         )
+        codeql_archives = archive_directory(vendor_codeql, vendor_codeql_archive)
 
     if args.skip_jadx:
         warn("Skipping jadx vendoring")
+        if vendor_jadx.exists():
+            shutil.rmtree(vendor_jadx)
+        remove_archive_and_parts(vendor_jadx_archive)
+        jadx_archives = []
     else:
         stage_tool(
             backend_dir=backend_dir,
@@ -230,14 +315,15 @@ def main() -> int:
             module_name="scripts.download_jadx",
             description=f"Downloading jadx into {vendor_jadx}",
         )
+        jadx_archives = archive_directory(vendor_jadx, vendor_jadx_archive)
 
     write_manifest(
         vendor_root / "manifest.json",
         wheelhouse=vendor_python,
-        scanner_dir=vendor_scanners,
-        node_archive=vendor_node if args.include_node_modules else None,
-        codeql_dir=vendor_codeql,
-        jadx_dir=vendor_jadx,
+        scanner_archives=scanner_archives,
+        node_archives=node_archives,
+        codeql_archives=codeql_archives,
+        jadx_archives=jadx_archives,
     )
 
     log(f"Ubuntu vendor tree prepared at {vendor_root}")

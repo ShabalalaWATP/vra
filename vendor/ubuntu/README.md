@@ -7,9 +7,9 @@ vendor/ubuntu/
 ├── manifest.json
 ├── python/                 # wheelhouse for backend deps + semgrep + bandit
 ├── tools/
-│   ├── python_vendor/      # pre-bundled Semgrep + Bandit runtime for backend/tools/
-│   ├── codeql/             # Linux CodeQL bundle
-│   └── jadx/               # jadx distribution
+│   ├── python_vendor.tar.gz        # pre-bundled Semgrep + Bandit runtime
+│   ├── codeql.tar.gz.part-*        # split Linux CodeQL bundle
+│   └── jadx.tar.gz                 # jadx distribution
 └── node_modules.tar.gz     # optional frontend tooling archive
 ```
 
@@ -24,7 +24,8 @@ Notes:
 - Prepare on the same CPU architecture as the target Ubuntu VM.
 - Prepare on the same Python minor version as the target Ubuntu VM if you plan to commit the wheelhouse.
 - `install.sh` automatically prefers `vendor/ubuntu/` over network installs.
-- `install.sh` restores `tools/python_vendor/` into `backend/tools/python_vendor/`, so Semgrep and Bandit do not depend on user-level installs.
+- `install.sh` automatically extracts the vendored tool archives into `backend/tools/`, so Semgrep, Bandit, CodeQL, and jadx do not depend on user-level installs.
+- Large bundles are split into Git-safe `*.part-*` chunks when needed; `install.sh` reassembles them automatically.
 - `node_modules.tar.gz` is optional if the target machine can use your internal npm mirror.
 
 Target Ubuntu VM flow after this directory is committed:

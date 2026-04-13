@@ -1,0 +1,36 @@
+{
+  "generated_at": "2026-04-13T19:26:45.336026+00:00",
+  "prepared_on": {
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.36",
+    "machine": "x86_64",
+    "python": "3.11.15"
+  },
+  "intended_target": "Ubuntu/Linux host with the same CPU architecture",
+  "included": {
+    "python_wheels": 116,
+    "python_scanners": true,
+    "python_scanners_archive_parts": [
+      "python_vendor.tar.gz"
+    ],
+    "node_modules_archive": true,
+    "node_modules_archive_parts": [
+      "node_modules.tar.gz"
+    ],
+    "codeql": true,
+    "codeql_archive_parts": [
+      "codeql.tar.gz.part-000",
+      "codeql.tar.gz.part-001",
+      "codeql.tar.gz.part-002",
+      "codeql.tar.gz.part-003",
+      "codeql.tar.gz.part-004",
+      "codeql.tar.gz.part-005",
+      "codeql.tar.gz.part-006",
+      "codeql.tar.gz.part-007",
+      "codeql.tar.gz.part-008"
+    ],
+    "jadx": true,
+    "jadx_archive_parts": [
+      "jadx.tar.gz"
+    ]
+  }
+}
