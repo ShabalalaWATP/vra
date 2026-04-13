@@ -26,7 +26,6 @@ from pathlib import Path
 from sqlalchemy import case, select
 from sqlalchemy.orm import selectinload
 
-from app.analysis.diagram import render_diagram_for_report
 from app.database import async_session
 from app.events.bus import event_bus
 from app.models.llm_profile import LLMProfile
@@ -45,6 +44,7 @@ from app.orchestrator.agents.verifier import VerifierAgent
 from app.orchestrator.compaction import compact_context, should_compact
 from app.orchestrator.llm_client import LLMClient
 from app.orchestrator.scan_context import ScanContext
+from app.services.report_diagrams import render_report_diagrams
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +71,20 @@ async def _emit_progress(
     async with async_session() as session:
         scan = await session.get(Scan, ctx.scan_id)
         if scan:
+            if scan.status == "cancelled":
+                ctx.cancelled = True
+                return
             scan.current_phase = ctx.current_phase
             scan.current_task = ctx.current_task
+            scan.files_processed = ctx.files_processed
+            scan.files_total = ctx.files_total
+            scan.findings_count = ctx.findings_count
+            scan.ai_calls_made = ctx.ai_calls_made
             scan.status = status
             await session.commit()
+
+    if ctx.cancelled:
+        return
 
     # Emit WebSocket progress event
     await event_bus.publish(ctx.scan_id, {
@@ -143,6 +153,7 @@ async def run_scan(scan_id: uuid.UUID) -> None:
             context_window=llm_profile.context_window,
             max_output_tokens=llm_profile.max_output_tokens,
             use_max_completion_tokens=llm_profile.use_max_completion_tokens,
+            concurrency=llm_profile.concurrency,
         )
 
     ctx = ScanContext(
@@ -303,21 +314,24 @@ async def run_scan(scan_id: uuid.UUID) -> None:
         await _emit_progress(ctx, phase="reporting", task="Generating report")
         await _run_agent(ctx, ReporterAgent(llm), phase_errors)
 
-        # Render diagram
-        if ctx.diagram_spec:
+        # Render report diagrams from the persisted architecture payload so
+        # multi-diagram reports are validated here as well, even though only
+        # the primary render is cached on the report model.
+        async with async_session() as session:
+            report = (await session.execute(
+                select(Report).where(Report.scan_id == scan_id)
+            )).scalar_one_or_none()
+
+        if report:
             await _emit_progress(ctx, task="Rendering architecture diagram")
             try:
-                diagram_bytes = await render_diagram_for_report(
-                    ctx.diagram_spec,
-                    llm_client=llm,
-                    techs=ctx.languages + ctx.frameworks,
-                )
+                rendered_diagrams = await render_report_diagrams(report, llm_client=llm)
                 async with async_session() as session:
                     report = (await session.execute(
                         select(Report).where(Report.scan_id == scan_id)
                     )).scalar_one_or_none()
-                    if report:
-                        report.diagram_image = diagram_bytes
+                    if report and rendered_diagrams:
+                        report.diagram_image = rendered_diagrams[0].image_bytes
                         await session.commit()
             except Exception as e:
                 logger.warning("Diagram rendering failed: %s", e)
@@ -334,6 +348,10 @@ async def run_scan(scan_id: uuid.UUID) -> None:
         await _finish_scan(scan_id, final_status, error=error_msg)
         await _emit_progress(ctx, phase="done", status="completed")
 
+    except asyncio.CancelledError:
+        logger.info("Scan %s cancelled", scan_id)
+        await _finish_scan(scan_id, "cancelled")
+        raise
     except Exception as e:
         logger.exception("Scan %s failed with unrecoverable error", scan_id)
         await _finish_scan(scan_id, "failed", error=str(e))
@@ -457,6 +475,11 @@ async def _finish_scan(scan_id: uuid.UUID, status: str, *, error: str | None = N
     async with async_session() as session:
         scan = await session.get(Scan, scan_id)
         if scan:
+            if scan.status == "cancelled" and status != "cancelled":
+                if error and not scan.error_message:
+                    scan.error_message = error
+                    await session.commit()
+                return
             scan.status = status
             scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
             scan.current_phase = "done" if status == "completed" else status

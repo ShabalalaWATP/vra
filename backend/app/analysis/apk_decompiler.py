@@ -64,6 +64,11 @@ def _find_jadx_binary() -> str | None:
     return shutil.which("jadx")
 
 
+def get_jadx_binary_path() -> str | None:
+    """Return the resolved jadx binary path, if available."""
+    return _find_jadx_binary()
+
+
 async def is_jadx_available() -> bool:
     """Check if jadx is installed and accessible."""
     binary = _find_jadx_binary()

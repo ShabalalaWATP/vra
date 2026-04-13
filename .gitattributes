@@ -1,2 +1,10 @@
 backend/data/advisories/npm/advisories.json filter=lfs diff=lfs merge=lfs -text
+backend/data/advisories/**/*.gz binary
 backend/data/vragent.db binary
+vendor/ubuntu/**/*.whl binary
+vendor/ubuntu/**/*.tar.gz binary
+vendor/ubuntu/**/*.zip binary
+vendor/ubuntu/**/*.jar binary
+vendor/ubuntu/**/*.so binary
+vendor/ubuntu/**/*.dll binary
+vendor/ubuntu/**/*.exe binary

@@ -1,5 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api/client";
+import { triggerBrowserDownload } from "@/utils/download";
 
 /**
  * Convenience hooks for common API mutations.
@@ -59,10 +60,7 @@ export function useExportReport() {
         `/scans/${scanId}/report/export`,
         { format }
       );
-      window.open(
-        `/api/scans/${scanId}/report/export/${result.id}/download`,
-        "_blank"
-      );
+      triggerBrowserDownload(`/api/scans/${scanId}/report/export/${result.id}/download`);
       return result;
     },
   });

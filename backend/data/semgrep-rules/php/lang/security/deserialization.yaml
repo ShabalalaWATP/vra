@@ -3,9 +3,9 @@ rules:
   mode: taint
   pattern-sources:
   - pattern-either:
-    - pattern: $_GET[...]
-    - pattern: $_FILES[...]
-    - pattern: $_POST[...]
+    - pattern: $_GET[$KEY]
+    - pattern: $_FILES[$KEY]
+    - pattern: $_POST[$KEY]
   pattern-sinks:
   - pattern: extract(...)
   pattern-sanitizers:

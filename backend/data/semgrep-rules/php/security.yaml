@@ -26,10 +26,10 @@ rules:
 
   - id: php.xss.echo-unescaped
     patterns:
-      - pattern-either:
-          - pattern: echo $_GET[...]
-          - pattern: echo $_POST[...]
-          - pattern: echo $_REQUEST[...]
+      - pattern: echo $INPUT;
+      - metavariable-regex:
+          metavariable: $INPUT
+          regex: ^\$_(GET|POST|REQUEST)\[
     message: "XSS via direct echo of user input. Use htmlspecialchars()."
     severity: ERROR
     languages: [php]
@@ -45,10 +45,11 @@ rules:
   - id: php.file-inclusion.include
     patterns:
       - pattern-either:
-          - pattern: include($_GET[...])
-          - pattern: include($_POST[...])
-          - pattern: require($_GET[...])
-          - pattern: include($VAR)
+          - pattern: include($INPUT);
+          - pattern: require($INPUT);
+      - metavariable-regex:
+          metavariable: $INPUT
+          regex: ^\$_(GET|POST|REQUEST)\[
     message: "File inclusion with user input enables LFI/RFI."
     severity: ERROR
     languages: [php]
@@ -64,9 +65,11 @@ rules:
   - id: php.path-traversal
     patterns:
       - pattern-either:
-          - pattern: file_get_contents($_GET[...])
-          - pattern: file_get_contents($_POST[...])
-          - pattern: fopen($_GET[...], ...)
+          - pattern: file_get_contents($PATH);
+          - pattern: fopen($PATH, ...);
+      - metavariable-regex:
+          metavariable: $PATH
+          regex: ^\$_(GET|POST|REQUEST)\[
     message: "File operation with user-controlled path."
     severity: ERROR
     languages: [php]
@@ -75,8 +78,11 @@ rules:
   - id: php.ssrf
     patterns:
       - pattern-either:
-          - pattern: file_get_contents($_GET[...])
-          - pattern: curl_setopt($CH, CURLOPT_URL, $_GET[...])
+          - pattern: file_get_contents($URL);
+          - pattern: curl_setopt($CH, CURLOPT_URL, $URL);
+      - metavariable-regex:
+          metavariable: $URL
+          regex: ^\$_(GET|POST|REQUEST)\[
     message: "SSRF via user-controlled URL."
     severity: ERROR
     languages: [php]

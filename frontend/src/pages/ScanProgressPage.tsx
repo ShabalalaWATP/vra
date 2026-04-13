@@ -26,7 +26,7 @@ import {
 } from "lucide-react";
 import { api } from "@/api/client";
 import { useWebSocket } from "@/hooks/useWebSocket";
-import type { Project, Scan, ScannerRunSummary } from "@/types";
+import type { Project, Scan, ScanEvent, ScannerRunSummary } from "@/types";
 
 /* ── Phase definitions matching the backend stages ─────────── */
 const APK_PHASE = {
@@ -254,6 +254,12 @@ export default function ScanProgressPage() {
     enabled: !!scan?.project_id,
   });
 
+  const { data: persistedEvents } = useQuery<ScanEvent[]>({
+    queryKey: ["scan-events", scanId],
+    queryFn: () => api.get(`/scans/${scanId}/events?limit=500`),
+    enabled: !!scanId,
+  });
+
   const isApk = project?.source_type !== undefined && project.source_type !== "codebase";
   const PHASES = getPhases(isApk);
 
@@ -268,7 +274,7 @@ export default function ScanProgressPage() {
     if (isNearBottom) {
       logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
-  }, [events.length]);
+  }, [events.length, persistedEvents?.length]);
 
   useEffect(() => {
     const isComplete =
@@ -289,21 +295,30 @@ export default function ScanProgressPage() {
   }, [scan?.status, lastProgress?.status, scanId, navigate, showCompletion]);
 
   const currentPhase = lastProgress?.phase ?? scan?.current_phase ?? "triage";
-  const filesProcessed = lastProgress?.files_processed ?? 0;
-  const filesTotal = lastProgress?.files_total ?? 0;
-  const findingsCount = lastProgress?.findings_count ?? 0;
+  const currentTask = lastProgress?.task ?? scan?.current_task ?? "";
+  const filesProcessed = lastProgress?.files_processed ?? scan?.files_processed ?? 0;
+  const filesTotal = lastProgress?.files_total ?? scan?.files_total ?? 0;
+  const findingsCount = lastProgress?.findings_count ?? scan?.findings_count ?? 0;
   const phaseIdx = PHASES.findIndex((p) => p.id === currentPhase);
 
   // Use files_processed for better progress estimation during investigation
-  const aiCalls = scan?.ai_calls_made ?? lastProgress?.ai_calls_made ?? 0;
+  const aiCalls = lastProgress?.ai_calls_made ?? scan?.ai_calls_made ?? 0;
   const maxAiCalls = scan?.mode === "heavy" ? 300 : scan?.mode === "light" ? 30 : 100;
   const progressInPhase = phaseIdx === 3 && maxAiCalls > 0 ? aiCalls / maxAiCalls : 0.5;
   const overallProgress = PHASES.length > 0
     ? Math.round(((phaseIdx + progressInPhase) / PHASES.length) * 100)
     : 0;
 
-  const logEvents = events.filter((e) => e.type === "event");
-  const scannerRuns = events.reduce((acc, event) => {
+  const persistedLogEvents = (persistedEvents ?? []).map((event) => ({
+    type: "event" as const,
+    phase: event.phase ?? undefined,
+    level: event.level,
+    message: event.message,
+    detail: event.detail ?? undefined,
+  }));
+  const liveLogEvents = events.filter((e) => e.type === "event");
+  const logEvents = [...persistedLogEvents, ...liveLogEvents];
+  const scannerRuns = [...persistedLogEvents, ...events].reduce((acc, event) => {
     const detail = (event.detail ?? {}) as Record<string, unknown>;
     const scannerRun = detail as Partial<ScannerRunSummary>;
     if (typeof scannerRun.scanner === "string" && typeof scannerRun.status === "string") {
@@ -694,12 +709,12 @@ export default function ScanProgressPage() {
                       )}
 
                       {/* Current task detail */}
-                      {isActive && scan?.current_task && (
+                      {isActive && currentTask && (
                         <div className="mt-3 px-3 py-2 rounded-lg bg-[#0c0c14] border border-[#1a1a2e]">
                           <div className="flex items-center gap-2 text-xs font-mono">
                             <Zap className="w-3 h-3 text-accent-warning shrink-0" />
                             <TypingText
-                              text={scan.current_task}
+                              text={currentTask}
                               speed={15}
                               className="text-accent-success"
                             />

@@ -62,6 +62,11 @@ $ProgressPreference = "SilentlyContinue"
 $ROOT = $PSScriptRoot
 $BACKEND = Join-Path $ROOT "backend"
 $FRONTEND = Join-Path $ROOT "frontend"
+$OFFLINE_ROOT = Join-Path $ROOT "offline-packages"
+$OFFLINE_PYTHON = Join-Path $OFFLINE_ROOT "python"
+$OFFLINE_NODE = Join-Path $OFFLINE_ROOT "node_modules.tar.gz"
+$OFFLINE_TOOLS = Join-Path $OFFLINE_ROOT "tools"
+$LOCAL_SCANNERS = Join-Path $BACKEND "tools" "python_vendor"
 
 function Write-Header {
     param([string]$Text)
@@ -149,12 +154,11 @@ Write-Header "Installing Backend Dependencies"
 Push-Location $BACKEND
 try {
     if ($Offline) {
-        $offlinePkgs = Join-Path $ROOT "offline-packages" "python"
-        if (Test-Path $offlinePkgs) {
-            Write-Step "Installing from offline packages: $offlinePkgs"
-            pip install --no-index --find-links=$offlinePkgs -e ".[dev]" 2>&1 | Out-Null
+        if (Test-Path $OFFLINE_PYTHON) {
+            Write-Step "Installing from offline packages: $OFFLINE_PYTHON"
+            pip install --no-index --find-links=$OFFLINE_PYTHON -e ".[dev]" 2>&1 | Out-Null
         } else {
-            Write-Err "Offline packages not found at: $offlinePkgs"
+            Write-Err "Offline packages not found at: $OFFLINE_PYTHON"
             Write-Err "Prepare offline packages first (see README.md)"
             exit 1
         }
@@ -164,32 +168,41 @@ try {
     }
     Write-Step "Backend dependencies installed"
 
-    # Install Semgrep
-    if (Test-Command "semgrep") {
-        $sgVer = semgrep --version 2>&1
-        Write-Step "Semgrep already installed: $sgVer"
-    } else {
-        Write-Step "Installing Semgrep..."
-        pip install semgrep 2>&1 | Out-Null
-        if (Test-Command "semgrep") {
-            Write-Step "Semgrep installed: $(semgrep --version 2>&1)"
-        } else {
-            Write-Warn "Semgrep installation may have failed. Check: pip install semgrep"
+    # Bundle Semgrep + Bandit locally under backend/tools/
+    $offlineScannerVendor = Join-Path $OFFLINE_TOOLS "python_vendor"
+    if ($Offline -and (Test-Path $offlineScannerVendor)) {
+        Write-Step "Restoring bundled Python scanners from offline bundle..."
+        if (Test-Path $LOCAL_SCANNERS) {
+            Remove-Item -Recurse -Force $LOCAL_SCANNERS
         }
+        New-Item -ItemType Directory -Path (Split-Path $LOCAL_SCANNERS -Parent) -Force | Out-Null
+        Copy-Item -Path $offlineScannerVendor -Destination $LOCAL_SCANNERS -Recurse -Force
+    } else {
+        Write-Step "Bundling project-local Python scanners..."
+        $bundleArgs = @("-m", "scripts.bundle_python_scanners")
+        if ($Offline) {
+            if (-not (Test-Path $OFFLINE_PYTHON)) {
+                Write-Err "Offline Python packages not found at: $OFFLINE_PYTHON"
+                exit 1
+            }
+            $bundleArgs += @("--no-index", "--wheelhouse", $OFFLINE_PYTHON)
+        }
+        & python @bundleArgs 2>&1 | Out-Null
     }
 
-    # Install Bandit
-    if (Test-Command "bandit") {
-        $bVer = bandit --version 2>&1
-        Write-Step "Bandit already installed: $bVer"
+    $localSemgrep = Join-Path $BACKEND "tools" "bin" "run_semgrep.py"
+    $localBandit = Join-Path $BACKEND "tools" "bin" "run_bandit.py"
+    if ((Test-Path $localSemgrep) -and (Test-Path $LOCAL_SCANNERS)) {
+        $semgrepVer = & python $localSemgrep --version 2>&1
+        Write-Step "Bundled Semgrep ready: $semgrepVer"
     } else {
-        Write-Step "Installing Bandit..."
-        pip install bandit 2>&1 | Out-Null
-        if (Test-Command "bandit") {
-            Write-Step "Bandit installed"
-        } else {
-            Write-Warn "Bandit installation may have failed. Check: pip install bandit"
-        }
+        Write-Warn "Bundled Semgrep was not created successfully."
+    }
+    if ((Test-Path $localBandit) -and (Test-Path $LOCAL_SCANNERS)) {
+        $banditVer = & python $localBandit --version 2>&1 | Select-Object -First 1
+        Write-Step "Bundled Bandit ready: $banditVer"
+    } else {
+        Write-Warn "Bundled Bandit was not created successfully."
     }
 } finally {
     Pop-Location
@@ -201,12 +214,11 @@ Write-Header "Installing Frontend Dependencies"
 Push-Location $FRONTEND
 try {
     if ($Offline) {
-        $offlineModules = Join-Path $ROOT "offline-packages" "node_modules.tar.gz"
-        if (Test-Path $offlineModules) {
+        if (Test-Path $OFFLINE_NODE) {
             Write-Step "Extracting offline node_modules..."
-            tar xzf $offlineModules
+            tar xzf $OFFLINE_NODE
         } else {
-            Write-Err "Offline node_modules not found at: $offlineModules"
+            Write-Err "Offline node_modules not found at: $OFFLINE_NODE"
             exit 1
         }
     } else {
@@ -264,7 +276,14 @@ if (-not $SkipCodeQL -and -not $Offline) {
     Write-Warn "CodeQL is optional but recommended for deep taint tracking."
 } elseif ($Offline) {
     Write-Header "CodeQL (Offline Mode)"
+    $offlineCodeql = Join-Path $OFFLINE_TOOLS "codeql"
+    $codeqlDir = Join-Path $BACKEND "tools" "codeql"
     $codeqlBin = Join-Path $BACKEND "tools" "codeql" "codeql.exe"
+    if (-not (Test-Path $codeqlBin) -and (Test-Path $offlineCodeql)) {
+        Write-Step "Restoring CodeQL from offline bundle..."
+        New-Item -ItemType Directory -Path $codeqlDir -Force | Out-Null
+        Copy-Item -Path (Join-Path $offlineCodeql "*") -Destination $codeqlDir -Recurse -Force
+    }
     if (Test-Path $codeqlBin) {
         Write-Step "CodeQL found at: $codeqlBin"
     } else {
@@ -300,7 +319,14 @@ if (-not $Offline) {
     }
 } elseif ($Offline) {
     Write-Header "jadx (Offline Mode)"
+    $offlineJadx = Join-Path $OFFLINE_TOOLS "jadx"
+    $jadxDir = Join-Path $BACKEND "tools" "jadx"
     $jadxBin = Join-Path $BACKEND "tools" "jadx" "bin" "jadx.bat"
+    if (-not (Test-Path $jadxBin) -and (Test-Path $offlineJadx)) {
+        Write-Step "Restoring jadx from offline bundle..."
+        New-Item -ItemType Directory -Path $jadxDir -Force | Out-Null
+        Copy-Item -Path (Join-Path $offlineJadx "*") -Destination $jadxDir -Recurse -Force
+    }
     if (Test-Path $jadxBin) {
         Write-Step "jadx found at: $jadxBin"
     } else {
@@ -403,8 +429,8 @@ Write-Header "Installation Complete"
 $checks = @(
     @{ Name = "Python backend"; Check = { Test-Path (Join-Path $BACKEND "app" "main.py") } },
     @{ Name = "Frontend node_modules"; Check = { Test-Path (Join-Path $FRONTEND "node_modules") } },
-    @{ Name = "Semgrep"; Check = { Test-Command "semgrep" } },
-    @{ Name = "Bandit"; Check = { Test-Command "bandit" } },
+    @{ Name = "Bundled Semgrep"; Check = { (Test-Path (Join-Path $BACKEND "tools" "bin" "run_semgrep.py")) -and (Test-Path (Join-Path $BACKEND "tools" "python_vendor")) } },
+    @{ Name = "Bundled Bandit"; Check = { (Test-Path (Join-Path $BACKEND "tools" "bin" "run_bandit.py")) -and (Test-Path (Join-Path $BACKEND "tools" "python_vendor")) } },
     @{ Name = "ESLint"; Check = { Test-Path (Join-Path $FRONTEND "node_modules" ".bin" "eslint.cmd") } },
     @{ Name = "CodeQL"; Check = { Test-Path (Join-Path $BACKEND "tools" "codeql" "codeql.exe") } },
     @{ Name = "jadx"; Check = { Test-Path (Join-Path $BACKEND "tools" "jadx" "bin" "jadx.bat") } },
@@ -424,13 +450,12 @@ foreach ($c in $checks) {
 Write-Host ""
 Write-Host "  To start VRAgent:" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "    Terminal 1 (Backend):" -ForegroundColor White
-Write-Host "      cd backend" -ForegroundColor DarkGray
-Write-Host "      uvicorn app.main:app --host 0.0.0.0 --port 8000" -ForegroundColor DarkGray
+Write-Host "    Preferred runtime (single process, serves frontend/dist):" -ForegroundColor White
+Write-Host "      .\\start.ps1" -ForegroundColor DarkGray
+Write-Host "      Then open: http://localhost:8000" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "    Terminal 2 (Frontend):" -ForegroundColor White
-Write-Host "      cd frontend" -ForegroundColor DarkGray
-Write-Host "      npm run dev" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "    Then open: http://localhost:3000" -ForegroundColor White
+Write-Host "    Development mode (two processes):" -ForegroundColor White
+Write-Host "      Terminal 1: cd backend ; uvicorn app.main:app --host 0.0.0.0 --port 8000" -ForegroundColor DarkGray
+Write-Host "      Terminal 2: cd frontend ; npm run dev" -ForegroundColor DarkGray
+Write-Host "      Then open: http://localhost:3000" -ForegroundColor DarkGray
 Write-Host ""

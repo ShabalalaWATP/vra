@@ -8,6 +8,7 @@ from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.events.bus import event_bus
 from app.models.llm_profile import LLMProfile
 from app.models.project import Project
 from app.models.scan import Scan, ScanConfig
@@ -20,6 +21,7 @@ router = APIRouter(prefix="/scans", tags=["scans"])
 
 # Reference to the orchestrator runner — set during app startup
 _run_scan_fn = None
+_scan_tasks: dict[uuid.UUID, asyncio.Task] = {}
 
 SCANNER_ALIASES = {
     "semgrep": "semgrep",
@@ -55,8 +57,22 @@ def set_scan_runner(fn):
     _run_scan_fn = fn
 
 
+def _register_scan_task(scan_id: uuid.UUID, task: asyncio.Task) -> None:
+    _scan_tasks[scan_id] = task
+
+
+def _pop_scan_task(scan_id: uuid.UUID, task: asyncio.Task | None = None) -> asyncio.Task | None:
+    existing = _scan_tasks.get(scan_id)
+    if existing is None:
+        return None
+    if task is not None and existing is not task:
+        return None
+    return _scan_tasks.pop(scan_id, None)
+
+
 def _scan_task_done(task: asyncio.Task, *, scan_id: uuid.UUID) -> None:
     """Callback for scan background task — logs unhandled exceptions."""
+    _pop_scan_task(scan_id, task)
     if task.cancelled():
         logger.warning("Scan task %s was cancelled", scan_id)
         return
@@ -168,6 +184,7 @@ async def start_scan(scan_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     # Launch the scan in background
     if _run_scan_fn:
         task = asyncio.create_task(_run_scan_fn(scan_id))
+        _register_scan_task(scan_id, task)
         task.add_done_callback(lambda t: _scan_task_done(t, scan_id=scan_id))
 
     return ScanOut.model_validate(scan)
@@ -186,8 +203,28 @@ async def cancel_scan(scan_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
         raise HTTPException(400, f"Scan is {scan.status}, cannot cancel")
 
     scan.status = "cancelled"
+    scan.current_task = None
     scan.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.flush()
+
+    task = _pop_scan_task(scan_id)
+    if task and not task.done():
+        task.cancel()
+
+    await event_bus.publish(
+        scan_id,
+        {
+            "type": "progress",
+            "status": "cancelled",
+            "phase": scan.current_phase,
+            "task": None,
+            "findings_count": scan.findings_count,
+            "files_processed": scan.files_processed,
+            "files_total": scan.files_total,
+            "ai_calls_made": scan.ai_calls_made,
+        },
+    )
+    await event_bus.complete(scan_id)
     return ScanOut.model_validate(scan)
 
 

@@ -6,7 +6,6 @@ Targeted scan: uses specific rule paths selected by the rule_selector agent.
 
 import asyncio
 import json
-import shutil
 import time
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -16,6 +15,7 @@ import yaml
 from app.analysis.paths import normalise_path, relative_to_repo
 from app.config import settings
 from app.scanners.base import ScannerAdapter, ScannerHit, ScannerOutput
+from app.tooling import get_semgrep_command
 
 SEVERITY_MAP = {
     "ERROR": "high",
@@ -148,21 +148,32 @@ class SemgrepAdapter(ScannerAdapter):
         if not isinstance(rules, list):
             return str(config_path)
 
+        relative = str(config_path).replace("\\", "/").lower()
         legacy_broken_nest_rule = (
             config_path.name == "security.yaml"
             and "typescript.nest.no-auth-guard" in raw_content
             and "@UseGuards(...)\n          ..." in raw_content
         )
 
-        if not legacy_broken_nest_rule:
+        removable_rule_ids: set[str] = set()
+        if "yaml/github-actions/security/curl-eval.yaml" in relative:
+            removable_rule_ids.add("curl-eval")
+        if "dockerfile/best-practice/use-workdir.yaml" in relative:
+            removable_rule_ids.add("use-workdir")
+
+        if not legacy_broken_nest_rule and not removable_rule_ids:
             return str(config_path)
 
         filtered_rules = [
             rule for rule in rules
-            if isinstance(rule, dict) and rule.get("id") != "typescript.nest.no-auth-guard"
+            if isinstance(rule, dict)
+            and rule.get("id") != "typescript.nest.no-auth-guard"
+            and rule.get("id") not in removable_rule_ids
         ]
         if len(filtered_rules) == len(rules):
             return str(config_path)
+        if not filtered_rules:
+            return None
 
         temp_dir = TemporaryDirectory(prefix="vragent-semgrep-")
         temp_path = Path(temp_dir.name) / config_path.name
@@ -283,12 +294,16 @@ class SemgrepAdapter(ScannerAdapter):
         return configs
 
     async def is_available(self) -> bool:
-        return shutil.which(settings.semgrep_binary) is not None
+        return bool(get_semgrep_command())
 
     async def get_version(self) -> str | None:
+        command = get_semgrep_command()
+        if not command:
+            return None
         try:
             proc = await asyncio.create_subprocess_exec(
-                settings.semgrep_binary, "--version",
+                *command,
+                "--version",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -334,8 +349,17 @@ class SemgrepAdapter(ScannerAdapter):
         if not config_paths:
             config_paths = [str(rules_path)]
 
+        command = get_semgrep_command()
+        if not command:
+            return ScannerOutput(
+                scanner_name=self.name,
+                success=False,
+                errors=["Semgrep binary is not available"],
+                duration_ms=0,
+            )
+
         cmd = [
-            settings.semgrep_binary,
+            *command,
             "scan",
             "--json",
             "--no-git-ignore",
@@ -369,8 +393,17 @@ class SemgrepAdapter(ScannerAdapter):
         rules: list[str],
     ) -> ScannerOutput:
         """Run targeted Semgrep with specific rules on specific files."""
+        command = get_semgrep_command()
+        if not command:
+            return ScannerOutput(
+                scanner_name=self.name,
+                success=False,
+                errors=["Semgrep binary is not available"],
+                duration_ms=0,
+            )
+
         cmd = [
-            settings.semgrep_binary,
+            *command,
             "scan",
             "--json",
             "--no-git-ignore",
@@ -424,6 +457,7 @@ class SemgrepAdapter(ScannerAdapter):
         java/spring) as targeted follow-ups on files the investigator flagged.
         """
         configs = []
+        language_set = {lang.lower() for lang in (languages or [])}
 
         if not rules_path.exists():
             return configs
@@ -516,31 +550,31 @@ class SemgrepAdapter(ScannerAdapter):
             has_kubernetes = True
             has_openapi = True
 
-        if has_dockerfile:
+        if has_dockerfile and "dockerfile" in language_set:
             df_dir = rules_path / "dockerfile" / "security"
             if df_dir.exists():
                 configs.append(str(df_dir))
             configs.extend(self._collect_valid_top_level_configs(rules_path / "dockerfile"))
 
-        if has_terraform:
+        if has_terraform and "terraform" in language_set:
             tf_dir = rules_path / "terraform" / "lang"
             if tf_dir.exists():
                 configs.append(str(tf_dir))
             configs.extend(self._collect_valid_top_level_configs(rules_path / "terraform"))
 
-        if has_compose:
+        if has_compose and "yaml" in language_set:
             yaml_dir = rules_path / "yaml" / "docker-compose"
             if yaml_dir.exists():
                 configs.append(str(yaml_dir))
-        if has_github_actions:
+        if has_github_actions and "yaml" in language_set:
             yaml_dir = rules_path / "yaml" / "github-actions"
             if yaml_dir.exists():
                 configs.append(str(yaml_dir))
-        if has_kubernetes:
+        if has_kubernetes and "yaml" in language_set:
             yaml_dir = rules_path / "yaml" / "kubernetes"
             if yaml_dir.exists():
                 configs.append(str(yaml_dir))
-        if has_openapi:
+        if has_openapi and "yaml" in language_set:
             yaml_dir = rules_path / "yaml" / "openapi"
             if yaml_dir.exists():
                 configs.append(str(yaml_dir))

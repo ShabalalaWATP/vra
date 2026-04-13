@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Download, FileText, Loader2 } from "lucide-react";
 import { api } from "@/api/client";
+import { triggerBrowserDownload } from "@/utils/download";
 
 interface ExportButtonsProps {
   scanId: string;
@@ -18,11 +19,7 @@ export default function ExportButtons({ scanId }: ExportButtonsProps) {
         `/scans/${scanId}/report/export`,
         { format }
       );
-      // Open download link
-      window.open(
-        `/api/scans/${scanId}/report/export/${result.id}/download`,
-        "_blank"
-      );
+      triggerBrowserDownload(`/api/scans/${scanId}/report/export/${result.id}/download`);
     } catch (e) {
       setError(`Export failed: ${(e as Error).message}`);
     } finally {

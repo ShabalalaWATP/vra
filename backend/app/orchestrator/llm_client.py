@@ -9,6 +9,7 @@ Key design decisions:
 - Provides helpers to check available budget before building prompts
 """
 
+import asyncio
 import logging
 import ssl
 import time
@@ -56,6 +57,7 @@ class LLMClient:
         context_window: int = 131072,
         max_output_tokens: int = 4096,
         use_max_completion_tokens: bool = False,
+        concurrency: int = 2,
     ):
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
@@ -64,6 +66,7 @@ class LLMClient:
         self.context_window = context_window
         self.max_output_tokens = max_output_tokens
         self.use_max_completion_tokens = use_max_completion_tokens
+        self.concurrency = max(1, int(concurrency))
 
         verify: bool | ssl.SSLContext = True
         if cert_path:
@@ -87,6 +90,7 @@ class LLMClient:
         # Rate limit management: track last request time for proactive pacing
         self._last_request_time: float = 0
         self._min_request_interval: float = 0.5  # seconds between requests (adjustable)
+        self._request_semaphore = asyncio.Semaphore(self.concurrency)
 
     @property
     def max_input_tokens(self) -> int:
@@ -233,31 +237,50 @@ class LLMClient:
             await _aio.sleep(self._min_request_interval - elapsed_since_last)
 
         # ── Send request with exponential backoff on 429 ─────────────
-        chat_path = await self._resolve_chat_path(headers)
-        start = time.monotonic()
-        max_retries = 5
-        resp = None
+        async with self._request_semaphore:
+            chat_path = await self._resolve_chat_path(headers)
+            start = time.monotonic()
+            max_retries = 5
+            resp = None
 
-        for attempt in range(max_retries + 1):
-            resp = await self._client.post(
-                chat_path,
-                headers=headers,
-                json=body,
-            )
-            if resp.status_code == 429 and attempt < max_retries:
-                # Exponential backoff with jitter (OpenAI recommended)
-                base_delay = min(2 ** attempt, 60)  # 1, 2, 4, 8, 16... capped at 60
-                jitter = _random.uniform(0, base_delay)
-                wait = base_delay + jitter
-                logger.warning(
-                    "Rate limited (429). Retrying in %.1fs (attempt %d/%d)...",
-                    wait, attempt + 1, max_retries,
-                )
-                await _aio.sleep(wait)
-                continue
-            break
+            for attempt in range(max_retries + 1):
+                try:
+                    resp = await self._client.post(
+                        chat_path,
+                        headers=headers,
+                        json=body,
+                    )
+                except httpx.RequestError as exc:
+                    if attempt >= max_retries:
+                        logger.error(
+                            "LLM transport error after %d attempts: %s (path=%s, model=%s)",
+                            attempt + 1, exc, chat_path, self.model_name,
+                        )
+                        raise
+                    base_delay = min(2 ** attempt, 30)
+                    jitter = _random.uniform(0, base_delay)
+                    wait = base_delay + jitter
+                    logger.warning(
+                        "LLM transport error (%s). Retrying in %.1fs (attempt %d/%d)...",
+                        exc, wait, attempt + 1, max_retries,
+                    )
+                    await _aio.sleep(wait)
+                    continue
 
-        duration_ms = int((time.monotonic() - start) * 1000)
+                if resp.status_code in {429, 502, 503, 504} and attempt < max_retries:
+                    # Exponential backoff with jitter for transient provider overload/outage.
+                    base_delay = min(2 ** attempt, 60)
+                    jitter = _random.uniform(0, base_delay)
+                    wait = base_delay + jitter
+                    logger.warning(
+                        "LLM request got HTTP %d. Retrying in %.1fs (attempt %d/%d)...",
+                        resp.status_code, wait, attempt + 1, max_retries,
+                    )
+                    await _aio.sleep(wait)
+                    continue
+                break
+
+            duration_ms = int((time.monotonic() - start) * 1000)
 
         if resp.status_code != 200:
             body_text = resp.text[:500]

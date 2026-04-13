@@ -14,24 +14,38 @@ from app.orchestrator.scan_context import ScanContext
 
 logger = logging.getLogger(__name__)
 
+CANONICAL_REPORT_DIAGRAM_KINDS = {
+    "overview": 0,
+    "security": 1,
+    "data_flow": 2,
+    "attack_surface": 3,
+    "result_overview": 10,
+    "trust_boundaries": 11,
+    "dependency_risk": 12,
+}
+
 SYSTEM_PROMPT = """You are a security report writer. Generate a professional vulnerability assessment report section.
 
-Given the application understanding and findings, produce:
-1. A clear, professional executive summary of the application
-2. A methodology section explaining the analysis approach
-3. A limitations section noting blind spots and caveats
-4. For each finding, a narrative explanation suitable for a technical audience
+Given the application understanding, analysis coverage, architecture context, and verified findings, produce:
+1. `application_summary`: what the application does, who or what interacts with it, and its main technical shape
+2. `executive_summary`: a security-focused narrative that reflects the actual risk posture and notable strengths or weaknesses
+3. `methodology`: the analysis approach, explicitly noting degraded scanner coverage, obfuscation, decompilation, or incomplete scope when present
+4. `limitations`: blind spots and caveats that materially affect analyst confidence
+5. `finding_narratives`: one technical explanation per finding
 
 Write in clear, professional English. Be specific and evidence-based.
 Do not use marketing language or hyperbole.
+Do not collapse the application summary into the security narrative. They serve different purposes.
 
 Respond with JSON:
 {
+  "application_summary": "...",
   "executive_summary": "...",
   "methodology": "...",
   "limitations": "...",
   "finding_narratives": [
     {
+      "finding_id": "exact finding UUID from the prompt",
       "title": "...",
       "explanation": "detailed explanation of the vulnerability",
       "impact": "what could happen if exploited",
@@ -51,10 +65,31 @@ class ReporterAgent(BaseAgent):
         ctx.current_task = "Generating report"
         await self.emit(ctx, "Generating final report...")
 
-        # Build report prompt (executive summary + methodology + limitations)
+        # Build enrichments first so the final report uses the full analysis context.
         dep_findings = await self._load_dependency_findings(ctx)
         dependency_summary = self._build_dependency_report_context(dep_findings)
-        user_content = self._build_report_prompt(ctx, dependency_summary)
+        architecture_payload = self._build_architecture_payload(ctx, dep_findings)
+        ctx.architecture_notes = json.dumps(architecture_payload)
+        diagrams = architecture_payload.get("diagrams") or []
+        if diagrams:
+            ctx.diagram_spec = diagrams[0].get("mermaid", "") or ctx.diagram_spec
+
+        risk_score, risk_grade = self._compute_risk_score(ctx)
+        owasp = self._build_owasp_mapping(ctx)
+        comp_scores = self._build_component_scores(ctx)
+        sbom = await self._build_sbom(ctx)
+        coverage = self._build_scan_coverage(ctx)
+        await self._ensure_candidate_finding_ids(ctx)
+        user_content = self._build_report_prompt(
+            ctx,
+            dependency_summary=dependency_summary,
+            architecture_payload=architecture_payload,
+            scan_coverage=coverage,
+            risk_score=risk_score,
+            risk_grade=risk_grade,
+            component_scores=comp_scores,
+            sbom=sbom,
+        )
 
         try:
             result = await self.llm.chat_json(SYSTEM_PROMPT, user_content, max_tokens=4096)
@@ -70,6 +105,7 @@ class ReporterAgent(BaseAgent):
                 else ""
             )
             result = {
+                "application_summary": ctx.app_summary or "Application summary unavailable due to report generation failure.",
                 "executive_summary": ctx.app_summary or "Report generation encountered an error.",
                 "methodology": (
                     f"This security assessment was conducted using VRAgent's multi-stage analysis pipeline. "
@@ -103,25 +139,15 @@ class ReporterAgent(BaseAgent):
                 "finding_narratives": [],
             }
 
-        architecture_payload = self._build_architecture_payload(ctx, dep_findings)
-        ctx.architecture_notes = json.dumps(architecture_payload)
-        diagrams = architecture_payload.get("diagrams") or []
-        if diagrams:
-            ctx.diagram_spec = diagrams[0].get("mermaid", "") or ctx.diagram_spec
-
-        # Compute enrichment data
-        risk_score, risk_grade = self._compute_risk_score(ctx)
-        owasp = self._build_owasp_mapping(ctx)
-        comp_scores = self._build_component_scores(ctx)
-        sbom = await self._build_sbom(ctx)
-        coverage = self._build_scan_coverage(ctx)
+        application_summary = self._resolve_application_summary(ctx, result)
+        security_narrative = self._resolve_security_narrative(ctx, result)
 
         # Persist the report
         async with async_session() as session:
             report = Report(
                 scan_id=ctx.scan_id,
-                app_summary=result.get("executive_summary", ctx.app_summary),
-                narrative=result.get("executive_summary", ctx.app_summary),
+                app_summary=application_summary,
+                narrative=security_narrative,
                 architecture=ctx.architecture_notes,
                 diagram_spec=ctx.diagram_spec,
                 methodology=result.get("methodology", ""),
@@ -150,8 +176,16 @@ class ReporterAgent(BaseAgent):
 
         # Batch remaining findings that weren't covered in the first call
         confirmed = [f for f in ctx.candidate_findings if f.status != "dismissed"]
-        narrated_titles = {n.get("title", "").lower() for n in narratives}
-        unnarrated = [f for f in confirmed if f.title.lower() not in narrated_titles]
+        narrated_ids = {
+            str(n.get("finding_id") or "").strip()
+            for n in narratives
+            if str(n.get("finding_id") or "").strip()
+        }
+        unnarrated = [
+            f for f in confirmed
+            if not str(getattr(f, "finding_id", "") or "").strip()
+            or str(getattr(f, "finding_id", "") or "").strip() not in narrated_ids
+        ]
 
         if unnarrated:
             batch_size = 6
@@ -170,18 +204,26 @@ class ReporterAgent(BaseAgent):
 
     async def _generate_batch_narratives(self, ctx: ScanContext, findings: list):
         """Generate narratives for a batch of findings in a separate LLM call."""
-        batch_prompt = "Generate detailed narratives for these security findings:\n\n"
+        batch_prompt = (
+            "Generate detailed narratives for these security findings.\n"
+            "Every response object MUST echo the exact Finding ID provided for that finding.\n\n"
+        )
         for i, f in enumerate(findings, 1):
             batch_prompt += (
                 f"### {i}. {f.title}\n"
+                f"Finding ID: {f.finding_id or 'missing'}\n"
                 f"Severity: {f.severity}, Confidence: {f.confidence}\n"
+                f"Category: {f.category}\n"
                 f"File: {f.file_path}\n"
                 f"Hypothesis: {f.hypothesis}\n"
-                f"Evidence: {'; '.join(f.supporting_evidence[:3])}\n\n"
+                f"Evidence: {'; '.join(f.supporting_evidence[:3])}\n"
             )
+            for line in self._finding_reporting_context(ctx, f):
+                batch_prompt += f"{line}\n"
+            batch_prompt += "\n"
         batch_prompt += (
-            "\nRespond with JSON: {\"finding_narratives\": [{\"title\": \"...\", "
-            "\"explanation\": \"...\", \"impact\": \"...\", \"remediation\": \"...\"}]}"
+            "\nRespond with JSON: {\"finding_narratives\": [{\"finding_id\": \"...\", "
+            "\"title\": \"...\", \"explanation\": \"...\", \"impact\": \"...\", \"remediation\": \"...\"}]}"
         )
 
         try:
@@ -194,9 +236,7 @@ class ReporterAgent(BaseAgent):
             await self.emit(ctx, f"Batch narrative generation failed: {e}", level="warn")
 
     async def _update_finding_narratives(self, ctx: ScanContext, narratives: list[dict]):
-        """Update findings with generated narratives using fuzzy title matching."""
-        from difflib import SequenceMatcher
-
+        """Update findings with generated narratives using exact finding identifiers."""
         from sqlalchemy import select
 
         from app.models.finding import Finding
@@ -208,37 +248,159 @@ class ReporterAgent(BaseAgent):
             findings = result.scalars().all()
 
             matched = 0
+            findings_by_id = {str(finding.id): finding for finding in findings}
             for narrative in narratives:
-                title = narrative.get("title", "")
-                if not title:
+                finding_id = str(narrative.get("finding_id") or "").strip()
+                if not finding_id:
                     continue
-
-                # Try exact match first
-                best_finding = None
-                best_ratio = 0.0
-                for finding in findings:
-                    if finding.title == title:
-                        best_finding = finding
-                        best_ratio = 1.0
-                        break
-                    # Fuzzy match
-                    ratio = SequenceMatcher(None, finding.title.lower(), title.lower()).ratio()
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_finding = finding
-
-                # Accept match if >75% similar
-                if best_finding and best_ratio >= 0.75:
-                    best_finding.explanation = narrative.get("explanation", "")
-                    best_finding.impact = narrative.get("impact", "")
-                    best_finding.remediation = narrative.get("remediation", "")
+                finding = findings_by_id.get(finding_id)
+                if finding:
+                    finding.explanation = narrative.get("explanation", "")
+                    finding.impact = narrative.get("impact", "")
+                    finding.remediation = narrative.get("remediation", "")
                     matched += 1
 
             await session.commit()
 
         if matched < len(narratives):
             unmatched = len(narratives) - matched
-            await self.emit(ctx, f"{unmatched} finding narratives could not be matched to findings", level="warn")
+            await self.emit(ctx, f"{unmatched} finding narratives could not be matched by finding ID", level="warn")
+
+    async def _ensure_candidate_finding_ids(self, ctx: ScanContext) -> None:
+        confirmed = [finding for finding in ctx.candidate_findings if finding.status != "dismissed"]
+        if not confirmed or all(str(getattr(finding, "finding_id", "") or "").strip() for finding in confirmed):
+            return
+
+        persisted_rows = await self._load_persisted_finding_rows(ctx.scan_id)
+        if not persisted_rows:
+            return
+
+        self._attach_finding_ids(ctx, persisted_rows)
+
+    async def _load_persisted_finding_rows(self, scan_id) -> list[dict]:
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+
+        from app.models.file import File
+        from app.models.finding import Finding
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(Finding)
+                .where(Finding.scan_id == scan_id)
+                .options(selectinload(Finding.files))
+                .order_by(Finding.created_at.asc(), Finding.id.asc())
+            )
+            findings = result.scalars().all()
+
+            file_ids = {ff.file_id for finding in findings for ff in finding.files if ff.file_id}
+            file_path_map: dict = {}
+            if file_ids:
+                file_rows = await session.execute(select(File.id, File.path).where(File.id.in_(file_ids)))
+                file_path_map = {row.id: row.path for row in file_rows.all()}
+
+        rows = []
+        for finding in findings:
+            file_paths = sorted(
+                file_path_map[ff.file_id]
+                for ff in finding.files
+                if ff.file_id in file_path_map
+            )
+            rows.append(
+                {
+                    "finding_id": str(finding.id),
+                    "title": finding.title,
+                    "severity": finding.severity,
+                    "category": finding.category,
+                    "description": finding.description,
+                    "file_paths": file_paths,
+                }
+            )
+        return rows
+
+    @classmethod
+    def _attach_finding_ids(cls, ctx: ScanContext, persisted_rows: list[dict]) -> None:
+        remaining_rows = [
+            {
+                "finding_id": str(row.get("finding_id") or ""),
+                "keys": cls._finding_lookup_keys(
+                    title=row.get("title"),
+                    severity=row.get("severity"),
+                    category=row.get("category"),
+                    file_path=(row.get("file_paths") or [""])[0],
+                    description=row.get("description"),
+                ),
+            }
+            for row in persisted_rows
+            if row.get("finding_id")
+        ]
+
+        for finding in ctx.candidate_findings:
+            if finding.status == "dismissed" or str(getattr(finding, "finding_id", "") or "").strip():
+                continue
+            candidate_keys = cls._finding_lookup_keys(
+                title=finding.title,
+                severity=finding.severity,
+                category=finding.category,
+                file_path=finding.file_path,
+                description=finding.hypothesis,
+            )
+            for index, row in enumerate(remaining_rows):
+                if any(key in row["keys"] for key in candidate_keys):
+                    finding.finding_id = row["finding_id"]
+                    remaining_rows.pop(index)
+                    break
+
+    @classmethod
+    def _finding_lookup_keys(
+        cls,
+        *,
+        title: str | None,
+        severity: str | None,
+        category: str | None,
+        file_path: str | None,
+        description: str | None,
+    ) -> list[tuple[str, str, str, str, str]]:
+        title_key = cls._normalise_finding_text(title)
+        severity_key = cls._normalise_finding_text(severity)
+        category_key = cls._normalise_finding_text(category)
+        path_key = cls._normalise_finding_path(file_path)
+        description_key = cls._normalise_finding_text(description)
+        return [
+            (title_key, severity_key, category_key, path_key, description_key),
+            (title_key, severity_key, category_key, path_key, ""),
+            (title_key, severity_key, "", path_key, description_key),
+            (title_key, severity_key, "", path_key, ""),
+        ]
+
+    @staticmethod
+    def _normalise_finding_text(value: str | None) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+        return text[:500]
+
+    @staticmethod
+    def _normalise_finding_path(value: str | None) -> str:
+        return str(value or "").replace("\\", "/").strip().lstrip("./").lower()
+
+    @staticmethod
+    def _resolve_application_summary(ctx: ScanContext, result: dict) -> str:
+        summary = (
+            result.get("application_summary")
+            or ctx.app_summary
+            or result.get("executive_summary")
+            or "Application summary unavailable."
+        )
+        return str(summary).strip()
+
+    @staticmethod
+    def _resolve_security_narrative(ctx: ScanContext, result: dict) -> str:
+        summary = (
+            result.get("executive_summary")
+            or result.get("security_narrative")
+            or ctx.app_summary
+            or "Security narrative unavailable."
+        )
+        return str(summary).strip()
 
     def _build_attack_surface(self, ctx: ScanContext) -> dict:
         """Build attack surface metrics from scan context for radar chart."""
@@ -804,6 +966,21 @@ class ReporterAgent(BaseAgent):
         payload = self._parse_architecture_payload(ctx.architecture_notes)
         confirmed = [f for f in ctx.candidate_findings if f.status != "dismissed"]
         severity_counts = Counter(str(f.severity).lower() for f in confirmed)
+        provenance_counts = Counter(str(getattr(f, "provenance", "") or "llm").lower() for f in confirmed)
+        verification_counts = Counter(
+            str(getattr(f, "verification_level", "") or "hypothesis").lower() for f in confirmed
+        )
+        merged_finding_count = sum(
+            1
+            for finding in confirmed
+            if isinstance(getattr(finding, "merge_metadata", None), dict)
+            and int(getattr(finding, "merge_metadata", {}).get("merged_count") or 1) > 1
+        )
+        merged_duplicate_count = sum(
+            max(int(getattr(finding, "merge_metadata", {}).get("merged_count") or 1) - 1, 0)
+            for finding in confirmed
+            if isinstance(getattr(finding, "merge_metadata", None), dict)
+        )
 
         components = payload.get("components")
         if not isinstance(components, list) or not components:
@@ -817,11 +994,21 @@ class ReporterAgent(BaseAgent):
             "critical_count": severity_counts.get("critical", 0),
             "high_count": severity_counts.get("high", 0),
             "medium_count": severity_counts.get("medium", 0),
+            "exploit_chain_count": sum(1 for f in confirmed if str(f.category).lower() == "exploit_chain"),
             "advisory_correlated_count": sum(1 for f in confirmed if f.related_cves),
+            "scanner_only_count": provenance_counts.get("scanner", 0),
+            "llm_only_count": provenance_counts.get("llm", 0),
+            "hybrid_count": provenance_counts.get("hybrid", 0),
+            "hypothesis_count": verification_counts.get("hypothesis", 0),
+            "statically_verified_count": verification_counts.get("statically_verified", 0),
+            "strongly_verified_count": verification_counts.get("strongly_verified", 0),
+            "runtime_validated_count": verification_counts.get("runtime_validated", 0),
             "reachable_dependency_count": dependency_summary["reachable"],
             "active_dependency_count": dependency_summary["active"],
             "function_matched_dependency_count": dependency_summary["function_matches"],
             "high_risk_dependency_count": dependency_summary["high_risk"],
+            "merged_finding_count": merged_finding_count,
+            "merged_duplicate_count": merged_duplicate_count,
         }
 
         security_observations = []
@@ -843,21 +1030,35 @@ class ReporterAgent(BaseAgent):
             text = str(note).strip()
             if text and text not in security_observations:
                 security_observations.append(text)
+        if result_summary["llm_only_count"] > 0:
+            security_observations.append(
+                f"{result_summary['llm_only_count']} confirmed findings came from AI-led investigation without direct scanner leads."
+            )
+        if result_summary["strongly_verified_count"] > 0:
+            security_observations.append(
+                f"{result_summary['strongly_verified_count']} findings achieved strong static verification through combined evidence."
+            )
+        if result_summary["merged_duplicate_count"] > 0:
+            security_observations.append(
+                f"{result_summary['merged_duplicate_count']} duplicate finding candidates were merged before reporting."
+            )
 
         payload["result_summary"] = result_summary
         payload["trust_boundaries"] = payload.get("trust_boundaries") or ctx.trust_boundaries or []
         payload["entry_points"] = payload.get("entry_points") or ctx.entry_points or []
+        payload["data_flows"] = payload.get("data_flows") or []
+        payload["attack_surface"] = payload.get("attack_surface") or ctx.attack_surface or []
         payload["security_observations"] = security_observations[:12]
         payload["component_hotspots"] = component_hotspots
         payload["dependency_summary"] = dependency_summary
         payload["diagrams"] = self._merge_diagrams(
+            payload.get("diagrams") or [],
             self._build_result_aware_diagrams(
                 payload,
                 confirmed,
                 component_hotspots,
                 dependency_summary,
             ),
-            payload.get("diagrams") or [],
         )
         return payload
 
@@ -871,29 +1072,93 @@ class ReporterAgent(BaseAgent):
         except Exception:
             return {"analysis_markdown": str(raw)}
 
+    @classmethod
+    def _merge_diagrams(cls, architecture_diagrams: list[dict], supplemental_diagrams: list[dict]) -> list[dict]:
+        merged: list[tuple[int, int, dict]] = []
+        seen_keys: set[str] = set()
+        for source_bias, diagrams in enumerate((architecture_diagrams or [], supplemental_diagrams or [])):
+            for position, candidate in enumerate(diagrams):
+                entry = cls._normalise_report_diagram_entry(candidate)
+                if not entry:
+                    continue
+                key = f"kind:{entry['kind']}" if entry.get("kind") else f"title:{entry['title'].lower()}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                merged.append((cls._diagram_sort_rank(entry.get("kind")), source_bias * 100 + position, entry))
+
+        merged.sort(key=lambda item: (item[0], item[1]))
+        return [entry for _rank, _position, entry in merged]
+
+    @classmethod
+    def _normalise_report_diagram_entry(cls, candidate: dict | None) -> dict | None:
+        if not isinstance(candidate, dict):
+            return None
+        mermaid = str(candidate.get("mermaid") or "").strip()
+        if not mermaid:
+            return None
+        kind = cls._diagram_kind(str(candidate.get("kind") or ""), str(candidate.get("title") or ""))
+        title = str(candidate.get("title") or "").strip()
+        description = str(candidate.get("description") or "").strip()
+
+        canonical_titles = {
+            "overview": ("System Overview", "High-level architecture showing main components and their connections"),
+            "security": ("Security Architecture", "Trust boundaries, auth flows, data entry points, sensitive data stores"),
+            "data_flow": ("Data Flow", "How data moves through the application from user input to storage and back"),
+            "attack_surface": ("Attack Surface", "All points where an attacker could interact with the application"),
+        }
+        if kind in canonical_titles:
+            title = canonical_titles[kind][0]
+            if not description:
+                description = canonical_titles[kind][1]
+        if not title:
+            title = "Architecture Overview"
+
+        entry = {
+            "title": title,
+            "description": description,
+            "kind": kind or str(candidate.get("kind") or "").strip() or None,
+            "mermaid": mermaid,
+        }
+        if isinstance(candidate.get("highlights"), list):
+            entry["highlights"] = [
+                str(item).strip()
+                for item in candidate.get("highlights", [])
+                if str(item).strip()
+            ]
+        return entry
+
     @staticmethod
-    def _merge_diagrams(primary: list[dict], existing: list[dict], max_diagrams: int = 5) -> list[dict]:
-        merged: list[dict] = []
-        seen_titles: set[str] = set()
-        for candidate in [*primary, *existing]:
-            if not isinstance(candidate, dict):
-                continue
-            title = str(candidate.get("title") or "").strip()
-            mermaid = str(candidate.get("mermaid") or "").strip()
-            if not title or not mermaid:
-                continue
-            key = title.lower()
-            if key in seen_titles:
-                continue
-            seen_titles.add(key)
-            merged.append(candidate)
-            if len(merged) >= max_diagrams:
-                break
-        return merged
+    def _diagram_kind(raw_kind: str, title: str) -> str | None:
+        kind = str(raw_kind or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if kind in CANONICAL_REPORT_DIAGRAM_KINDS:
+            return kind
+
+        title_key = " ".join(str(title or "").strip().lower().split())
+        title_map = {
+            "system overview": "overview",
+            "overview": "overview",
+            "architecture overview": "overview",
+            "system architecture": "overview",
+            "security architecture": "security",
+            "security overview": "security",
+            "data flow": "data_flow",
+            "dataflow": "data_flow",
+            "attack surface": "attack_surface",
+            "verified security overview": "result_overview",
+            "trust boundaries and hotspots": "trust_boundaries",
+            "dependency exposure and reachability": "dependency_risk",
+        }
+        return title_map.get(title_key)
+
+    @staticmethod
+    def _diagram_sort_rank(kind: str | None) -> int:
+        return CANONICAL_REPORT_DIAGRAM_KINDS.get(str(kind or ""), 100)
 
     @staticmethod
     def _build_component_hotspots(components: list[dict], findings: list) -> list[dict]:
         hotspots: list[dict] = []
+        severity_rank = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
         for component in components or []:
             if not isinstance(component, dict):
                 continue
@@ -903,6 +1168,10 @@ class ReporterAgent(BaseAgent):
                 if any(finding.file_path == path or finding.file_path.startswith(f"{path}/") for path in paths):
                     matched.append(finding)
             severity_counts = Counter(str(item.severity).lower() for item in matched)
+            max_severity = "info"
+            for severity, _count in severity_counts.items():
+                if severity_rank.get(severity, 0) > severity_rank.get(max_severity, 0):
+                    max_severity = severity
             hotspots.append(
                 {
                     "name": str(component.get("name") or "Component"),
@@ -911,6 +1180,7 @@ class ReporterAgent(BaseAgent):
                     "critical_count": severity_counts.get("critical", 0),
                     "high_count": severity_counts.get("high", 0),
                     "medium_count": severity_counts.get("medium", 0),
+                    "max_severity": max_severity,
                     "in_attack_surface": bool(component.get("in_attack_surface")),
                 }
             )
@@ -1205,8 +1475,29 @@ class ReporterAgent(BaseAgent):
         text = text or fallback
         return text[:limit].rstrip()
 
-    def _build_report_prompt(self, ctx: ScanContext, dependency_summary: str = "") -> str:
+    def _build_report_prompt(
+        self,
+        ctx: ScanContext,
+        dependency_summary: str = "",
+        *,
+        architecture_payload: dict | None = None,
+        scan_coverage: dict | None = None,
+        risk_score: float | None = None,
+        risk_grade: str | None = None,
+        component_scores: dict | None = None,
+        sbom: dict | None = None,
+    ) -> str:
+        architecture_payload = architecture_payload or {}
+        result_summary = architecture_payload.get("result_summary") or {}
+        component_hotspots = architecture_payload.get("component_hotspots") or []
+        diagrams = architecture_payload.get("diagrams") or []
         parts = [
+            "## Output Requirements",
+            "- `application_summary` must explain what the application does, the main user or system interactions, and the technical shape of the deployment.",
+            "- `executive_summary` must be a security review narrative that explicitly references the risk posture, important exploit paths, and analysis caveats from this prompt.",
+            "- If analysis coverage was degraded or incomplete, state that plainly in both methodology and limitations.",
+            "- Every `finding_narratives` entry must echo the exact Finding ID provided for that finding.",
+            "",
             "## Application",
             ctx.app_summary or "No application summary available.",
             "",
@@ -1217,6 +1508,131 @@ class ReporterAgent(BaseAgent):
             f"Scan mode: {ctx.mode}",
             f"Documentation files analysed: {len(ctx.doc_files_found)}",
         ]
+
+        if result_summary or component_hotspots or diagrams:
+            parts.append("\n## Final Reporting Enrichments")
+            if risk_score is not None:
+                grade = f" ({risk_grade})" if risk_grade else ""
+                parts.append(f"- Risk score ready for final report: {risk_score}{grade}")
+            if result_summary:
+                parts.append(
+                    "- Result summary: "
+                    f"{result_summary.get('finding_count', 0)} findings, "
+                    f"{result_summary.get('critical_count', 0)} critical, "
+                    f"{result_summary.get('high_count', 0)} high, "
+                    f"{result_summary.get('exploit_chain_count', 0)} exploit chains, "
+                    f"{result_summary.get('reachable_dependency_count', 0)} reachable dependency risks"
+                )
+                parts.append(
+                    "- Finding sources: "
+                    f"scanner-led={result_summary.get('scanner_only_count', 0)}, "
+                    f"llm-only={result_summary.get('llm_only_count', 0)}, "
+                    f"hybrid={result_summary.get('hybrid_count', 0)}"
+                )
+                parts.append(
+                    "- Verification levels: "
+                    f"hypothesis={result_summary.get('hypothesis_count', 0)}, "
+                    f"statically_verified={result_summary.get('statically_verified_count', 0)}, "
+                    f"strongly_verified={result_summary.get('strongly_verified_count', 0)}, "
+                    f"runtime_validated={result_summary.get('runtime_validated_count', 0)}"
+                )
+                if result_summary.get("merged_duplicate_count", 0):
+                    parts.append(
+                        "- Duplicate merge summary: "
+                        f"{result_summary.get('merged_finding_count', 0)} canonical findings absorbed "
+                        f"{result_summary.get('merged_duplicate_count', 0)} duplicate candidates"
+                    )
+            if component_hotspots:
+                hotspot_text = ", ".join(
+                    f"{item.get('name', 'component')} ({item.get('finding_count', 0)} findings, {item.get('max_severity', 'unknown')})"
+                    for item in component_hotspots[:5]
+                )
+                parts.append(f"- Component hotspots: {hotspot_text}")
+            if diagrams:
+                parts.append(
+                    "- Diagrams prepared for export/UI: "
+                    + ", ".join(str(diagram.get("title") or "diagram") for diagram in diagrams[:6])
+                )
+
+        trust_boundaries = architecture_payload.get("trust_boundaries") or ctx.trust_boundaries
+        entry_points = architecture_payload.get("entry_points") or ctx.entry_points
+        data_flows = architecture_payload.get("data_flows") or []
+        attack_surface_points = architecture_payload.get("attack_surface") or ctx.attack_surface
+        auth_mechanisms = architecture_payload.get("auth_mechanisms") or []
+        external_integrations = architecture_payload.get("external_integrations") or []
+        if trust_boundaries or entry_points or data_flows or attack_surface_points or auth_mechanisms or external_integrations:
+            parts.append("\n## Architecture Highlights")
+            for boundary in trust_boundaries[:6]:
+                parts.append(f"- Trust boundary: {boundary}")
+            for entry_point in entry_points[:8]:
+                if isinstance(entry_point, dict):
+                    parts.append(f"- Entry point: {self._format_entry_point(entry_point)}")
+                else:
+                    parts.append(f"- Entry point: {entry_point}")
+            for data_flow in data_flows[:6]:
+                if isinstance(data_flow, dict):
+                    parts.append(f"- Data flow: {self._format_data_flow(data_flow)}")
+                else:
+                    parts.append(f"- Data flow: {data_flow}")
+            for point in attack_surface_points[:8]:
+                parts.append(f"- Concrete attack surface point: {point}")
+            for mechanism in auth_mechanisms[:4]:
+                if isinstance(mechanism, dict):
+                    mech_type = mechanism.get("type") or mechanism.get("name") or "unknown"
+                    implementation = mechanism.get("implementation") or mechanism.get("file")
+                    if implementation:
+                        parts.append(f"- Auth mechanism: {mech_type} implemented in {implementation}")
+                    else:
+                        parts.append(f"- Auth mechanism: {mech_type}")
+            if external_integrations:
+                parts.append(
+                    "- External integrations: "
+                    + ", ".join(str(item) for item in external_integrations[:8])
+                )
+
+        if scan_coverage:
+            parts.append("\n## Scan Coverage Summary")
+            parts.append(
+                f"- Coverage: total_files={scan_coverage.get('total_files', 0)} "
+                f"indexed={scan_coverage.get('files_indexed', 0)} "
+                f"ai_inspected={scan_coverage.get('files_inspected_by_ai', 0)} "
+                f"ai_calls={scan_coverage.get('ai_calls_made', 0)}"
+            )
+            if scan_coverage.get("scanners_used"):
+                parts.append(
+                    "- Scanners used: " + ", ".join(scan_coverage.get("scanners_used", [])[:12])
+                )
+
+        if component_scores:
+            parts.append("\n## Component Scorecard Snapshot")
+            for name, summary in sorted(
+                component_scores.items(),
+                key=lambda item: item[1].get("score", 100),
+            )[:6]:
+                parts.append(
+                    f"- {name}: grade={summary.get('grade')} score={summary.get('score')} "
+                    f"criticality={summary.get('criticality')} findings={summary.get('finding_count')}"
+                )
+
+        if sbom:
+            parts.append("\n## SBOM Snapshot")
+            parts.append(
+                f"- Components: {sbom.get('total_components', 0)} total, "
+                f"{sbom.get('vulnerable_components', 0)} vulnerable"
+            )
+            ecosystems = sbom.get("ecosystems") or {}
+            if ecosystems:
+                parts.append(
+                    "- Ecosystems: "
+                    + ", ".join(f"{name}={count}" for name, count in ecosystems.items())
+                )
+
+        if ctx.compaction_summaries:
+            parts.append("\n## Compacted Investigation Summaries")
+            for summary in ctx.compaction_summaries[-3:]:
+                text = str(summary).strip()
+                if text:
+                    parts.append(f"- {text[:700]}")
 
         if ctx.scanner_runs:
             parts.append("\n## Scanner Run Health")
@@ -1315,10 +1731,20 @@ class ReporterAgent(BaseAgent):
         confirmed = [f for f in ctx.candidate_findings if f.status != "dismissed"]
         for i, finding in enumerate(confirmed, 1):
             parts.append(f"\n### {i}. {finding.title}")
+            if finding.finding_id:
+                parts.append(f"Finding ID: {finding.finding_id}")
             parts.append(f"Severity: {finding.severity}")
             parts.append(f"Confidence: {finding.confidence}")
             parts.append(f"Category: {finding.category}")
             parts.append(f"File: {finding.file_path}")
+            parts.append(
+                "Provenance: "
+                + str(getattr(finding, "provenance", "llm") or "llm").replace("_", " ")
+            )
+            parts.append(
+                "Verification level: "
+                + str(getattr(finding, "verification_level", "hypothesis") or "hypothesis").replace("_", " ")
+            )
 
             # Flag if finding is in an obfuscated file
             if finding.file_path in ctx.obfuscated_files:
@@ -1338,16 +1764,7 @@ class ReporterAgent(BaseAgent):
                 parts.append(f"Supporting: {'; '.join(finding.supporting_evidence[:3])}")
             if finding.opposing_evidence:
                 parts.append(f"Mitigations considered: {'; '.join(finding.opposing_evidence[:3])}")
-
-            # Exploit evidence
-            if finding.exploit_difficulty:
-                parts.append(f"Exploit difficulty: {finding.exploit_difficulty.upper()}")
-            if finding.exploit_prerequisites:
-                parts.append(f"Prerequisites: {', '.join(finding.exploit_prerequisites)}")
-            if finding.exploit_template:
-                parts.append(f"Proof of Concept:\n```\n{finding.exploit_template[:500]}\n```")
-            if finding.attack_scenario:
-                parts.append(f"Attack scenario: {finding.attack_scenario[:300]}")
+            parts.extend(self._finding_reporting_context(ctx, finding))
 
         if not confirmed:
             parts.append("No confirmed security findings.")
@@ -1422,3 +1839,206 @@ class ReporterAgent(BaseAgent):
             parts.append(dependency_summary)
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _normalise_exploit_evidence(finding) -> dict:
+        payload = getattr(finding, "exploit_evidence", None)
+        evidence = payload if isinstance(payload, dict) else {}
+
+        def _clean_list(values) -> list[str]:
+            if not isinstance(values, list):
+                return []
+            cleaned: list[str] = []
+            for value in values:
+                text = str(value).strip()
+                if text:
+                    cleaned.append(text)
+            return cleaned
+
+        normalised = {
+            "difficulty": str(
+                evidence.get("difficulty")
+                or getattr(finding, "exploit_difficulty", "")
+                or ""
+            ).strip()
+            or None,
+            "target_route": str(evidence.get("target_route") or "").strip() or None,
+            "prerequisites": _clean_list(
+                evidence.get("prerequisites") or getattr(finding, "exploit_prerequisites", None)
+            ),
+            "validation_steps": _clean_list(evidence.get("validation_steps")),
+            "cleanup_notes": _clean_list(evidence.get("cleanup_notes")),
+            "exploit_template": str(
+                evidence.get("exploit_template")
+                or getattr(finding, "exploit_template", "")
+                or ""
+            ).strip()
+            or None,
+            "attack_scenario": str(
+                evidence.get("attack_scenario")
+                or getattr(finding, "attack_scenario", "")
+                or ""
+            ).strip()
+            or None,
+            "components": _clean_list(evidence.get("components")),
+            "related_entry_points": _clean_list(evidence.get("related_entry_points")),
+            "related_taint_flows": _clean_list(evidence.get("related_taint_flows")),
+        }
+        return {
+            key: value
+            for key, value in normalised.items()
+            if value not in (None, [], "")
+        }
+
+    def _finding_reporting_context(self, ctx: ScanContext, finding) -> list[str]:
+        lines: list[str] = []
+        component_names = self._component_names_for_finding(ctx, finding)
+        if component_names:
+            lines.append(f"Component context: {', '.join(component_names[:4])}")
+        provenance = str(getattr(finding, "provenance", "") or "").strip()
+        if provenance:
+            lines.append(f"Finding source: {provenance.replace('_', ' ')}")
+        verification_level = str(getattr(finding, "verification_level", "") or "").strip()
+        if verification_level:
+            lines.append(f"Verification level: {verification_level.replace('_', ' ')}")
+        verification_notes = str(getattr(finding, "verification_notes", "") or "").strip()
+        if verification_notes:
+            lines.append(f"Verification notes: {verification_notes[:500]}")
+        source_scanners = [
+            str(item).strip()
+            for item in (getattr(finding, "source_scanners", None) or [])
+            if str(item).strip()
+        ]
+        if source_scanners:
+            lines.append(f"Source scanners: {', '.join(source_scanners[:6])}")
+        source_rules = [
+            str(item).strip()
+            for item in (getattr(finding, "source_rules", None) or [])
+            if str(item).strip()
+        ]
+        if source_rules:
+            lines.append(f"Source rules: {', '.join(source_rules[:6])}")
+        merge_metadata = getattr(finding, "merge_metadata", None)
+        if isinstance(merge_metadata, dict):
+            merged_count = int(merge_metadata.get("merged_count") or 1)
+            if merged_count > 1:
+                lines.append(f"Merged duplicate candidates: {merged_count}")
+
+        if getattr(finding, "related_cves", None):
+            advisory_lines = [
+                self._format_related_advisory(advisory)
+                for advisory in finding.related_cves[:3]
+                if isinstance(advisory, dict)
+            ]
+            advisory_lines = [line for line in advisory_lines if line]
+            if advisory_lines:
+                lines.append(f"Related advisories: {'; '.join(advisory_lines)}")
+
+        exploit_evidence = self._normalise_exploit_evidence(finding)
+        if exploit_evidence.get("difficulty"):
+            lines.append(f"Exploit difficulty: {str(exploit_evidence['difficulty']).upper()}")
+        if exploit_evidence.get("target_route"):
+            lines.append(f"Target route or invocation: {exploit_evidence['target_route']}")
+        if exploit_evidence.get("components"):
+            lines.append(f"Exploit-linked components: {', '.join(exploit_evidence['components'][:4])}")
+        if exploit_evidence.get("related_entry_points"):
+            lines.append(f"Related entry points: {'; '.join(exploit_evidence['related_entry_points'][:4])}")
+        if exploit_evidence.get("prerequisites"):
+            lines.append(f"Prerequisites: {', '.join(exploit_evidence['prerequisites'][:8])}")
+        if exploit_evidence.get("validation_steps"):
+            lines.append(f"Validation steps: {'; '.join(exploit_evidence['validation_steps'][:6])}")
+        if exploit_evidence.get("cleanup_notes"):
+            lines.append(f"Cleanup notes: {'; '.join(exploit_evidence['cleanup_notes'][:4])}")
+        if exploit_evidence.get("related_taint_flows"):
+            lines.append(f"Related taint flows: {'; '.join(exploit_evidence['related_taint_flows'][:4])}")
+        if exploit_evidence.get("attack_scenario"):
+            lines.append(f"Attack scenario: {str(exploit_evidence['attack_scenario'])[:400]}")
+        if exploit_evidence.get("exploit_template"):
+            lines.append(
+                "Proof of Concept:\n```\n"
+                f"{str(exploit_evidence['exploit_template'])[:700]}\n```"
+            )
+        return lines
+
+    @staticmethod
+    def _component_names_for_finding(ctx: ScanContext, finding) -> list[str]:
+        names: list[str] = []
+        file_path = str(getattr(finding, "file_path", "") or "")
+        for component in ctx.components:
+            for path in component.get("files", []):
+                if file_path.startswith(path) or file_path == path:
+                    name = str(component.get("name") or "component").strip()
+                    if name and name not in names:
+                        names.append(name)
+                    break
+        return names
+
+    @staticmethod
+    def _format_related_advisory(advisory: dict) -> str:
+        advisory_id = (
+            advisory.get("display_id")
+            or advisory.get("cve_id")
+            or advisory.get("advisory_id")
+            or "advisory"
+        )
+        parts = [str(advisory_id)]
+
+        severity = str(advisory.get("severity") or "").strip()
+        if severity:
+            parts.append(severity.upper())
+
+        package = str(advisory.get("package") or "").strip()
+        ecosystem = str(advisory.get("ecosystem") or "").strip()
+        if package:
+            package_label = package
+            if ecosystem:
+                package_label += f" ({ecosystem})"
+            parts.append(package_label)
+
+        evidence_type = str(advisory.get("evidence_type") or "").strip()
+        if evidence_type:
+            parts.append(evidence_type.replace("_", " "))
+
+        function = str(advisory.get("function") or "").strip()
+        if function:
+            function_label = f"call {function}"
+            if isinstance(advisory.get("line"), int):
+                function_label += f" line {advisory['line']}"
+            parts.append(function_label)
+
+        summary = str(advisory.get("summary") or "").strip()
+        if summary:
+            parts.append(summary[:140])
+
+        return " | ".join(part for part in parts if part)
+
+    @staticmethod
+    def _format_entry_point(entry_point: dict) -> str:
+        method = str(entry_point.get("method") or "").strip()
+        path = str(entry_point.get("path") or "").strip()
+        entry_type = str(entry_point.get("type") or "").strip()
+        file_path = str(entry_point.get("file") or "").strip()
+        function = str(entry_point.get("function") or "").strip()
+
+        headline = " ".join(part for part in [method, path] if part).strip()
+        if not headline:
+            headline = entry_type or "entry point"
+
+        location_bits = []
+        if file_path:
+            location_bits.append(file_path)
+        if function:
+            location_bits.append(function)
+        if location_bits:
+            headline += f" in {'::'.join(location_bits)}"
+        if entry_type and entry_type not in headline:
+            headline += f" [{entry_type}]"
+        return headline
+
+    @staticmethod
+    def _format_data_flow(data_flow: dict) -> str:
+        source = str(data_flow.get("from") or "unknown source").strip()
+        destination = str(data_flow.get("to") or "unknown destination").strip()
+        data = str(data_flow.get("data") or "data").strip()
+        sensitive = " [sensitive]" if data_flow.get("sensitive") else ""
+        return f"{source} -> {destination} carrying {data}{sensitive}"

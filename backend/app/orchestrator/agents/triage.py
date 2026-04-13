@@ -5,6 +5,8 @@ import logging
 import uuid
 from pathlib import Path
 
+from sqlalchemy import select
+
 from app.analysis.dependency_inventory import dependency_identity_key
 from app.analysis.file_scorer import score_file
 from app.analysis.fingerprint import SKIP_DIRS, fingerprint_repo

@@ -19,6 +19,14 @@ class CandidateFinding:
     opposing_evidence: list[str] = field(default_factory=list)
     confidence: float = 0.5
     status: str = "investigating"  # investigating, confirmed, dismissed
+    provenance: str = "llm"  # llm, scanner, hybrid
+    source_scanners: list[str] = field(default_factory=list)
+    source_rules: list[str] = field(default_factory=list)
+    source_scanner_hits: list[dict] = field(default_factory=list)
+    verification_level: str = "hypothesis"  # hypothesis, statically_verified, strongly_verified, runtime_validated, dismissed
+    verification_notes: str = ""
+    canonical_key: str | None = None
+    merge_metadata: dict | None = None
     related_findings: list[str] = field(default_factory=list)  # IDs of related findings
     input_sources: list[str] = field(default_factory=list)  # Traced input entry points
     sinks: list[str] = field(default_factory=list)  # Where tainted data is consumed
@@ -29,8 +37,10 @@ class CandidateFinding:
     exploit_prerequisites: list[str] = field(default_factory=list)
     exploit_template: str = ""  # PoC code (curl, Python, etc.)
     attack_scenario: str = ""  # Step-by-step exploitation narrative
+    exploit_evidence: dict | None = None  # Structured PoC metadata for reporting/export
     # CVE correlation (populated by verifier's CVE correlation step)
     related_cves: list[dict] = field(default_factory=list)  # [{cve_id, summary, severity, package}]
+    finding_id: str | None = None  # Persisted finding UUID once stored in the database
 
 
 @dataclass

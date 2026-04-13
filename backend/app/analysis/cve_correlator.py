@@ -57,6 +57,12 @@ def _advisory_summary_entry(adv: dict, ecosystem: str) -> dict | None:
     if not display_id:
         return None
 
+    symbol_entries = [
+        entry
+        for entry in (adv.get("vulnerable_symbols") or [])
+        if isinstance(entry, dict) and entry.get("symbol")
+    ]
+
     return {
         "cve_id": cve_id,
         "advisory_id": advisory_id,
@@ -73,6 +79,12 @@ def _advisory_summary_entry(adv: dict, ecosystem: str) -> dict | None:
             func
             for func in (adv.get("vulnerable_functions") or [])
             if isinstance(func, str) and func
+        ],
+        "vulnerable_symbols": symbol_entries,
+        "vulnerable_import_paths": [
+            path
+            for path in (adv.get("vulnerable_import_paths") or [])
+            if isinstance(path, str) and path
         ],
     }
 
@@ -141,6 +153,15 @@ def _load_cwe_and_func_index() -> tuple[dict, dict]:
             # Index by vulnerable function
             for func in adv.get("vulnerable_functions") or []:
                 for func_key in _function_index_keys(func):
+                    if func_key not in _func_index:
+                        _func_index[func_key] = []
+                    if len(_func_index[func_key]) < 20:
+                        _func_index[func_key].append(summary_entry)
+
+            for symbol_entry in adv.get("vulnerable_symbols") or []:
+                if not isinstance(symbol_entry, dict):
+                    continue
+                for func_key in _function_index_keys(symbol_entry.get("symbol", "")):
                     if func_key not in _func_index:
                         _func_index[func_key] = []
                     if len(_func_index[func_key]) < 20:
@@ -502,25 +523,35 @@ def _best_import_match(
     package: str,
     ecosystem: str,
     *,
+    advisory: dict | None = None,
     function_name: str = "",
     call_object: str = "",
 ) -> dict | None:
     best_match = None
     function_token = (function_name or "").strip().lower()
     object_token = (call_object or "").strip().lower()
+    import_hints = _advisory_import_hints(advisory, function_name=function_name)
 
     for res in _iter_external_imports(import_resolutions):
         match = match_external_import_to_package(package, ecosystem, res["import_module"])
-        if not match:
+        hint_confidence = max(
+            (_import_hint_confidence(res["import_module"], hint) for hint in import_hints),
+            default=0.0,
+        )
+        if not match and not hint_confidence:
             continue
 
-        confidence = float(match["confidence"])
+        confidence = float(match["confidence"]) if match else 0.0
         evidence = "module_import"
         imported_names = {name.lower() for name in res["imported_names"]}
 
+        if hint_confidence:
+            confidence = max(confidence, hint_confidence)
+            evidence = "advisory_import_path"
+
         if function_token and function_token in imported_names:
-            confidence = max(confidence, 0.99)
-            evidence = "imported_symbol"
+            confidence = max(confidence, 1.0 if hint_confidence else 0.99)
+            evidence = "advisory_imported_symbol" if hint_confidence else "imported_symbol"
         elif object_token:
             qualifier_match = match_external_import_to_package(package, ecosystem, object_token)
             if qualifier_match:
@@ -592,6 +623,7 @@ def find_vulnerable_function_calls(
                         import_resolutions,
                         adv.get("package", ""),
                         advisory_ecosystem,
+                        advisory=adv,
                         function_name=func_name,
                         call_object=call_object,
                     )
@@ -611,7 +643,11 @@ def find_vulnerable_function_calls(
                 elif import_match:
                     evidence_strength = "medium"
                     match_type = "import_confirmed_function_match"
-                    package_evidence_source = "import_graph"
+                    package_evidence_source = (
+                        "advisory_import_path"
+                        if str(import_match.get("evidence", "")).startswith("advisory_")
+                        else "import_graph"
+                    )
                     package_match_confidence = float(import_match["confidence"])
                     import_module = import_match.get("import_module", "")
                     imported_symbol = import_match.get("imported_symbol", "")
@@ -672,3 +708,46 @@ def find_vulnerable_function_calls(
         ),
     )
     return results[:10]
+
+
+def _advisory_import_hints(advisory: dict | None, function_name: str = "") -> set[str]:
+    if not isinstance(advisory, dict):
+        return set()
+
+    function_token = (function_name or "").strip().lower()
+    targeted_hints: set[str] = set()
+    fallback_hints: set[str] = set()
+
+    for entry in advisory.get("vulnerable_symbols") or []:
+        if not isinstance(entry, dict):
+            continue
+        import_path = str(entry.get("import_path", "") or "").strip().lower()
+        if not import_path:
+            continue
+        fallback_hints.add(import_path)
+        if function_token and function_token in _function_index_keys(entry.get("symbol", "")):
+            targeted_hints.add(import_path)
+
+    if targeted_hints:
+        return targeted_hints
+
+    for import_path in advisory.get("vulnerable_import_paths") or []:
+        clean = str(import_path or "").strip().lower()
+        if clean:
+            fallback_hints.add(clean)
+
+    return fallback_hints
+
+
+def _import_hint_confidence(import_module: str, hint: str) -> float:
+    module = str(import_module or "").strip().lower()
+    target = str(hint or "").strip().lower()
+    if not module or not target:
+        return 0.0
+    if module == target:
+        return 1.0
+    if module.startswith(f"{target}.") or module.startswith(f"{target}/"):
+        return 0.99
+    if target.startswith(f"{module}.") or target.startswith(f"{module}/"):
+        return 0.97
+    return 0.0

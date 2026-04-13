@@ -2,13 +2,12 @@
 
 import asyncio
 import json
-import shutil
 import time
 from pathlib import Path
 
 from app.analysis.paths import normalise_path, relative_to_repo
-from app.config import settings
 from app.scanners.base import ScannerAdapter, ScannerHit, ScannerOutput
+from app.tooling import get_bandit_command
 
 SEVERITY_MAP = {
     "HIGH": "high",
@@ -56,12 +55,16 @@ class BanditAdapter(ScannerAdapter):
         return "bandit"
 
     async def is_available(self) -> bool:
-        return shutil.which(settings.bandit_binary) is not None
+        return bool(get_bandit_command())
 
     async def get_version(self) -> str | None:
+        command = get_bandit_command()
+        if not command:
+            return None
         try:
             proc = await asyncio.create_subprocess_exec(
-                settings.bandit_binary, "--version",
+                *command,
+                "--version",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -78,8 +81,17 @@ class BanditAdapter(ScannerAdapter):
         rules: list[str] | None = None,
         file_filter: list[str] | None = None,
     ) -> ScannerOutput:
+        command = get_bandit_command()
+        if not command:
+            return ScannerOutput(
+                scanner_name=self.name,
+                success=False,
+                errors=["Bandit binary is not available"],
+                duration_ms=0,
+            )
+
         cmd = [
-            settings.bandit_binary,
+            *command,
             "-r",
             "-f", "json",
             "--quiet",
@@ -110,8 +122,17 @@ class BanditAdapter(ScannerAdapter):
         files: list[str],
         rules: list[str],
     ) -> ScannerOutput:
+        command = get_bandit_command()
+        if not command:
+            return ScannerOutput(
+                scanner_name=self.name,
+                success=False,
+                errors=["Bandit binary is not available"],
+                duration_ms=0,
+            )
+
         cmd = [
-            settings.bandit_binary,
+            *command,
             "-f", "json",
             "--quiet",
         ]

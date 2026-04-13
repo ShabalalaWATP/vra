@@ -11,6 +11,8 @@ class ReportOut(BaseModel):
     architecture: str | None
     diagram_spec: str | None
     has_diagram_image: bool = False
+    diagram_count: int = 0
+    diagram_media_type: str | None = None
     narrative: str | None = None
     methodology: str | None
     limitations: str | None

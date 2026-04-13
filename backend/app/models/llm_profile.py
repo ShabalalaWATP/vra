@@ -19,7 +19,7 @@ class LLMProfile(Base):
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=120)
 
     # Context window = total tokens the model can handle (input + output combined)
-    # Common values: 4096, 8192, 16384, 32768, 65536, 131072, 200000, 400000
+    # Common values: 4096, 8192, 16384, 32768, 65536, 131072, 200000, 400000, 500000-1000000
     context_window: Mapped[int] = mapped_column(Integer, default=131072)
 
     # Max output tokens = how many tokens the model should generate per response

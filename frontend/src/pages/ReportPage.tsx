@@ -35,18 +35,21 @@ import ReactMarkdown from "react-markdown";
 import { api } from "@/api/client";
 import ChatWindow from "@/components/ChatWindow";
 import { MermaidDiagram } from "@/components/MermaidDiagram";
+import { triggerBrowserDownload } from "@/utils/download";
 import {
   SeverityDonut,
   ScannerHitsChart,
+  FindingSourceChart,
   LanguageChart,
   CategoryChart,
   ConfidenceDistribution,
-  AttackSurfaceRadar,
   DependencyRiskDonut,
+  VerificationLevelChart,
 } from "@/components/charts/Charts";
 import type {
   Report,
   Finding,
+  ExploitEvidence,
   RelatedAdvisory,
   SecretCandidate,
   DependencyFinding,
@@ -66,6 +69,80 @@ const SEVERITY_COLORS: Record<string, { bg: string; text: string; bar: string; h
   low: { bg: "bg-accent-success/10", text: "text-accent-success", bar: "bg-accent-success", hex: "#22c55e" },
   info: { bg: "bg-accent-primary/10", text: "text-accent-primary", bar: "bg-accent-primary", hex: "#38bdf8" },
 };
+
+function normalizeExploitEvidence(finding: Finding): ExploitEvidence | null {
+  const payload = finding.exploit_evidence ?? {};
+  const cleanList = (values?: string[] | null) =>
+    Array.isArray(values) ? values.map((value) => String(value).trim()).filter(Boolean) : [];
+
+  const evidence: ExploitEvidence = {
+    difficulty: payload.difficulty || finding.exploit_difficulty || null,
+    target_route: payload.target_route || null,
+    prerequisites: cleanList(payload.prerequisites || finding.exploit_prerequisites),
+    validation_steps: cleanList(payload.validation_steps),
+    cleanup_notes: cleanList(payload.cleanup_notes),
+    exploit_template: payload.exploit_template || finding.exploit_template || null,
+    attack_scenario: payload.attack_scenario || finding.attack_scenario || null,
+    components: cleanList(payload.components),
+    related_entry_points: cleanList(payload.related_entry_points),
+    related_taint_flows: cleanList(payload.related_taint_flows),
+  };
+
+  return Object.values(evidence).some((value) => {
+    if (Array.isArray(value)) return value.length > 0;
+    return Boolean(value);
+  })
+    ? evidence
+    : null;
+}
+
+function normalizeFindingProvenance(value?: string | null): "scanner" | "llm" | "hybrid" {
+  const normalized = String(value || "llm").trim().toLowerCase();
+  if (normalized === "scanner") return "scanner";
+  if (normalized === "hybrid") return "hybrid";
+  return "llm";
+}
+
+function formatFindingProvenance(value?: string | null): string {
+  const normalized = normalizeFindingProvenance(value);
+  if (normalized === "scanner") return "Scanner-led";
+  if (normalized === "hybrid") return "Hybrid";
+  return "LLM-only";
+}
+
+function normalizeVerificationLevel(value?: string | null): string {
+  const normalized = String(value || "hypothesis").trim().toLowerCase();
+  if (normalized === "runtime_validated") return "runtime_validated";
+  if (normalized === "strongly_verified") return "strongly_verified";
+  if (normalized === "statically_verified") return "statically_verified";
+  if (normalized === "dismissed") return "dismissed";
+  return "hypothesis";
+}
+
+function formatVerificationLevel(value?: string | null): string {
+  const normalized = normalizeVerificationLevel(value);
+  if (normalized === "runtime_validated") return "Runtime";
+  if (normalized === "strongly_verified") return "Strong";
+  if (normalized === "statically_verified") return "Static";
+  if (normalized === "dismissed") return "Dismissed";
+  return "Hypothesis";
+}
+
+function getMergedFindingCount(finding: Finding): number {
+  const raw = finding.merge_metadata?.merged_count;
+  return typeof raw === "number" && raw > 1 ? raw : 1;
+}
+
+function diagramFamilyLabel(kind?: string): string | null {
+  const normalized = String(kind || "").trim().toLowerCase();
+  if (["overview", "security", "data_flow", "attack_surface"].includes(normalized)) {
+    return "Architecture";
+  }
+  if (["result_overview", "trust_boundaries", "dependency_risk"].includes(normalized)) {
+    return "Result-aware";
+  }
+  return null;
+}
 
 export default function ReportPage() {
   const { scanId } = useParams<{ scanId: string }>();
@@ -117,6 +194,33 @@ export default function ReportPage() {
   findings?.forEach((f) => {
     sevCounts[f.severity] = (sevCounts[f.severity] || 0) + 1;
   });
+  const categoryCounts: Record<string, number> = {};
+  const findingSourceCounts: Record<string, number> = {
+    scanner: 0,
+    llm: 0,
+    hybrid: 0,
+  };
+  const verificationCounts: Record<string, number> = {
+    hypothesis: 0,
+    statically_verified: 0,
+    strongly_verified: 0,
+    runtime_validated: 0,
+  };
+  let mergedDuplicateCount = 0;
+  findings?.forEach((finding) => {
+    const category = finding.category || "uncategorized";
+    categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+
+    const provenance = normalizeFindingProvenance(finding.provenance);
+    findingSourceCounts[provenance] = (findingSourceCounts[provenance] || 0) + 1;
+
+    const verificationLevel = normalizeVerificationLevel(finding.verification_level);
+    if (verificationLevel !== "dismissed") {
+      verificationCounts[verificationLevel] = (verificationCounts[verificationLevel] || 0) + 1;
+    }
+
+    mergedDuplicateCount += Math.max(getMergedFindingCount(finding) - 1, 0);
+  });
 
   const activeSecrets = secrets?.filter((s) => !s.is_false_positive) ?? [];
   const reachableDepCount = depFindings?.filter((d) => d.reachability_status === "reachable").length ?? 0;
@@ -136,7 +240,7 @@ export default function ReportPage() {
         `/scans/${scanId}/report/export`,
         { format }
       );
-      window.open(`/api/scans/${scanId}/report/export/${result.id}/download`);
+      triggerBrowserDownload(`/api/scans/${scanId}/report/export/${result.id}/download`);
     } catch (e: unknown) {
       setExportError(e instanceof Error ? e.message : "Export failed");
     } finally {
@@ -149,6 +253,14 @@ export default function ReportPage() {
     frameworks?: string[];
   } | null;
   const architectureData = parseArchitecturePayload(report?.architecture, report?.diagram_spec);
+  const concreteAttackSurfacePoints = architectureData.attack_surface_points;
+  const architectureEntryPoints = architectureData.entry_points;
+  const architectureDataFlows = architectureData.data_flows;
+  const exploitChainFindings = sortedFindings.filter(
+    (finding) => String(finding.category || "").toLowerCase() === "exploit_chain"
+  );
+  const exploitableCount =
+    findings?.filter((finding) => Boolean(normalizeExploitEvidence(finding))).length ?? 0;
 
   if (reportLoading) {
     return (
@@ -287,27 +399,52 @@ export default function ReportPage() {
                 <ReactMarkdown>{report.app_summary}</ReactMarkdown>
               </div>
 
-              {/* Attack Surface Overview */}
-              {report.attack_surface && Object.keys(report.attack_surface).length > 0 && (
+              {/* Concrete Attack Paths */}
+              {concreteAttackSurfacePoints.length > 0 ? (
                 <div className="mt-4 pt-4 border-t border-border/30">
-                  <h3 className="text-sm font-semibold text-text-primary mb-3">Attack Surface</h3>
+                  <div className="flex items-center justify-between gap-3 mb-3">
+                    <h3 className="text-sm font-semibold text-text-primary">Exposed Attack Paths</h3>
+                    <span className="text-[10px] font-mono text-text-muted">
+                      {concreteAttackSurfacePoints.length} mapped
+                    </span>
+                  </div>
+                  <div className="space-y-2">
+                    {concreteAttackSurfacePoints.slice(0, 4).map((point) => (
+                      <div
+                        key={point}
+                        className="rounded-lg border border-accent-danger/15 bg-accent-danger/5 px-3 py-2 text-xs font-mono text-text-secondary"
+                      >
+                        {point}
+                      </div>
+                    ))}
+                    {concreteAttackSurfacePoints.length > 4 && (
+                      <p className="text-[11px] text-text-muted">
+                        +{concreteAttackSurfacePoints.length - 4} additional mapped routes, handlers, or exposed functions.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              ) : report.attack_surface && Object.keys(report.attack_surface).length > 0 ? (
+                <div className="mt-4 pt-4 border-t border-border/30">
+                  <h3 className="text-sm font-semibold text-text-primary mb-2">Finding Surface Mix</h3>
+                  <p className="text-xs text-text-muted mb-3">
+                    These counts are derived from findings and scanner coverage, not concrete routes or handlers.
+                  </p>
                   <div className="flex flex-wrap gap-2">
                     {Object.entries(report.attack_surface as Record<string, number>)
                       .sort((a, b) => (b[1] as number) - (a[1] as number))
                       .map(([key, val]) => (
-                        <span key={key} className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border ${
-                          (val as number) > 30 ? "bg-accent-danger/10 text-accent-danger border-accent-danger/20"
-                          : (val as number) > 10 ? "bg-accent-warning/10 text-accent-warning border-accent-warning/20"
-                          : "bg-bg-secondary text-text-muted border-border"
-                        }`}>
+                        <span
+                          key={key}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-bg-secondary px-2.5 py-1 text-xs font-medium text-text-muted"
+                        >
                           {key}
                           <span className="font-mono text-[10px] opacity-70">{String(val)}</span>
                         </span>
-                      ))
-                    }
+                      ))}
                   </div>
                 </div>
-              )}
+              ) : null}
 
               {/* Key Architecture Notes */}
               {report.architecture && (
@@ -340,11 +477,12 @@ export default function ReportPage() {
       </div>
 
       {/* ── Architecture Diagrams ──────────────────────────────── */}
-      {(report?.has_diagram_image || architectureData.diagrams.length > 0 || report?.diagram_spec) && (
+      {(((report?.diagram_count ?? 0) > 0) || architectureData.diagrams.length > 0 || report?.diagram_spec) && (
         <DiagramViewer
           scanId={scanId!}
           architectureData={architectureData}
           hasDiagramImage={report?.has_diagram_image ?? false}
+          diagramCount={report?.diagram_count ?? 0}
         />
       )}
 
@@ -361,17 +499,17 @@ export default function ReportPage() {
 
       {/* ── Scan Statistics ──────────────────────────────────── */}
       {(() => {
-        const exploitableCount = findings?.filter((f) => f.exploit_template).length ?? 0;
         const advisoryCount = findings?.filter((f) => f.related_cves && f.related_cves.length > 0).length ?? 0;
         const critHighCount = (sevCounts["critical"] || 0) + (sevCounts["high"] || 0);
         return (
-          <section className="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <section className="grid grid-cols-2 md:grid-cols-6 gap-4">
             {[
               { label: "Total Findings", value: findings?.length ?? 0, color: "text-accent-warning" },
               { label: "Critical / High", value: critHighCount, color: critHighCount > 0 ? "text-accent-danger" : "text-accent-success" },
               { label: "Exploitable (PoC)", value: exploitableCount, color: exploitableCount > 0 ? "text-accent-danger" : "text-text-muted" },
               { label: "Advisory Correlated", value: advisoryCount, color: advisoryCount > 0 ? "text-orange-400" : "text-text-muted" },
               { label: "Dep. Risks", value: depFindings?.length ?? 0, color: (depFindings?.length ?? 0) > 0 ? "text-accent-warning" : "text-text-muted" },
+              { label: "Merged Dups", value: mergedDuplicateCount, color: mergedDuplicateCount > 0 ? "text-accent-primary" : "text-text-muted" },
             ].map((stat) => (
               <div key={stat.label} className="card-glow text-center py-4">
                 <p className={`text-2xl font-bold font-mono ${stat.color}`}>{stat.value}</p>
@@ -391,7 +529,7 @@ export default function ReportPage() {
           <h2 className="text-lg font-semibold">Scan Analytics</h2>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8">
           {/* Severity donut */}
           <div className="bg-[#0c0c14] rounded-xl border border-[#1a1a2e] p-6 flex items-center justify-center min-h-[300px]">
             {findings && findings.length > 0 ? (
@@ -419,33 +557,44 @@ export default function ReportPage() {
             )}
           </div>
 
+          {/* Final finding sources */}
+          <div className="bg-[#0c0c14] rounded-xl border border-[#1a1a2e] p-6 min-h-[300px]">
+            {findings && findings.length > 0 ? (
+              <FindingSourceChart counts={findingSourceCounts} />
+            ) : (
+              <p className="text-text-muted text-sm">No findings</p>
+            )}
+          </div>
+
+          {/* Verification levels */}
+          <div className="bg-[#0c0c14] rounded-xl border border-[#1a1a2e] p-6 min-h-[300px]">
+            {findings && findings.length > 0 ? (
+              <VerificationLevelChart counts={verificationCounts} />
+            ) : (
+              <p className="text-text-muted text-sm">No findings</p>
+            )}
+          </div>
+
           {/* Finding categories */}
           <div className="bg-[#0c0c14] rounded-xl border border-[#1a1a2e] p-6 min-h-[300px]">
             {findings && findings.length > 0 ? (
-              <CategoryChart
-                categories={
-                  findings.reduce((acc, f) => {
-                    const cat = f.category || "uncategorized";
-                    acc[cat] = (acc[cat] || 0) + 1;
-                    return acc;
-                  }, {} as Record<string, number>)
-                }
-              />
+              <CategoryChart categories={categoryCounts} />
             ) : (
               <p className="text-text-muted text-sm">No findings</p>
             )}
           </div>
         </div>
 
-        {/* Second row: radar + languages + dependency risks */}
+        {/* Second row: attack paths + languages + dependency risks */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mt-8 pt-6 border-t border-border/30">
-          {/* Attack surface radar */}
-          <div className="bg-[#0c0c14] rounded-xl border border-[#1a1a2e] p-6 flex items-center justify-center min-h-[280px]">
-            {report?.attack_surface ? (
-              <AttackSurfaceRadar metrics={report.attack_surface as Record<string, number>} size={260} />
-            ) : (
-              <p className="text-text-muted text-sm">No attack surface data</p>
-            )}
+          {/* Concrete attack paths */}
+          <div className="bg-[#0c0c14] rounded-xl border border-[#1a1a2e] p-6 min-h-[280px]">
+            <AttackPathPanel
+              attackSurfacePoints={concreteAttackSurfacePoints}
+              entryPoints={architectureEntryPoints}
+              dataFlows={architectureDataFlows}
+              fallbackMetrics={report?.attack_surface as Record<string, number> | null | undefined}
+            />
           </div>
 
           {/* Language distribution */}
@@ -577,6 +726,11 @@ export default function ReportPage() {
         </div>
       </section>
 
+      {/* ── Exploit Chains ────────────────────────────────────── */}
+      {exploitChainFindings.length > 0 && (
+        <ExploitChainsSection findings={exploitChainFindings} />
+      )}
+
       {/* ── Security Findings ─────────────────────────────────── */}
       <section className="space-y-4">
         <div className="flex items-center justify-between">
@@ -620,6 +774,25 @@ export default function ReportPage() {
             {filteredFindings.map((f, idx) => {
               const isExpanded = expandedFindings.has(f.id);
               const sc = SEVERITY_COLORS[f.severity] || SEVERITY_COLORS.info;
+              const exploitEvidence = normalizeExploitEvidence(f);
+              const exploitDifficulty = exploitEvidence?.difficulty || null;
+              const provenance = normalizeFindingProvenance(f.provenance);
+              const verificationLevel = normalizeVerificationLevel(f.verification_level);
+              const mergedCount = getMergedFindingCount(f);
+              const provenanceBadgeClass =
+                provenance === "scanner"
+                  ? "bg-accent-primary/10 text-accent-primary"
+                  : provenance === "hybrid"
+                  ? "bg-accent-secondary/10 text-accent-secondary"
+                  : "bg-accent-warning/10 text-accent-warning";
+              const verificationBadgeClass =
+                verificationLevel === "runtime_validated"
+                  ? "bg-accent-danger/10 text-accent-danger"
+                  : verificationLevel === "strongly_verified"
+                  ? "bg-accent-success/10 text-accent-success"
+                  : verificationLevel === "statically_verified"
+                  ? "bg-accent-primary/10 text-accent-primary"
+                  : "bg-bg-secondary text-text-muted";
 
               return (
                 <div
@@ -647,6 +820,12 @@ export default function ReportPage() {
                     <span className={`badge badge-${f.severity} shrink-0`}>
                       {f.severity.toUpperCase()}
                     </span>
+                    <span className={`text-[10px] px-2 py-0.5 rounded font-medium shrink-0 ${provenanceBadgeClass}`}>
+                      {formatFindingProvenance(f.provenance)}
+                    </span>
+                    <span className={`text-[10px] px-2 py-0.5 rounded font-medium shrink-0 ${verificationBadgeClass}`}>
+                      {formatVerificationLevel(f.verification_level)}
+                    </span>
                     <span className="font-medium flex-1 group-hover:text-accent-primary transition-colors">
                       {f.title}
                     </span>
@@ -667,6 +846,11 @@ export default function ReportPage() {
                         ))}
                       </div>
                     )}
+                    {mergedCount > 1 && (
+                      <span className="text-[9px] text-text-secondary bg-bg-secondary px-1.5 py-0.5 rounded font-mono shrink-0">
+                        merged x{mergedCount}
+                      </span>
+                    )}
                     <ConfidenceBar value={f.confidence} />
                   </button>
 
@@ -677,6 +861,50 @@ export default function ReportPage() {
                       <p className="text-sm text-text-secondary leading-relaxed pl-10">
                         {f.description}
                       </p>
+
+                      {(f.provenance || f.verification_level || (f.source_scanners?.length ?? 0) > 0 || (f.source_rules?.length ?? 0) > 0 || f.verification_notes || mergedCount > 1) && (
+                        <div className="pl-10">
+                          <div className="rounded-xl border border-border bg-bg-secondary/50 p-4">
+                            <div className="flex items-center gap-2 mb-3">
+                              <Shield className="w-4 h-4 text-accent-primary" />
+                              <span className="text-xs font-semibold text-text-primary uppercase tracking-wider">
+                                Assessment
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap gap-2 mb-3">
+                              <span className={`text-[10px] px-2 py-0.5 rounded font-medium ${provenanceBadgeClass}`}>
+                                {formatFindingProvenance(f.provenance)}
+                              </span>
+                              <span className={`text-[10px] px-2 py-0.5 rounded font-medium ${verificationBadgeClass}`}>
+                                {formatVerificationLevel(f.verification_level)}
+                              </span>
+                              {mergedCount > 1 && (
+                                <span className="text-[10px] px-2 py-0.5 rounded bg-bg-tertiary text-text-secondary font-medium">
+                                  {mergedCount} merged candidates
+                                </span>
+                              )}
+                            </div>
+                            {f.source_scanners && f.source_scanners.length > 0 && (
+                              <p className="text-xs text-text-secondary leading-relaxed">
+                                <span className="text-text-muted">Source scanners: </span>
+                                {f.source_scanners.join(", ")}
+                              </p>
+                            )}
+                            {f.source_rules && f.source_rules.length > 0 && (
+                              <p className="text-xs text-text-secondary leading-relaxed mt-1">
+                                <span className="text-text-muted">Source rules: </span>
+                                {f.source_rules.slice(0, 6).join(", ")}
+                              </p>
+                            )}
+                            {f.verification_notes && (
+                              <p className="text-xs text-text-secondary leading-relaxed mt-2">
+                                <span className="text-text-muted">Verification notes: </span>
+                                {f.verification_notes}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )}
 
                       {/* Related advisories */}
                       {f.related_cves && f.related_cves.length > 0 && (
@@ -828,39 +1056,103 @@ export default function ReportPage() {
                       )}
 
                       {/* Exploit Assessment */}
-                      {f.exploit_difficulty && (
+                      {exploitEvidence && (
                         <div className="pl-10">
                           <div className={`rounded-xl p-4 border ${
-                            f.exploit_difficulty === "easy"
+                            exploitDifficulty === "easy"
                               ? "bg-accent-danger/5 border-accent-danger/20"
-                              : f.exploit_difficulty === "moderate"
+                              : exploitDifficulty === "moderate"
                               ? "bg-accent-warning/5 border-accent-warning/20"
                               : "bg-bg-secondary/50 border-border"
                           }`}>
                             <div className="flex items-center gap-3 mb-2">
                               <Crosshair className={`w-4 h-4 ${
-                                f.exploit_difficulty === "easy" ? "text-accent-danger" :
-                                f.exploit_difficulty === "moderate" ? "text-accent-warning" :
+                                exploitDifficulty === "easy" ? "text-accent-danger" :
+                                exploitDifficulty === "moderate" ? "text-accent-warning" :
                                 "text-text-muted"
                               }`} />
                               <span className="text-xs font-semibold uppercase tracking-wider">
-                                Exploit Difficulty: {f.exploit_difficulty}
+                                {exploitDifficulty ? `Exploit Difficulty: ${exploitDifficulty}` : "Exploit Evidence"}
                               </span>
                             </div>
-                            {f.attack_scenario && (
-                              <p className="text-sm text-text-secondary leading-relaxed mb-3">
-                                {f.attack_scenario}
+                            {exploitEvidence.target_route && (
+                              <p className="text-sm text-text-primary leading-relaxed mb-2">
+                                <span className="text-text-muted">Target route / invocation: </span>
+                                <span className="font-mono text-xs">{exploitEvidence.target_route}</span>
                               </p>
                             )}
-                            {f.exploit_prerequisites && f.exploit_prerequisites.length > 0 && (
+                            {exploitEvidence.attack_scenario && (
+                              <p className="text-sm text-text-secondary leading-relaxed mb-3">
+                                {exploitEvidence.attack_scenario}
+                              </p>
+                            )}
+                            {exploitEvidence.prerequisites && exploitEvidence.prerequisites.length > 0 && (
                               <div className="mb-3">
                                 <span className="text-xs text-text-muted">Prerequisites: </span>
                                 <span className="text-xs text-text-secondary">
-                                  {f.exploit_prerequisites.join(", ")}
+                                  {exploitEvidence.prerequisites.join(", ")}
                                 </span>
                               </div>
                             )}
-                            {f.exploit_template && (
+                            {exploitEvidence.components && exploitEvidence.components.length > 0 && (
+                              <div className="mb-3">
+                                <span className="text-xs text-text-muted">Components: </span>
+                                <span className="text-xs text-text-secondary">
+                                  {exploitEvidence.components.join(", ")}
+                                </span>
+                              </div>
+                            )}
+                            {exploitEvidence.related_entry_points && exploitEvidence.related_entry_points.length > 0 && (
+                              <div className="mb-3">
+                                <span className="text-xs text-text-muted">Related entry points:</span>
+                                <div className="mt-1 flex flex-wrap gap-1.5">
+                                  {exploitEvidence.related_entry_points.map((entryPoint) => (
+                                    <span
+                                      key={`${f.id}-entry-${entryPoint}`}
+                                      className="rounded bg-bg-secondary px-2 py-1 text-[11px] font-mono text-text-secondary"
+                                    >
+                                      {entryPoint}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {exploitEvidence.related_taint_flows && exploitEvidence.related_taint_flows.length > 0 && (
+                              <div className="mb-3">
+                                <span className="text-xs text-text-muted">Related taint flows:</span>
+                                <div className="mt-1 space-y-1">
+                                  {exploitEvidence.related_taint_flows.map((flow) => (
+                                    <div
+                                      key={`${f.id}-flow-${flow}`}
+                                      className="rounded bg-bg-secondary px-2 py-1 text-[11px] text-text-secondary"
+                                    >
+                                      {flow}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {exploitEvidence.validation_steps && exploitEvidence.validation_steps.length > 0 && (
+                              <div className="mb-3">
+                                <span className="text-xs text-text-muted">Validation steps:</span>
+                                <ul className="mt-1 space-y-1 text-xs text-text-secondary list-disc list-inside">
+                                  {exploitEvidence.validation_steps.map((step) => (
+                                    <li key={`${f.id}-validation-${step}`}>{step}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {exploitEvidence.cleanup_notes && exploitEvidence.cleanup_notes.length > 0 && (
+                              <div className="mb-3">
+                                <span className="text-xs text-text-muted">Cleanup notes:</span>
+                                <ul className="mt-1 space-y-1 text-xs text-text-secondary list-disc list-inside">
+                                  {exploitEvidence.cleanup_notes.map((step) => (
+                                    <li key={`${f.id}-cleanup-${step}`}>{step}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {exploitEvidence.exploit_template && (
                               <div className="rounded-lg overflow-hidden border border-border mt-2">
                                 <div className="bg-bg-tertiary px-3 py-1.5 border-b border-border">
                                   <span className="text-[10px] text-text-muted uppercase tracking-wider font-medium">
@@ -868,7 +1160,7 @@ export default function ReportPage() {
                                   </span>
                                 </div>
                                 <pre className="bg-bg-secondary px-3 py-2 text-xs font-mono overflow-x-auto text-accent-danger/80">
-                                  {f.exploit_template}
+                                  {exploitEvidence.exploit_template}
                                 </pre>
                               </div>
                             )}
@@ -1356,6 +1648,244 @@ function formatDependencyLabel(value: string): string {
     .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized) {
+      continue;
+    }
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(normalized);
+  }
+  return deduped;
+}
+
+function normalizeArchitectureComponent(component: unknown): ArchitectureComponent | null {
+  if (typeof component === "string") {
+    const name = component.trim();
+    return name ? { name } : null;
+  }
+
+  const record = asRecord(component);
+  if (!record) {
+    return null;
+  }
+
+  const name = String(record.name || "").trim() || "Component";
+  return {
+    name,
+    purpose: typeof record.purpose === "string" ? record.purpose : undefined,
+    files: normalizeStringList(record.files),
+    criticality: typeof record.criticality === "string" ? record.criticality : undefined,
+    in_attack_surface: typeof record.in_attack_surface === "boolean" ? record.in_attack_surface : undefined,
+    handles_user_input: typeof record.handles_user_input === "boolean" ? record.handles_user_input : undefined,
+  };
+}
+
+function normalizeArchitectureEntryPoint(entryPoint: unknown): ArchitectureEntryPoint | null {
+  if (typeof entryPoint === "string") {
+    const path = entryPoint.trim();
+    return path ? { path } : null;
+  }
+
+  const record = asRecord(entryPoint);
+  if (!record) {
+    return null;
+  }
+
+  const file = typeof record.file === "string" ? record.file.trim() : "";
+  const fn = typeof record.function === "string" ? record.function.trim() : "";
+  const path = typeof record.path === "string" ? record.path.trim() : "";
+  const method = typeof record.method === "string" ? record.method.trim() : "";
+  const type = typeof record.type === "string" ? record.type.trim() : "";
+  const auth = typeof record.auth === "string" ? record.auth.trim() : "";
+  const notes = typeof record.notes === "string" ? record.notes.trim() : "";
+
+  if (!file && !fn && !path && !method && !type && !auth && !notes) {
+    return null;
+  }
+
+  return {
+    file: file || undefined,
+    function: fn || undefined,
+    type: type || undefined,
+    method: method || undefined,
+    path: path || undefined,
+    auth: auth || undefined,
+    notes: notes || undefined,
+  };
+}
+
+function formatArchitectureEntryPoint(entryPoint: ArchitectureEntryPoint): string {
+  const route = [entryPoint.method, entryPoint.path].filter(Boolean).join(" ").trim();
+  const handler = [entryPoint.file, entryPoint.function].filter(Boolean).join(" -> ").trim();
+  const typeLabel = entryPoint.type ? formatDependencyLabel(entryPoint.type) : "";
+  return [route || null, handler || null, typeLabel || null].filter(Boolean).join(" | ") || "Mapped entry point";
+}
+
+function normalizeArchitectureDataFlow(flow: unknown): ArchitectureDataFlow | null {
+  if (typeof flow === "string") {
+    const summary = flow.trim();
+    return summary ? { from: summary } : null;
+  }
+
+  const record = asRecord(flow);
+  if (!record) {
+    return null;
+  }
+
+  const from = typeof record.from === "string" ? record.from.trim() : "";
+  const to = typeof record.to === "string" ? record.to.trim() : "";
+  const data = typeof record.data === "string" ? record.data.trim() : "";
+  const sensitive = typeof record.sensitive === "boolean" ? record.sensitive : undefined;
+
+  if (!from && !to && !data && typeof sensitive !== "boolean") {
+    return null;
+  }
+
+  return {
+    from: from || undefined,
+    to: to || undefined,
+    data: data || undefined,
+    sensitive,
+  };
+}
+
+function formatArchitectureDataFlow(flow: ArchitectureDataFlow): string {
+  const path = [flow.from || "source", flow.to || "destination"].join(" -> ");
+  const detail = flow.data ? ` | ${flow.data}` : "";
+  const sensitivity = flow.sensitive ? " | sensitive" : "";
+  return `${path}${detail}${sensitivity}`;
+}
+
+function normalizeArchitectureAuthMechanism(mechanism: unknown): ArchitectureAuthMechanism | null {
+  if (typeof mechanism === "string") {
+    const type = mechanism.trim();
+    return type ? { type } : null;
+  }
+
+  const record = asRecord(mechanism);
+  if (!record) {
+    return null;
+  }
+
+  const type = typeof record.type === "string" ? record.type.trim() : "";
+  const implementation = typeof record.implementation === "string" ? record.implementation.trim() : "";
+  const weaknesses = typeof record.weaknesses === "string" ? record.weaknesses.trim() : "";
+
+  if (!type && !implementation && !weaknesses) {
+    return null;
+  }
+
+  return {
+    type: type || undefined,
+    implementation: implementation || undefined,
+    weaknesses: weaknesses || undefined,
+  };
+}
+
+function normalizeArchitectureHotspot(hotspot: unknown): ArchitectureHotspot | null {
+  if (typeof hotspot === "string") {
+    const name = hotspot.trim();
+    return name ? { name } : null;
+  }
+
+  const record = asRecord(hotspot);
+  if (!record) {
+    return null;
+  }
+
+  const name = String(record.name || "").trim() || "Component";
+  const numericValue = (key: string) =>
+    typeof record[key] === "number" && Number.isFinite(record[key]) ? (record[key] as number) : undefined;
+
+  return {
+    name,
+    criticality: typeof record.criticality === "string" ? record.criticality : undefined,
+    finding_count: numericValue("finding_count"),
+    critical_count: numericValue("critical_count"),
+    high_count: numericValue("high_count"),
+    medium_count: numericValue("medium_count"),
+    max_severity: typeof record.max_severity === "string" ? record.max_severity : undefined,
+    in_attack_surface: typeof record.in_attack_surface === "boolean" ? record.in_attack_surface : undefined,
+  };
+}
+
+function deriveAttackSurfacePoints(attackSurface: string[], entryPoints: ArchitectureEntryPoint[]): string[] {
+  const entryPointPaths = entryPoints.map((entryPoint) => formatArchitectureEntryPoint(entryPoint));
+  return uniqueStrings([...attackSurface, ...entryPointPaths]);
+}
+
+function extractExploitChainSteps(finding: Finding): string[] {
+  const exploitEvidence = normalizeExploitEvidence(finding);
+  if (exploitEvidence?.validation_steps?.length) {
+    return uniqueStrings(exploitEvidence.validation_steps).slice(0, 6);
+  }
+
+  const textSources = [
+    exploitEvidence?.attack_scenario,
+    finding.description,
+    finding.explanation,
+    finding.impact,
+  ].filter(Boolean) as string[];
+
+  const bulletSteps = uniqueStrings(
+    textSources
+      .flatMap((value) => value.split(/\r?\n+/))
+      .map((step) => step.replace(/^[\-\*\d\.\)\s]+/, "").trim())
+      .filter((step) => step.length >= 20)
+  );
+  if (bulletSteps.length >= 2) {
+    return bulletSteps.slice(0, 6);
+  }
+
+  const arrowSteps = uniqueStrings(
+    textSources
+      .flatMap((value) => value.split(/\s*(?:->|=>)\s*/))
+      .map((step) => step.trim())
+      .filter((step) => step.length >= 8)
+  );
+  return arrowSteps.length >= 2 ? arrowSteps.slice(0, 6) : [];
+}
+
+function createEmptyArchitecturePayload(diagrams: ArchitectureDiagram[] = []): ArchitecturePayload {
+  return {
+    analysisMarkdown: null,
+    diagrams,
+    components: [],
+    auth_mechanisms: [],
+    external_integrations: [],
+    trust_boundaries: [],
+    security_observations: [],
+    component_hotspots: [],
+    result_summary: {},
+    entry_points: [],
+    data_flows: [],
+    attack_surface_points: [],
+  };
+}
+
 function formatAdvisoryFunctionLabel(advisory: RelatedAdvisory): string {
   const functionName = advisory.function || advisory.imported_symbol || advisory.call_object;
   if (!functionName) {
@@ -1393,7 +1923,7 @@ function AdvisoryEvidenceBadge({ evidenceType }: { evidenceType: string }) {
   );
 }
 
-function parseArchitecturePayload(
+export function parseArchitecturePayload(
   architecture: string | null | undefined,
   diagramSpec?: string | null
 ): ArchitecturePayload {
@@ -1402,13 +1932,13 @@ function parseArchitecturePayload(
     : [];
 
   if (!architecture) {
-    return { diagrams: fallbackDiagrams };
+    return createEmptyArchitecturePayload(fallbackDiagrams);
   }
 
   try {
     const parsed = JSON.parse(architecture) as Record<string, unknown>;
     if (!parsed || typeof parsed !== "object") {
-      return { analysisMarkdown: architecture, diagrams: fallbackDiagrams };
+      return { ...createEmptyArchitecturePayload(fallbackDiagrams), analysisMarkdown: architecture };
     }
 
     const rawDiagrams = Array.isArray(parsed.diagrams) ? parsed.diagrams : [];
@@ -1420,29 +1950,66 @@ function parseArchitecturePayload(
         description: String(diagram?.description || ""),
         mermaid: String(diagram?.mermaid || ""),
         kind: diagram?.kind ? String(diagram.kind) : undefined,
+        imageUrl:
+          typeof diagram?.imageUrl === "string"
+            ? String(diagram.imageUrl)
+            : typeof diagram?.image_url === "string"
+            ? String(diagram.image_url)
+            : undefined,
         highlights: Array.isArray(diagram?.highlights)
           ? diagram.highlights.map((item) => String(item))
           : undefined,
       }))
       .filter((diagram) => diagram.mermaid || fallbackDiagrams.length === 0);
 
+    const entryPoints = Array.isArray(parsed.entry_points)
+      ? parsed.entry_points
+          .map((entryPoint) => normalizeArchitectureEntryPoint(entryPoint))
+          .filter(Boolean) as ArchitectureEntryPoint[]
+      : [];
+    const dataFlows = Array.isArray(parsed.data_flows)
+      ? parsed.data_flows
+          .map((flow) => normalizeArchitectureDataFlow(flow))
+          .filter(Boolean) as ArchitectureDataFlow[]
+      : [];
+    const attackSurface = normalizeStringList(parsed.attack_surface);
+    const resultSummaryRecord = asRecord(parsed.result_summary);
+    const resultSummary = resultSummaryRecord
+      ? Object.fromEntries(
+          Object.entries(resultSummaryRecord).filter(([, value]) => typeof value === "number" && Number.isFinite(value))
+        ) as ArchitectureResultSummary
+      : {};
+
     return {
       analysisMarkdown: typeof parsed.analysis_markdown === "string" ? parsed.analysis_markdown : null,
       diagrams: diagrams.length > 0 ? diagrams : fallbackDiagrams,
-      components: Array.isArray(parsed.components) ? parsed.components as ArchitectureComponent[] : [],
-      auth_mechanisms: Array.isArray(parsed.auth_mechanisms) ? parsed.auth_mechanisms as ArchitectureAuthMechanism[] : [],
-      external_integrations: Array.isArray(parsed.external_integrations) ? parsed.external_integrations.map((item) => String(item)) : [],
-      trust_boundaries: Array.isArray(parsed.trust_boundaries) ? parsed.trust_boundaries.map((item) => String(item)) : [],
-      security_observations: Array.isArray(parsed.security_observations) ? parsed.security_observations.map((item) => String(item)) : [],
-      component_hotspots: Array.isArray(parsed.component_hotspots) ? parsed.component_hotspots as ArchitectureHotspot[] : [],
-      result_summary: parsed.result_summary && typeof parsed.result_summary === "object"
-        ? parsed.result_summary as Record<string, number>
-        : {},
+      components: Array.isArray(parsed.components)
+        ? parsed.components
+            .map((component) => normalizeArchitectureComponent(component))
+            .filter(Boolean) as ArchitectureComponent[]
+        : [],
+      auth_mechanisms: Array.isArray(parsed.auth_mechanisms)
+        ? parsed.auth_mechanisms
+            .map((mechanism) => normalizeArchitectureAuthMechanism(mechanism))
+            .filter(Boolean) as ArchitectureAuthMechanism[]
+        : [],
+      external_integrations: normalizeStringList(parsed.external_integrations),
+      trust_boundaries: normalizeStringList(parsed.trust_boundaries),
+      security_observations: normalizeStringList(parsed.security_observations),
+      component_hotspots: Array.isArray(parsed.component_hotspots)
+        ? parsed.component_hotspots
+            .map((hotspot) => normalizeArchitectureHotspot(hotspot))
+            .filter(Boolean) as ArchitectureHotspot[]
+        : [],
+      result_summary: resultSummary,
+      entry_points: entryPoints,
+      data_flows: dataFlows,
+      attack_surface_points: deriveAttackSurfacePoints(attackSurface, entryPoints),
     };
   } catch {
     return {
+      ...createEmptyArchitecturePayload(fallbackDiagrams),
       analysisMarkdown: architecture,
-      diagrams: fallbackDiagrams,
     };
   }
 }
@@ -2161,12 +2728,33 @@ type ArchitectureDiagram = {
   mermaid: string;
   kind?: string;
   highlights?: string[];
+  imageUrl?: string;
 };
 
 type ArchitectureComponent = {
   name?: string;
   purpose?: string;
+  files?: string[];
   criticality?: string;
+  in_attack_surface?: boolean;
+  handles_user_input?: boolean;
+};
+
+type ArchitectureEntryPoint = {
+  file?: string;
+  function?: string;
+  type?: string;
+  method?: string;
+  path?: string;
+  auth?: string;
+  notes?: string;
+};
+
+type ArchitectureDataFlow = {
+  from?: string;
+  to?: string;
+  data?: string;
+  sensitive?: boolean;
 };
 
 type ArchitectureAuthMechanism = {
@@ -2181,21 +2769,41 @@ type ArchitectureHotspot = {
   finding_count?: number;
   critical_count?: number;
   high_count?: number;
+  medium_count?: number;
+  max_severity?: string;
+  in_attack_surface?: boolean;
+};
+
+type ArchitectureResultSummary = {
+  [key: string]: number | undefined;
+  finding_count?: number;
+  critical_count?: number;
+  high_count?: number;
+  medium_count?: number;
+  exploit_chain_count?: number;
+  advisory_correlated_count?: number;
+  reachable_dependency_count?: number;
+  active_dependency_count?: number;
+  function_matched_dependency_count?: number;
+  high_risk_dependency_count?: number;
 };
 
 type ArchitecturePayload = {
-  analysisMarkdown?: string | null;
+  analysisMarkdown: string | null;
   diagrams: ArchitectureDiagram[];
-  components?: ArchitectureComponent[];
-  auth_mechanisms?: ArchitectureAuthMechanism[];
-  external_integrations?: string[];
-  trust_boundaries?: string[];
-  security_observations?: string[];
-  component_hotspots?: ArchitectureHotspot[];
-  result_summary?: Record<string, number>;
+  components: ArchitectureComponent[];
+  auth_mechanisms: ArchitectureAuthMechanism[];
+  external_integrations: string[];
+  trust_boundaries: string[];
+  security_observations: string[];
+  component_hotspots: ArchitectureHotspot[];
+  result_summary: ArchitectureResultSummary;
+  entry_points: ArchitectureEntryPoint[];
+  data_flows: ArchitectureDataFlow[];
+  attack_surface_points: string[];
 };
 
-function ArchitectureAnalysisPanel({
+export function ArchitectureAnalysisPanel({
   data,
   rawArchitecture,
 }: {
@@ -2203,13 +2811,16 @@ function ArchitectureAnalysisPanel({
   rawArchitecture: string | null;
 }) {
   const hasStructuredContent =
-    Object.keys(data.result_summary || {}).length > 0 ||
-    (data.component_hotspots?.length ?? 0) > 0 ||
-    (data.trust_boundaries?.length ?? 0) > 0 ||
-    (data.auth_mechanisms?.length ?? 0) > 0 ||
-    (data.external_integrations?.length ?? 0) > 0 ||
-    (data.security_observations?.length ?? 0) > 0 ||
-    (data.components?.length ?? 0) > 0;
+    Object.keys(data.result_summary).length > 0 ||
+    data.component_hotspots.length > 0 ||
+    data.trust_boundaries.length > 0 ||
+    data.auth_mechanisms.length > 0 ||
+    data.external_integrations.length > 0 ||
+    data.security_observations.length > 0 ||
+    data.components.length > 0 ||
+    data.entry_points.length > 0 ||
+    data.data_flows.length > 0 ||
+    data.attack_surface_points.length > 0;
 
   if (!hasStructuredContent) {
     const markdown = data.analysisMarkdown || rawArchitecture;
@@ -2226,35 +2837,46 @@ function ArchitectureAnalysisPanel({
     );
   }
 
-  const resultSummary = data.result_summary || {};
-  const hotspots = data.component_hotspots || [];
-  const components = data.components || [];
-  const authMechanisms = data.auth_mechanisms || [];
-  const integrations = data.external_integrations || [];
-  const trustBoundaries = data.trust_boundaries || [];
-  const observations = data.security_observations || [];
+  const resultSummary = data.result_summary;
+  const hotspots = data.component_hotspots;
+  const components = data.components;
+  const authMechanisms = data.auth_mechanisms;
+  const integrations = data.external_integrations;
+  const trustBoundaries = data.trust_boundaries;
+  const observations = data.security_observations;
+  const entryPoints = data.entry_points;
+  const dataFlows = data.data_flows;
+  const attackSurfacePoints = data.attack_surface_points;
+  const summaryBadges = [
+    ["Verified findings", resultSummary.finding_count],
+    ["Critical", resultSummary.critical_count],
+    ["High", resultSummary.high_count],
+    ["Medium", resultSummary.medium_count],
+    ["Exploit chains", resultSummary.exploit_chain_count],
+    ["Advisory correlated", resultSummary.advisory_correlated_count],
+    ["Scanner-led", resultSummary.scanner_only_count],
+    ["LLM-only", resultSummary.llm_only_count],
+    ["Hybrid", resultSummary.hybrid_count],
+    ["Static verification", resultSummary.statically_verified_count],
+    ["Strong verification", resultSummary.strongly_verified_count],
+    ["Runtime validated", resultSummary.runtime_validated_count],
+    ["Merged duplicates", resultSummary.merged_duplicate_count],
+    ["Reachable deps", resultSummary.reachable_dependency_count],
+    ["Function matches", resultSummary.function_matched_dependency_count],
+  ].filter(([, value]) => typeof value === "number" && value > 0);
 
   return (
     <div className="space-y-4 text-sm text-text-secondary">
-      {Object.keys(resultSummary).length > 0 && (
+      {summaryBadges.length > 0 && (
         <div>
           <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Result Summary</p>
           <div className="flex flex-wrap gap-2">
-            {[
-              ["Verified findings", resultSummary.finding_count],
-              ["Critical", resultSummary.critical_count],
-              ["High", resultSummary.high_count],
-              ["Advisory correlated", resultSummary.advisory_correlated_count],
-              ["Reachable deps", resultSummary.reachable_dependency_count],
-              ["Function matches", resultSummary.function_matched_dependency_count],
-            ]
-              .filter(([, value]) => typeof value === "number" && value > 0)
-              .map(([label, value]) => (
-                <span key={label} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-bg-secondary px-2.5 py-1 text-xs">
-                  <span className="text-text-secondary">{label}</span>
-                  <span className="font-mono text-text-primary">{value}</span>
-                </span>
-              ))}
+            {summaryBadges.map(([label, value]) => (
+              <span key={label} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-bg-secondary px-2.5 py-1 text-xs">
+                <span className="text-text-secondary">{label}</span>
+                <span className="font-mono text-text-primary">{value}</span>
+              </span>
+            ))}
           </div>
         </div>
       )}
@@ -2267,20 +2889,81 @@ function ArchitectureAnalysisPanel({
               <div key={component.name} className="rounded-lg border border-border bg-bg-secondary/60 px-3 py-2">
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-medium text-text-primary">{component.name}</span>
-                  {component.criticality && (
-                    <span className="text-[10px] text-text-muted bg-bg-tertiary px-1.5 py-0.5 rounded">
-                      {formatDependencyLabel(component.criticality)}
-                    </span>
-                  )}
+                  <div className="flex items-center gap-1.5">
+                    {component.max_severity && (
+                      <span
+                        className={`text-[10px] px-1.5 py-0.5 rounded ${
+                          SEVERITY_COLORS[component.max_severity]?.bg || "bg-bg-tertiary"
+                        } ${SEVERITY_COLORS[component.max_severity]?.text || "text-text-muted"}`}
+                      >
+                        {formatDependencyLabel(component.max_severity)}
+                      </span>
+                    )}
+                    {component.criticality && (
+                      <span className="text-[10px] text-text-muted bg-bg-tertiary px-1.5 py-0.5 rounded">
+                        {formatDependencyLabel(component.criticality)}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-text-muted">
                   <span>{component.finding_count || 0} findings</span>
                   {(component.critical_count || 0) > 0 && <span className="text-accent-danger">{component.critical_count} critical</span>}
                   {(component.high_count || 0) > 0 && <span className="text-orange-400">{component.high_count} high</span>}
+                  {(component.medium_count || 0) > 0 && <span className="text-accent-warning">{component.medium_count} medium</span>}
+                  {component.in_attack_surface && <span className="text-accent-primary">attack surface</span>}
                 </div>
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {(attackSurfacePoints.length > 0 || entryPoints.length > 0 || dataFlows.length > 0) && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {attackSurfacePoints.length > 0 && (
+            <div>
+              <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Concrete Attack Surface</p>
+              <div className="space-y-1">
+                {attackSurfacePoints.slice(0, 5).map((point) => (
+                  <div key={point} className="rounded-lg bg-bg-secondary/60 px-2.5 py-1.5 text-xs font-mono text-text-secondary">
+                    {point}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {entryPoints.length > 0 && (
+            <div>
+              <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Entry Points</p>
+              <div className="space-y-1">
+                {entryPoints.slice(0, 4).map((entryPoint, index) => (
+                  <div key={`${formatArchitectureEntryPoint(entryPoint)}-${index}`} className="rounded-lg bg-bg-secondary/60 px-2.5 py-1.5 text-xs">
+                    <div className="font-medium text-text-primary">{formatArchitectureEntryPoint(entryPoint)}</div>
+                    {(entryPoint.auth || entryPoint.notes) && (
+                      <div className="mt-1 text-text-muted">
+                        {[entryPoint.auth ? `auth: ${entryPoint.auth}` : null, entryPoint.notes || null].filter(Boolean).join(" | ")}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {dataFlows.length > 0 && (
+            <div>
+              <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Data Flows</p>
+              <div className="space-y-1">
+                {dataFlows.slice(0, 4).map((flow, index) => (
+                  <div key={`${formatArchitectureDataFlow(flow)}-${index}`} className="rounded-lg bg-bg-secondary/60 px-2.5 py-1.5 text-xs">
+                    <div className="font-medium text-text-primary">{`${flow.from || "source"} -> ${flow.to || "destination"}`}</div>
+                    {flow.data && <div className="mt-1 text-text-muted">{flow.data}</div>}
+                    {flow.sensitive && <div className="mt-1 text-accent-warning">Sensitive data path</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -2306,6 +2989,7 @@ function ArchitectureAnalysisPanel({
                   <div key={`${auth.type || "auth"}-${index}`} className="rounded-lg bg-bg-secondary/60 px-2.5 py-1.5 text-xs">
                     <div className="font-medium text-text-primary">{formatDependencyLabel(auth.type || "unknown")}</div>
                     {auth.implementation && <div className="mt-1 text-text-muted">{truncateText(auth.implementation, 100)}</div>}
+                    {auth.weaknesses && <div className="mt-1 text-accent-warning">{truncateText(auth.weaknesses, 100)}</div>}
                   </div>
                 ))}
               </div>
@@ -2342,11 +3026,36 @@ function ArchitectureAnalysisPanel({
       {components.length > 0 && (
         <div>
           <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Architecture Components</p>
-          <div className="flex flex-wrap gap-1.5">
-            {components.slice(0, 8).map((component, index) => (
-              <span key={`${component.name || "component"}-${index}`} className="rounded-lg border border-border bg-bg-secondary px-2 py-1 text-xs">
-                {component.name || "Component"}
-              </span>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            {components.slice(0, 6).map((component, index) => (
+              <div key={`${component.name || "component"}-${index}`} className="rounded-lg border border-border bg-bg-secondary px-3 py-2 text-xs">
+                <div className="font-medium text-text-primary">{component.name || "Component"}</div>
+                {component.purpose && (
+                  <div className="mt-1 text-text-muted leading-relaxed">{truncateText(component.purpose, 110)}</div>
+                )}
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {component.criticality && (
+                    <span className="rounded bg-bg-tertiary px-2 py-0.5 text-[10px] text-text-muted">
+                      {formatDependencyLabel(component.criticality)}
+                    </span>
+                  )}
+                  {component.in_attack_surface && (
+                    <span className="rounded bg-accent-danger/10 px-2 py-0.5 text-[10px] text-accent-danger">
+                      attack surface
+                    </span>
+                  )}
+                  {component.handles_user_input && (
+                    <span className="rounded bg-accent-warning/10 px-2 py-0.5 text-[10px] text-accent-warning">
+                      user input
+                    </span>
+                  )}
+                  {(component.files?.length ?? 0) > 0 && (
+                    <span className="rounded bg-bg-tertiary px-2 py-0.5 text-[10px] text-text-muted">
+                      {component.files?.length} files
+                    </span>
+                  )}
+                </div>
+              </div>
             ))}
           </div>
         </div>
@@ -2366,14 +3075,215 @@ function ArchitectureAnalysisPanel({
   );
 }
 
+export function AttackPathPanel({
+  attackSurfacePoints,
+  entryPoints,
+  dataFlows,
+  fallbackMetrics,
+}: {
+  attackSurfacePoints: string[];
+  entryPoints: ArchitectureEntryPoint[];
+  dataFlows: ArchitectureDataFlow[];
+  fallbackMetrics?: Record<string, number> | null;
+}) {
+  const fallbackEntries = Object.entries(fallbackMetrics || {}).sort((a, b) => b[1] - a[1]);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-3">
+        <div className="w-9 h-9 rounded-lg bg-accent-danger/10 flex items-center justify-center">
+          <Crosshair className="w-4 h-4 text-accent-danger" />
+        </div>
+        <div>
+          <h3 className="text-sm font-semibold text-text-primary">Attack Paths</h3>
+          <p className="text-xs text-text-muted">Concrete entry points and security-relevant flows</p>
+        </div>
+      </div>
+
+      {attackSurfacePoints.length > 0 ? (
+        <>
+          <div className="flex flex-wrap gap-2">
+            <span className="rounded-lg border border-border bg-bg-secondary px-2.5 py-1 text-xs text-text-secondary">
+              <span className="font-mono text-text-primary">{attackSurfacePoints.length}</span> mapped surfaces
+            </span>
+            <span className="rounded-lg border border-border bg-bg-secondary px-2.5 py-1 text-xs text-text-secondary">
+              <span className="font-mono text-text-primary">{entryPoints.length}</span> entry points
+            </span>
+            <span className="rounded-lg border border-border bg-bg-secondary px-2.5 py-1 text-xs text-text-secondary">
+              <span className="font-mono text-text-primary">{dataFlows.length}</span> traced flows
+            </span>
+          </div>
+
+          <div className="space-y-2">
+            {attackSurfacePoints.slice(0, 5).map((point) => (
+              <div
+                key={point}
+                className="rounded-lg border border-accent-danger/15 bg-accent-danger/5 px-3 py-2 text-xs font-mono text-text-secondary"
+              >
+                {point}
+              </div>
+            ))}
+          </div>
+
+          {dataFlows.length > 0 && (
+            <div className="pt-3 border-t border-border/30">
+              <p className="text-[10px] text-text-muted uppercase tracking-wider font-medium mb-2">Flow Preview</p>
+              <div className="space-y-1.5">
+                {dataFlows.slice(0, 3).map((flow, index) => (
+                  <div key={`${formatArchitectureDataFlow(flow)}-${index}`} className="rounded-lg bg-bg-secondary/60 px-3 py-2 text-xs">
+                    <div className="font-medium text-text-primary">{`${flow.from || "source"} -> ${flow.to || "destination"}`}</div>
+                    {flow.data && <div className="mt-1 text-text-muted">{flow.data}</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      ) : fallbackEntries.length > 0 ? (
+        <div className="space-y-3">
+          <p className="text-xs text-text-muted">
+            Concrete routes were not mapped for this scan. Showing the finding-derived surface mix instead.
+          </p>
+          <div className="space-y-2">
+            {fallbackEntries.slice(0, 6).map(([label, count]) => (
+              <div key={label} className="space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-text-secondary">{label}</span>
+                  <span className="font-mono text-text-primary">{count}</span>
+                </div>
+                <div className="h-1.5 rounded-full bg-bg-secondary overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-accent-primary"
+                    style={{ width: `${Math.max(8, Math.min(100, count * 12))}%` }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <p className="text-sm text-text-muted">No concrete attack paths were mapped for this report.</p>
+      )}
+    </div>
+  );
+}
+
+export function ExploitChainsSection({ findings }: { findings: Finding[] }) {
+  return (
+    <section className="card-glow border-gradient space-y-4">
+      <div className="flex items-center gap-3">
+        <div className="w-8 h-8 rounded-lg bg-accent-danger/10 flex items-center justify-center">
+          <ListTree className="w-4 h-4 text-accent-danger" />
+        </div>
+        <div>
+          <h2 className="text-lg font-semibold">Exploit Chains</h2>
+          <p className="text-sm text-text-muted">Multi-step attack paths synthesized from verified findings and exploit evidence.</p>
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        {findings.map((finding) => {
+          const exploitEvidence = normalizeExploitEvidence(finding);
+          const steps = extractExploitChainSteps(finding);
+          const relatedPaths = uniqueStrings([
+            ...(exploitEvidence?.related_entry_points || []),
+            ...(exploitEvidence?.related_taint_flows || []),
+          ]);
+          const severityTone = SEVERITY_COLORS[finding.severity] || SEVERITY_COLORS.info;
+
+          return (
+            <div key={finding.id} className="rounded-2xl border border-border bg-bg-secondary/40 p-5">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="text-base font-semibold text-text-primary">{finding.title}</h3>
+                    <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider ${severityTone.bg} ${severityTone.text}`}>
+                      {finding.severity}
+                    </span>
+                    <span className="rounded-full bg-bg-tertiary px-2.5 py-1 text-[10px] font-mono text-text-muted">
+                      {Math.round((finding.confidence || 0) * 100)}% confidence
+                    </span>
+                  </div>
+                  <p className="mt-2 text-sm text-text-secondary leading-relaxed">{finding.description}</p>
+                </div>
+              </div>
+
+              {(exploitEvidence?.target_route || exploitEvidence?.attack_scenario || finding.impact) && (
+                <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                  {exploitEvidence?.target_route && (
+                    <div className="rounded-lg bg-bg-tertiary/70 px-3 py-2">
+                      <p className="text-[10px] uppercase tracking-wider text-text-muted mb-1">Target Route</p>
+                      <p className="font-mono text-xs text-text-primary">{exploitEvidence.target_route}</p>
+                    </div>
+                  )}
+                  {(exploitEvidence?.attack_scenario || finding.impact) && (
+                    <div className="rounded-lg bg-bg-tertiary/70 px-3 py-2 md:col-span-2">
+                      <p className="text-[10px] uppercase tracking-wider text-text-muted mb-1">Chain Outcome</p>
+                      <p className="text-text-secondary leading-relaxed">
+                        {exploitEvidence?.attack_scenario || finding.impact}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {relatedPaths.length > 0 && (
+                <div className="mt-4">
+                  <p className="text-[10px] uppercase tracking-wider text-text-muted mb-2">Chain Anchors</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {relatedPaths.slice(0, 8).map((path) => (
+                      <span key={`${finding.id}-${path}`} className="rounded-lg bg-bg-tertiary px-2 py-1 text-[11px] font-mono text-text-secondary">
+                        {path}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {steps.length > 0 && (
+                <div className="mt-4">
+                  <p className="text-[10px] uppercase tracking-wider text-text-muted mb-2">Observed Steps</p>
+                  <ol className="space-y-2">
+                    {steps.map((step, index) => (
+                      <li key={`${finding.id}-step-${index}`} className="flex gap-3 text-sm text-text-secondary">
+                        <span className="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent-primary/10 text-[10px] font-semibold text-accent-primary">
+                          {index + 1}
+                        </span>
+                        <span className="leading-relaxed">{step}</span>
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+
+              {exploitEvidence?.exploit_template && (
+                <div className="mt-4 rounded-lg overflow-hidden border border-border">
+                  <div className="bg-bg-tertiary px-3 py-1.5 border-b border-border">
+                    <span className="text-[10px] text-text-muted uppercase tracking-wider font-medium">Exploit Template</span>
+                  </div>
+                  <pre className="bg-[#0b0f19] text-[11px] leading-relaxed text-text-secondary overflow-x-auto p-4">
+                    {exploitEvidence.exploit_template}
+                  </pre>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function DiagramViewer({
   scanId,
   architectureData,
   hasDiagramImage,
+  diagramCount,
 }: {
   scanId: string;
   architectureData: ArchitecturePayload;
   hasDiagramImage: boolean;
+  diagramCount: number;
 }) {
   const [activeTab, setActiveTab] = useState(0);
   const [fullscreen, setFullscreen] = useState(false);
@@ -2382,11 +3292,18 @@ function DiagramViewer({
   const [dragging, setDragging] = useState(false);
   const dragStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const containerRef = useRef<HTMLDivElement>(null);
-  const diagrams =
+  const diagrams: ArchitectureDiagram[] =
     architectureData.diagrams.length > 0
       ? architectureData.diagrams
-      : hasDiagramImage
-      ? [{ title: "Architecture Overview", description: "Rendered report diagram", mermaid: "" }]
+      : (diagramCount > 0 || hasDiagramImage)
+      ? Array.from({ length: Math.max(diagramCount, hasDiagramImage ? 1 : 0) }, (_, index) => ({
+          title: index === 0 ? "Architecture Overview" : `Architecture Diagram ${index + 1}`,
+          description: "Rendered report diagram",
+          mermaid: "",
+          kind: undefined,
+          highlights: [],
+          imageUrl: `/api/scans/${scanId}/report/diagram/${index}`,
+        }))
       : [];
 
   // If no diagrams array, fall back to single diagram image
@@ -2395,11 +3312,23 @@ function DiagramViewer({
     return null;
   }
 
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
+  const handleWheel = useCallback((e: WheelEvent) => {
+    if (e.cancelable) {
+      e.preventDefault();
+    }
     const delta = e.deltaY > 0 ? -0.1 : 0.1;
     setZoom((z) => Math.max(0.3, Math.min(5, z + delta)));
   }, []);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    container.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      container.removeEventListener("wheel", handleWheel);
+    };
+  }, [handleWheel]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return;
@@ -2545,7 +3474,6 @@ function DiagramViewer({
           fullscreen ? "flex-1 m-4 mt-0" : ""
         }`}
         style={{ cursor: dragging ? "grabbing" : "grab", minHeight: fullscreen ? undefined : 400 }}
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
@@ -2563,7 +3491,12 @@ function DiagramViewer({
           <MermaidDiagram
             spec={diagrams[activeTab]?.mermaid || ""}
             id={`diagram-${activeTab}`}
-            fallbackImage={activeTab === 0 && hasDiagramImage ? `/api/scans/${scanId}/report/diagram` : undefined}
+            fallbackImage={
+              diagrams[activeTab]?.imageUrl
+              || (((diagramCount > activeTab) || (activeTab === 0 && hasDiagramImage))
+                ? `/api/scans/${scanId}/report/diagram/${activeTab}`
+                : undefined)
+            }
           />
         </div>
       </div>
@@ -2576,6 +3509,11 @@ function DiagramViewer({
           )}
           {diagrams[activeTab]?.kind && (
             <div className="flex flex-wrap gap-1.5">
+              {diagramFamilyLabel(diagrams[activeTab].kind) && (
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent-primary/10 text-accent-primary font-medium">
+                  {diagramFamilyLabel(diagrams[activeTab].kind)}
+                </span>
+              )}
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent-secondary/10 text-accent-secondary font-medium">
                 {formatDependencyLabel(diagrams[activeTab].kind || "diagram")}
               </span>

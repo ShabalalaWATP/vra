@@ -1,9 +1,12 @@
-import shutil
-
 from fastapi import APIRouter
 
 from app.config import settings
 from app.scanners.eslint import ESLintAdapter
+from app.tooling import (
+    get_bandit_display_path,
+    get_semgrep_display_path,
+    resolve_configured_binary,
+)
 
 router = APIRouter(tags=["health"])
 
@@ -18,15 +21,17 @@ async def tool_availability():
     """Check which scanners are available on this system."""
     tools = {}
 
-    for name, binary in [
-        ("semgrep", settings.semgrep_binary),
-        ("bandit", settings.bandit_binary),
-    ]:
-        path = shutil.which(binary)
-        tools[name] = {
-            "available": path is not None,
-            "path": path,
-        }
+    semgrep_path = get_semgrep_display_path()
+    tools["semgrep"] = {
+        "available": semgrep_path is not None,
+        "path": semgrep_path,
+    }
+
+    bandit_path = get_bandit_display_path()
+    tools["bandit"] = {
+        "available": bandit_path is not None,
+        "path": bandit_path,
+    }
 
     eslint_adapter = ESLintAdapter()
     eslint_available = await eslint_adapter.is_available()
@@ -75,7 +80,7 @@ async def tool_availability():
     }
 
     # CodeQL
-    codeql_path = shutil.which(settings.codeql_binary)
+    codeql_path = resolve_configured_binary(settings.codeql_binary)
     if not codeql_path:
         # Check project tools directory
         from pathlib import Path as _Path
@@ -90,10 +95,15 @@ async def tool_availability():
     }
 
     # jadx (APK decompiler)
-    from app.analysis.apk_decompiler import is_jadx_available, get_jadx_version
+    from app.analysis.apk_decompiler import (
+        get_jadx_binary_path,
+        get_jadx_version,
+        is_jadx_available,
+    )
     jadx_available = await is_jadx_available()
     tools["jadx"] = {
         "available": jadx_available,
+        "path": get_jadx_binary_path(),
         "version": await get_jadx_version() if jadx_available else None,
         "supports": [".apk", ".aab", ".dex", ".jar"],
     }

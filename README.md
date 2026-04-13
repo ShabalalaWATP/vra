@@ -37,7 +37,7 @@ VRAgent is **not** a scanner dashboard. It is **not** an LLM wrapper. It is a hy
   - [jadx Installation](#jadx-installation-for-apk-scanning)
   - [Windows 11 Installation](#windows-11-installation)
   - [Ubuntu Installation](#ubuntu-installation)
-  - [Offline Data Preparation](#offline-data-preparation)
+  - [Manual Offline Data Preparation](#manual-offline-data-preparation-advanced-fallback)
   - [First Run](#first-run)
 - [Configuration](#configuration)
 - [LLM Provider Setup](#llm-provider-setup)
@@ -70,10 +70,10 @@ VRAgent is **not** a scanner dashboard. It is **not** an LLM wrapper. It is a hy
 - **Obfuscation detection** — entropy-based and pattern-based detection of minified, packed, or obfuscated code with report-level noting
 - **Monorepo support** — workspace detection for Yarn, npm, Lerna, Gradle, Maven, Go workspaces
 - **Real-time progress** — WebSocket-driven live scan progress with phase tracking, ETA estimation, scan line animations, and terminal-style event logs
-- **Professional reports** — AI-generated narratives with 4 architecture diagrams, 7 Chart.js visualizations, OWASP mapping, component scorecard, SBOM, scan coverage, and risk scoring
-- **PDF & DOCX export** — structured reports with headings, tables, code blocks, severity labels, and embedded diagrams
-- **449 technology icons** — bundled SVG icons for languages, frameworks, databases, and cloud services, embedded in diagrams via base64 data URIs
-- **4 architecture diagrams** — System Overview, Security Architecture, Data Flow, and Attack Surface diagrams with fullscreen zoom/pan viewer
+- **Professional reports** — AI-generated application summaries, security narratives, multiple architecture diagrams, visual analytics, OWASP mapping, component scorecards, SBOM, scan coverage, and risk scoring
+- **PDF & DOCX export** — structured reports with headings, tables, code blocks, detailed PoC sections, and export-safe embedded diagrams
+- **Technology icon support** — bundled SVG icons for languages, frameworks, databases, and cloud services in the interactive diagram viewer, with export-safe diagram fallbacks
+- **Multiple architecture diagrams** — result-aware overview, trust boundary, hotspot, and dependency reachability diagrams with fullscreen zoom/pan viewer
 - **Scan history** — saved scans with search, status filtering, and delete functionality
 - **Cross-platform** — runs on Windows 11 and Ubuntu Linux
 - **Context-window aware** — supports 128K, 200K, and 400K token models with adaptive compaction
@@ -83,79 +83,28 @@ VRAgent is **not** a scanner dashboard. It is **not** an LLM wrapper. It is a hy
 
 ## Architecture Overview
 
+For non-technical audiences: VRAgent is a local security analyst workbench. A user starts a scan in the browser, the backend runs several security scanners and AI review stages against the codebase, then it stores evidence and serves back a report with findings, diagrams, and remediation guidance. The important operational point is that it is designed to run with local data and a local LLM endpoint rather than depending on internet services at runtime.
+
+For technical audiences: VRAgent is a FastAPI-based backend with a React frontend, usually run in single-process mode on `http://localhost:8000` with the built frontend served by the API. The backend orchestrates a 7-agent scan pipeline over a shared `ScanContext`, combines deterministic scanners with code-structure analysis modules, persists scan state in SQLite, streams progress over WebSockets, and renders report diagrams from Mermaid-based specifications into exportable assets.
+
+```mermaid
+flowchart TB
+    UI["Frontend\nReact 19 + Vite + Tailwind + Charts"] -->|"HTTP / WebSocket"| API["FastAPI backend"]
+
+    subgraph Core["Scan core"]
+        API --> REST["REST API + WebSocket endpoints"]
+        API --> ORCH["Scan orchestrator\n7 agents + planner + shared ScanContext"]
+        ORCH --> SCAN["Scanner adapters\nSemgrep | Bandit | ESLint | CodeQL | Secrets | DepAudit"]
+        ORCH --> ANALYSIS["Analysis modules\nCall graph | import resolution | taint tracking | doc intelligence | diagram rendering"]
+        ORCH --> DB["SQLite\nprojects | scans | findings | reports | exports"]
+    end
+
+    TOOLS["Local tools\nCodeQL CLI | jadx"] --> SCAN
+    DATA["Offline data\nSemgrep rules | advisories | icons | bundled frontend assets"] --> API
+    LLM["Local OpenAI-compatible endpoint"] <--> ORCH
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          FRONTEND (React 19)                          │
-│  Home │ Dashboard │ New Scan │ Progress │ Report │ History │ Settings  │
-│                                                                       │
-│  TypeScript · Tailwind CSS · Vite · Chart.js · WebSocket              │
-│  Locally bundled: JetBrains Mono font · lucide-react icons            │
-└───────────────────────────────┬──────────────────────────────────────┘
-                                │ HTTP / WebSocket
-┌───────────────────────────────┴──────────────────────────────────────┐
-│                         BACKEND (FastAPI)                              │
-│                                                                       │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────────────┐  │
-│  │  REST API     │  │  WebSocket   │  │  Background Task Runner     │  │
-│  │  /api/*       │  │  /ws/{id}    │  │  Scan Pipeline Orchestrator │  │
-│  └──────┬───────┘  └──────┬───────┘  └───────────┬─────────────────┘  │
-│         │                 │                       │                    │
-│  ┌──────┴─────────────────┴───────────────────────┴──────────────────┐│
-│  │                     SCAN ORCHESTRATOR                              ││
-│  │                                                                    ││
-│  │  ┌──────────┐ ┌───────────┐ ┌─────────────┐ ┌──────────────────┐  ││
-│  │  │ Triage   │→│Architecture│→│ Dependency  │→│  Investigator    │  ││
-│  │  │ Agent    │ │ Agent      │ │ Risk Agent  │ │  Agent (agentic) │  ││
-│  │  └──────────┘ └───────────┘ └─────────────┘ └────────┬─────────┘  ││
-│  │       │                                               │            ││
-│  │       │  ┌───────────────┐ ┌───────────┐ ┌──────────┐│            ││
-│  │       │  │ Rule Selector │←│  Verifier │←│ Reporter ││            ││
-│  │       │  │ Agent         │ │  Agent    │ │ Agent    │←┘           ││
-│  │       │  └───────────────┘ └───────────┘ └──────────┘             ││
-│  │       │                                                            ││
-│  │  ┌────┴────────────────────────────────────────────────────────┐   ││
-│  │  │ Planner (7 actions) · 20 AI Tools · Doc Intelligence       │   ││
-│  │  │ ScanContext · LLMClient · AgentToolkit · EventBus           │   ││
-│  │  └────────────────────────────────────────────────────────────┘   ││
-│  └───────────────────────────────────────────────────────────────────┘│
-│                                                                       │
-│  ┌────────────────────────────────────────────────────────────────┐   │
-│  │                      SCANNER ADAPTERS                          │   │
-│  │  Semgrep │ Bandit │ ESLint │ CodeQL │ Secrets │ DepAudit      │   │
-│  └────────────────────────────────────────────────────────────────┘   │
-│                                                                       │
-│  ┌────────────────────────────────────────────────────────────────┐   │
-│  │                     ANALYSIS MODULES                           │   │
-│  │  CallGraph · ImportResolver · TaintTracking · InterProcedural  │   │
-│  │  TreeSitter · FileScorer · Obfuscation · Diagram · DocIntel    │   │
-│  └────────────────────────────────────────────────────────────────┘   │
-│                                                                       │
-│  ┌────────────────────────────────────────────────────────────────┐   │
-│  │                     EXTERNAL TOOLS                             │   │
-│  │  CodeQL CLI (2,000+ queries) │ jadx (APK decompiler)          │   │
-│  └────────────────────────────────────────────────────────────────┘   │
-│                                                                       │
-│  Python 3.11+ · FastAPI · SQLAlchemy · Pydantic · httpx · matplotlib  │
-└───────────────────────────────┬──────────────────────────────────────┘
-                                │
-┌───────────────────────────────┴──────────────────────────────────────┐
-│                         SQLITE DATABASE                                │
-│  projects · scans · files · findings · evidence · reports · exports   │
-│  dependencies · secrets · scanner_results · symbols · agent_decisions │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-┌───────────────────────────────┴──────────────────────────────────────┐
-│                       OFFLINE DATA STORES                             │
-│  1,952 Semgrep rules │ Curated ESLint JS/TS policy │ CodeQL query packs │
-│  257K OSV advisories │ 449 technology SVG icons │ Bundled fonts        │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-┌───────────────────────────────┴──────────────────────────────────────┐
-│                    LOCAL LLM ENDPOINT                                  │
-│  Any OpenAI-compatible API — auto-detects /v1/, /chat/completions,    │
-│  /api/v1/ paths. Works with vLLM, Ollama, llama.cpp, LocalAI, TGI    │
-└──────────────────────────────────────────────────────────────────────┘
-```
+
+The application's report diagrams are already Mermaid-based; the README diagram now uses Mermaid as well so the mental model matches what the product renders later in reports.
 
 ---
 
@@ -803,23 +752,93 @@ VRAgent is designed for environments with no direct internet access at runtime. 
 
 > **Key distinction:** `pip install`, `npm install`, `git clone`, and GitHub release downloads all work via your organisation's internal mirrors. The constraint is that the **running application** makes no internet calls — all LLM communication goes to a local endpoint, all scanner rules/advisories/icons are bundled locally, and the frontend has no external CDN dependencies.
 
+### Setup At A Glance
+
+Use one of these setup paths:
+
+1. **Ubuntu clone-only path**: prepare and commit `vendor/ubuntu/` from a connected Ubuntu machine, then on the target VM run `git clone`, `bash ./install.sh --offline`, and `bash ./start.sh`.
+2. **Air-gap bundle path**: build `vragent-airgap-bundle.tar.gz` on a connected machine, transfer it out-of-band, then run `bash ./install.sh --offline` or `.\install.ps1 -Offline`.
+3. **Mirror-backed install path**: if the target machine already has access to internal `pip` and `npm` mirrors, clone the repo and run the normal install script without vendoring.
+
+In the preferred runtime, open `http://localhost:8000`. Use `http://localhost:3000` only when you intentionally start the separate Vite dev server or Docker Compose frontend.
+
+### Recommended Transfer Artifact
+
+For a truly air-gapped machine, prepare a single transfer bundle on a connected machine with the same OS and CPU architecture as the target host:
+
+```bash
+cd backend
+python -m scripts.prepare_airgap_bundle --output ../vragent-airgap-bundle.tar.gz
+```
+
+That bundle contains the current repo snapshot, an offline Python wheelhouse, an offline `frontend/node_modules` archive, and optional offline copies of CodeQL and jadx.
+
+Important Git/GitHub behavior:
+- If you commit the `.tar.gz` into the repository, GitHub stores it in Git history and every clone/fetch downloads it.
+- Keep large air-gap bundles out of Git history. Publish them as release assets or transfer them out-of-band instead.
+
+### Clone-Only Ubuntu Repository Path
+
+If you want a plain `git clone` on Ubuntu to carry the scanner/runtime dependencies with the repo, commit a populated `vendor/ubuntu/` tree. Build it on the same Ubuntu architecture and Python minor version as the target VM:
+
+```text
+vendor/ubuntu/
+├── python/              # wheelhouse for backend deps + semgrep + bandit
+├── tools/python_vendor/ # pre-bundled Semgrep + Bandit runtime
+├── tools/codeql/        # Linux CodeQL bundle
+├── tools/jadx/          # jadx distribution
+└── node_modules.tar.gz  # optional frontend tooling archive
+```
+
+Prepare that tree on a connected Ubuntu machine:
+
+```bash
+cd backend
+python -m scripts.prepare_ubuntu_vendor --include-node-modules
+```
+
+Use `--include-node-modules` if you want the target VM to install with `--offline` and never touch the npm mirror. If you are happy for the target VM to use your internal npm mirror, you can omit that flag and let `install.sh` fetch frontend dependencies there.
+
+After `vendor/ubuntu/` is committed, the target Ubuntu VM flow is:
+
+```bash
+git clone <your-vragent-repo-url>
+cd vragent
+bash ./install.sh --offline
+bash ./start.sh
+```
+
+If you intentionally want to use your internal mirrors for backend/frontend packages instead of the vendored wheelhouse or `node_modules.tar.gz`, run `bash ./install.sh` without `--offline`.
+
+In clone-only mode, a plain GitHub clone carries:
+- the Semgrep rules
+- the advisory database
+- the bundled Semgrep + Bandit runtime
+- the Linux CodeQL bundle
+- jadx
+- a Python wheelhouse containing backend deps plus Semgrep and Bandit
+- optionally a frontend `node_modules` archive
+
+The large npm advisory feed also has a repo-safe mirror at `backend/data/advisories/npm/advisories.json.gz`. If the clone does not have `git-lfs`, the app automatically falls back to that gzip copy, so the advisory database still loads on Ubuntu.
+
 ### Prerequisites
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | Python | 3.11 or higher | Backend runtime |
 | Node.js | 18 or higher | Frontend build |
+| Java Runtime | 11 or higher | Required if you want APK decompilation via jadx |
 | SQLite | bundled | Data persistence |
 | Git | 2.x | Optional — for repo analysis features |
-| Semgrep | Latest | Static analysis scanner |
-| Bandit | Latest | Python security scanner |
-| CodeQL | Latest | Semantic analysis (optional but recommended) |
+| Semgrep | bundled by install | Static analysis scanner |
+| Bandit | bundled by install | Python security scanner |
+| CodeQL | bundled by install (optional) | Semantic analysis |
 
 ---
 
-### Offline Data Preparation
+### Manual Offline Data Preparation (Advanced Fallback)
 
-Since pip/npm/GitHub are available via internal mirrors, these commands can be run directly on the deployment system.
+Only use this section if you are not using the `vendor/ubuntu/` flow or the `prepare_airgap_bundle` script. Since pip/npm/GitHub are available via internal mirrors, these commands can be run directly on the deployment system.
 
 #### 1. Clone the VRAgent Repository
 
@@ -1074,11 +1093,22 @@ pip install bandit
 bandit --version
 ```
 
+#### Fast Path: Install from the Air-Gap Bundle
+
+```powershell
+tar xzf vragent-airgap-bundle.tar.gz
+cd vragent
+.\install.ps1 -Offline
+.\start.ps1
+```
+
+Open your browser to `http://localhost:8000`
+
 #### Step 2: Extract VRAgent
 
 ```powershell
 # Extract the transfer bundle
-tar xzf vragent-offline-bundle.tar.gz
+tar xzf vragent-airgap-bundle.tar.gz
 cd vragent
 ```
 
@@ -1136,17 +1166,24 @@ python -m alembic upgrade head
 
 #### Step 8: Start VRAgent
 
-Open two terminal windows:
+Preferred runtime:
 
-**Terminal 1 — Backend:**
 ```powershell
-cd vragent\backend
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+cd vragent
+.\start.ps1
 ```
 
-**Terminal 2 — Frontend:**
+Open your browser to `http://localhost:8000`
+
+Development mode is still available if you want the Vite dev server:
+
 ```powershell
-cd vragent\frontend
+# Terminal 1
+cd vragent\backend
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# Terminal 2
+cd ..\frontend
 npm run dev
 ```
 
@@ -1187,6 +1224,32 @@ sudo apt install -y libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 \
     libcairo2 libffi-dev shared-mime-info
 ```
 
+#### Fast Path A: Clone-Only Ubuntu Repo
+
+Use this when `vendor/ubuntu/` has been committed to GitHub and includes the full offline payload:
+
+```bash
+git clone <your-vragent-repo-url>
+cd vragent
+bash ./install.sh --offline
+bash ./start.sh
+```
+
+Open your browser to `http://localhost:8000`
+
+If you intentionally want to use your internal `pip` and `npm` mirrors instead of the vendored wheelhouse or `node_modules.tar.gz`, run `bash ./install.sh` without `--offline`.
+
+#### Fast Path B: Install from the Air-Gap Bundle
+
+```bash
+tar xzf vragent-airgap-bundle.tar.gz
+cd vragent
+bash ./install.sh --offline
+bash ./start.sh
+```
+
+Open your browser to `http://localhost:8000`
+
 #### Step 2: Prepare SQLite database path
 
 ```bash
@@ -1199,7 +1262,7 @@ cd ..
 #### Step 3: Extract VRAgent
 
 ```bash
-tar xzf vragent-offline-bundle.tar.gz
+tar xzf vragent-airgap-bundle.tar.gz
 cd vragent
 ```
 
@@ -1220,8 +1283,8 @@ pip install -e ".[dev]"
 #### Step 5: Install Semgrep and Bandit
 
 ```bash
-# These are Python packages, installed via pip:
-pip install semgrep bandit
+# From offline wheels:
+pip install --no-index --find-links=../offline-packages/python semgrep bandit
 
 # Verify:
 semgrep --version
@@ -1265,6 +1328,17 @@ python -m alembic upgrade head
 
 #### Step 10: Start VRAgent
 
+Preferred runtime:
+
+```bash
+cd ..
+bash ./start.sh
+```
+
+Open your browser to `http://localhost:8000`
+
+Development mode is still available if you want the Vite dev server:
+
 **Option A: Using Make**
 
 ```bash
@@ -1302,11 +1376,12 @@ This starts the backend and frontend in containers and persists the SQLite datab
 
 ### First Run
 
-1. Open `http://localhost:3000` in your browser
+1. Open `http://localhost:8000` in your browser for the preferred single-process runtime.
 2. Go to **Settings** and configure your LLM provider:
    - **Base URL**: your local OpenAI-compatible endpoint (e.g., `http://localhost:8080/v1`)
    - **API Key**: your endpoint's API key (or any string if auth is not required)
    - **Model Name**: the model identifier (e.g., `llama-3.1-70b`, `qwen2.5-72b`, `mistral-large`)
+   - **Cert Path**: optional PEM CA bundle path if your internal HTTPS endpoint uses a private CA or self-signed certificate
    - **Context Window**: select the model's context window size (128K, 200K, or 400K tokens)
    - **Max Output Tokens**: maximum tokens per completion (recommended: 4096)
    - Click **Test Connection** to verify
@@ -1400,6 +1475,8 @@ Different LLM servers use different field names for the output token limit:
 - **`max_completion_tokens`** — used by newer OpenAI API, vLLM, newer Ollama
 
 Toggle the **"Use max_completion_tokens"** checkbox in LLM Settings to match your server. If unsure, try with it unchecked first. If you get errors about unknown parameters, toggle it.
+
+If your internal LLM endpoint is exposed over HTTPS with a private CA or self-signed certificate, set the **Cert Path** field in LLM Settings to the local PEM bundle the backend should trust.
 
 ---
 

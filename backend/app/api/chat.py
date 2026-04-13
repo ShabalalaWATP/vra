@@ -105,16 +105,16 @@ async def stream_chat(
         raise HTTPException(404, "Scan not found")
 
     # Get the active LLM profile
-    result = await db.execute(
-        select(LLMProfile).where(LLMProfile.is_default == True)
-    )
-    profile = result.scalar_one_or_none()
+    profile = None
+    if scan.llm_profile_id:
+        profile = await db.get(LLMProfile, scan.llm_profile_id)
     if not profile:
-        # Fall back to scan's profile
-        if scan.llm_profile_id:
-            profile = await db.get(LLMProfile, scan.llm_profile_id)
-        if not profile:
-            raise HTTPException(400, "No LLM profile configured. Add one in Settings.")
+        result = await db.execute(
+            select(LLMProfile).where(LLMProfile.is_default == True)
+        )
+        profile = result.scalar_one_or_none()
+    if not profile:
+        raise HTTPException(400, "No LLM profile configured. Add one in Settings.")
 
     # Get report
     report_result = await db.execute(
@@ -443,6 +443,7 @@ async def stream_chat(
         "/v1/chat/completions",
         "/chat/completions",
         "/api/v1/chat/completions",
+        "/api/chat/completions",
     ]
 
     headers = {}
@@ -470,7 +471,7 @@ async def stream_chat(
     async def generate():
         async with httpx.AsyncClient(
             base_url=profile.base_url,
-            timeout=120,
+            timeout=profile.timeout_seconds,
             verify=ssl_context or True,
         ) as client:
             current_messages = list(messages)
@@ -481,6 +482,8 @@ async def stream_chat(
                 # (streaming + tool calls is complex, so do tool resolution non-streaming)
                 if tool_round < max_tool_rounds:
                     last_error = None
+                    request_succeeded = False
+                    tool_calls = None
                     for path in chat_paths:
                         try:
                             resp = await client.post(
@@ -489,9 +492,10 @@ async def stream_chat(
                             )
                             if resp.status_code == 404:
                                 continue
+                            request_succeeded = True
                             if resp.status_code != 200:
-                                yield f"data: {json.dumps({'error': f'LLM error {resp.status_code}: {resp.text[:200]}'})}\n\n"
-                                return
+                                last_error = f"LLM error {resp.status_code}: {resp.text[:200]}"
+                                break
 
                             data = resp.json()
                             choice = data.get("choices", [{}])[0]
@@ -542,12 +546,15 @@ async def stream_chat(
                         except Exception as e:
                             last_error = str(e)
                             break
-                    else:
-                        # All paths failed
-                        yield f"data: {json.dumps({'error': last_error or 'No chat endpoint found'})}\n\n"
+                    if not request_succeeded and last_error is None:
+                        yield f"data: {json.dumps({'error': 'No chat endpoint found'})}\n\n"
                         return
-                    if not tool_calls:
-                        break
+                    if last_error is not None and not tool_calls:
+                        yield f"data: {json.dumps({'error': last_error})}\n\n"
+                        return
+                    if tool_calls:
+                        continue
+                    return
                 else:
                     # Max tool rounds reached — do final streaming call without tools
                     for path in chat_paths:

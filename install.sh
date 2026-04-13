@@ -22,12 +22,25 @@
 #   ./install.sh --skip-data        # Skip data downloads
 #   ./install.sh --db-path backend/data/custom.db
 #
+# Vendored Ubuntu assets at vendor/ubuntu/ are automatically preferred when present.
+#
 set -euo pipefail
 
 # ── Configuration ───────────────────────────────────────────────────
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND="$ROOT/backend"
 FRONTEND="$ROOT/frontend"
+OFFLINE_ROOT="$ROOT/offline-packages"
+OFFLINE_PYTHON="$OFFLINE_ROOT/python"
+OFFLINE_NODE="$OFFLINE_ROOT/node_modules.tar.gz"
+OFFLINE_TOOLS="$OFFLINE_ROOT/tools"
+VENDOR_ROOT="$ROOT/vendor/ubuntu"
+VENDOR_PYTHON="$VENDOR_ROOT/python"
+VENDOR_NODE="$VENDOR_ROOT/node_modules.tar.gz"
+VENDOR_SCANNERS="$VENDOR_ROOT/tools/python_vendor"
+VENDOR_CODEQL="$VENDOR_ROOT/tools/codeql"
+VENDOR_JADX="$VENDOR_ROOT/tools/jadx"
+LOCAL_SCANNERS="$BACKEND/tools/python_vendor"
 
 OFFLINE=false
 SKIP_CODEQL=false
@@ -74,6 +87,13 @@ warn()   { echo -e "  ${YELLOW}[!]${NC} $1"; }
 err()    { echo -e "  ${RED}[X]${NC} $1"; }
 
 has_cmd() { command -v "$1" &>/dev/null; }
+
+copy_tree() {
+    local src="$1"
+    local dest="$2"
+    mkdir -p "$dest"
+    cp -R "$src"/. "$dest/"
+}
 
 header() {
     printf "\n${CYAN}%s${NC}\n" "$(printf '=%.0s' {1..60})"
@@ -131,14 +151,24 @@ header "Installing Backend Dependencies"
 cd "$BACKEND"
 
 if [[ "$OFFLINE" == true ]]; then
-    OFFLINE_DIR="$ROOT/offline-packages/python"
-    if [[ -d "$OFFLINE_DIR" ]]; then
-        step "Installing from offline packages: $OFFLINE_DIR"
-        $PIP install --no-index --find-links="$OFFLINE_DIR" -e ".[dev]" 2>&1 | tail -1
+    if [[ -d "$VENDOR_PYTHON" ]]; then
+        step "Installing from vendored Ubuntu wheelhouse: $VENDOR_PYTHON"
+        $PIP install --no-index --find-links="$VENDOR_PYTHON" -e ".[dev]" 2>&1 | tail -1
+    elif [[ -d "$OFFLINE_PYTHON" ]]; then
+        step "Installing from offline packages: $OFFLINE_PYTHON"
+        $PIP install --no-index --find-links="$OFFLINE_PYTHON" -e ".[dev]" 2>&1 | tail -1
     else
-        err "Offline packages not found: $OFFLINE_DIR"
-        err "Prepare offline packages first (see README.md)"
+        err "No vendored Ubuntu wheelhouse or offline wheelhouse found."
+        err "Expected one of:"
+        err "  - $VENDOR_PYTHON"
+        err "  - $OFFLINE_PYTHON"
         exit 1
+    fi
+elif [[ -d "$VENDOR_PYTHON" ]]; then
+    step "Installing from vendored Ubuntu wheelhouse: $VENDOR_PYTHON"
+    if ! $PIP install --no-index --find-links="$VENDOR_PYTHON" -e ".[dev]" 2>&1 | tail -1; then
+        warn "Vendored Ubuntu wheelhouse install failed; falling back to PyPI/internal mirror."
+        $PIP install -e ".[dev]" 2>&1 | tail -1
     fi
 else
     step "Installing Python packages from PyPI..."
@@ -146,26 +176,45 @@ else
 fi
 step "Backend dependencies installed"
 
-# Semgrep
-if has_cmd semgrep; then
-    step "Semgrep already installed: $(semgrep --version 2>&1)"
+# Bundle Semgrep + Bandit locally under backend/tools/
+if [[ -d "$VENDOR_SCANNERS" ]]; then
+    step "Restoring bundled Python scanners from vendored assets..."
+    rm -rf "$LOCAL_SCANNERS"
+    mkdir -p "$(dirname "$LOCAL_SCANNERS")"
+    copy_tree "$VENDOR_SCANNERS" "$LOCAL_SCANNERS"
+elif [[ "$OFFLINE" == true && -d "$OFFLINE_TOOLS/python_vendor" ]]; then
+    step "Restoring bundled Python scanners from offline bundle..."
+    rm -rf "$LOCAL_SCANNERS"
+    mkdir -p "$(dirname "$LOCAL_SCANNERS")"
+    copy_tree "$OFFLINE_TOOLS/python_vendor" "$LOCAL_SCANNERS"
 else
-    step "Installing Semgrep..."
-    $PIP install semgrep 2>&1 | tail -1
-    if has_cmd semgrep; then
-        step "Semgrep installed: $(semgrep --version 2>&1)"
+    step "Bundling project-local Python scanners..."
+    if [[ "$OFFLINE" == true ]]; then
+        if [[ ! -d "$OFFLINE_PYTHON" ]]; then
+            err "Offline Python packages not found: $OFFLINE_PYTHON"
+            exit 1
+        fi
+        $PYTHON -m scripts.bundle_python_scanners --no-index --wheelhouse "$OFFLINE_PYTHON" 2>&1 | tail -3
+    elif [[ -d "$VENDOR_PYTHON" ]]; then
+        if ! $PYTHON -m scripts.bundle_python_scanners --no-index --wheelhouse "$VENDOR_PYTHON" 2>&1 | tail -3; then
+            warn "Vendored scanner bundle failed; falling back to live download."
+            $PYTHON -m scripts.bundle_python_scanners 2>&1 | tail -3
+        fi
     else
-        warn "Semgrep installation may have failed"
+        $PYTHON -m scripts.bundle_python_scanners 2>&1 | tail -3
     fi
 fi
 
-# Bandit
-if has_cmd bandit; then
-    step "Bandit already installed"
+if [[ -f "$BACKEND/tools/bin/run_semgrep.py" && -d "$LOCAL_SCANNERS" ]]; then
+    step "Bundled Semgrep ready: $($PYTHON "$BACKEND/tools/bin/run_semgrep.py" --version 2>&1 | head -1)"
 else
-    step "Installing Bandit..."
-    $PIP install bandit 2>&1 | tail -1
-    has_cmd bandit && step "Bandit installed" || warn "Bandit installation may have failed"
+    warn "Bundled Semgrep was not created successfully."
+fi
+
+if [[ -f "$BACKEND/tools/bin/run_bandit.py" && -d "$LOCAL_SCANNERS" ]]; then
+    step "Bundled Bandit ready: $($PYTHON "$BACKEND/tools/bin/run_bandit.py" --version 2>&1 | head -1)"
+else
+    warn "Bundled Bandit was not created successfully."
 fi
 
 cd "$ROOT"
@@ -176,14 +225,19 @@ header "Installing Frontend Dependencies"
 cd "$FRONTEND"
 
 if [[ "$OFFLINE" == true ]]; then
-    OFFLINE_MODULES="$ROOT/offline-packages/node_modules.tar.gz"
-    if [[ -f "$OFFLINE_MODULES" ]]; then
+    if [[ -f "$VENDOR_NODE" ]]; then
+        step "Extracting vendored Ubuntu node_modules..."
+        tar xzf "$VENDOR_NODE"
+    elif [[ -f "$OFFLINE_NODE" ]]; then
         step "Extracting offline node_modules..."
-        tar xzf "$OFFLINE_MODULES"
+        tar xzf "$OFFLINE_NODE"
     else
-        err "Offline node_modules not found: $OFFLINE_MODULES"
+        err "No vendored Ubuntu node_modules archive or offline node_modules archive found."
         exit 1
     fi
+elif [[ -f "$VENDOR_NODE" ]]; then
+    step "Extracting vendored Ubuntu node_modules..."
+    tar xzf "$VENDOR_NODE"
 else
     if [[ -f "$FRONTEND/package-lock.json" ]]; then
         step "Running npm ci..."
@@ -208,7 +262,17 @@ fi
 cd "$ROOT"
 
 # ── Download CodeQL ─────────────────────────────────────────────────
-if [[ "$SKIP_CODEQL" == false && "$OFFLINE" == false ]]; then
+if [[ -f "$BACKEND/tools/codeql/codeql" ]]; then
+    header "CodeQL"
+    step "CodeQL already installed at: $BACKEND/tools/codeql/codeql"
+elif [[ -f "$VENDOR_CODEQL/codeql" ]]; then
+    header "CodeQL (Vendored Ubuntu Bundle)"
+    step "Restoring CodeQL from $VENDOR_CODEQL"
+    rm -rf "$BACKEND/tools/codeql"
+    copy_tree "$VENDOR_CODEQL" "$BACKEND/tools/codeql"
+    chmod +x "$BACKEND/tools/codeql/codeql" || true
+    step "CodeQL restored to $BACKEND/tools/codeql/codeql"
+elif [[ "$SKIP_CODEQL" == false && "$OFFLINE" == false ]]; then
     header "Installing CodeQL"
 
     CODEQL_BIN="$BACKEND/tools/codeql/codeql"
@@ -237,6 +301,12 @@ elif [[ "$SKIP_CODEQL" == true ]]; then
 elif [[ "$OFFLINE" == true ]]; then
     header "CodeQL (Offline Mode)"
     CODEQL_BIN="$BACKEND/tools/codeql/codeql"
+    OFFLINE_CODEQL="$OFFLINE_TOOLS/codeql"
+    if [[ ! -f "$CODEQL_BIN" && -d "$OFFLINE_CODEQL" ]]; then
+        step "Restoring CodeQL from offline bundle..."
+        mkdir -p "$BACKEND/tools/codeql"
+        cp -R "$OFFLINE_CODEQL"/. "$BACKEND/tools/codeql/"
+    fi
     if [[ -f "$CODEQL_BIN" ]]; then
         step "CodeQL found at: $CODEQL_BIN"
     else
@@ -248,7 +318,17 @@ elif [[ "$OFFLINE" == true ]]; then
 fi
 
 # ── Download jadx ──────────────────────────────────────────────────
-if [[ "$OFFLINE" == false ]]; then
+if [[ -f "$BACKEND/tools/jadx/bin/jadx" ]]; then
+    header "jadx (APK decompiler)"
+    step "jadx already installed at: $BACKEND/tools/jadx/bin/jadx"
+elif [[ -f "$VENDOR_JADX/bin/jadx" ]]; then
+    header "jadx (Vendored Ubuntu Bundle)"
+    step "Restoring jadx from $VENDOR_JADX"
+    rm -rf "$BACKEND/tools/jadx"
+    copy_tree "$VENDOR_JADX" "$BACKEND/tools/jadx"
+    chmod +x "$BACKEND/tools/jadx/bin/jadx" || true
+    step "jadx restored to $BACKEND/tools/jadx/bin/jadx"
+elif [[ "$OFFLINE" == false ]]; then
     header "Installing jadx (APK decompiler)"
 
     JADX_BIN="$BACKEND/tools/jadx/bin/jadx"
@@ -275,6 +355,12 @@ if [[ "$OFFLINE" == false ]]; then
 elif [[ "$OFFLINE" == true ]]; then
     header "jadx (Offline Mode)"
     JADX_BIN="$BACKEND/tools/jadx/bin/jadx"
+    OFFLINE_JADX="$OFFLINE_TOOLS/jadx"
+    if [[ ! -f "$JADX_BIN" && -d "$OFFLINE_JADX" ]]; then
+        step "Restoring jadx from offline bundle..."
+        mkdir -p "$BACKEND/tools/jadx"
+        cp -R "$OFFLINE_JADX"/. "$BACKEND/tools/jadx/"
+    fi
     if [[ -f "$JADX_BIN" ]]; then
         step "jadx found at: $JADX_BIN"
     else
@@ -358,9 +444,12 @@ check_item() {
 }
 
 check_item "Python backend"      "test -f $BACKEND/app/main.py"
+check_item "Vendored Ubuntu wheelhouse" "test -d $VENDOR_PYTHON"
+check_item "Vendored Ubuntu CodeQL" "test -f $VENDOR_CODEQL/codeql"
+check_item "Vendored Ubuntu jadx" "test -f $VENDOR_JADX/bin/jadx"
 check_item "Frontend node_modules" "test -d $FRONTEND/node_modules"
-check_item "Semgrep"             "has_cmd semgrep"
-check_item "Bandit"              "has_cmd bandit"
+check_item "Bundled Semgrep"     "test -f $BACKEND/tools/bin/run_semgrep.py -a -d $BACKEND/tools/python_vendor"
+check_item "Bundled Bandit"      "test -f $BACKEND/tools/bin/run_bandit.py -a -d $BACKEND/tools/python_vendor"
 check_item "ESLint"              "test -x $FRONTEND/node_modules/.bin/eslint"
 check_item "CodeQL"              "test -f $BACKEND/tools/codeql/codeql"
 check_item "jadx"                "test -f $BACKEND/tools/jadx/bin/jadx"
@@ -370,14 +459,12 @@ check_item "Advisory database"   "test -f $BACKEND/data/advisories/manifest.json
 echo ""
 echo -e "  ${CYAN}To start VRAgent:${NC}"
 echo ""
-echo -e "    Terminal 1 (Backend):"
-echo -e "      cd backend"
-echo -e "      source venv/bin/activate  # if using venv"
-echo -e "      uvicorn app.main:app --host 0.0.0.0 --port 8000"
+echo -e "    Preferred runtime (single process, serves frontend/dist):"
+echo -e "      bash ./start.sh"
+echo -e "      Then open: ${CYAN}http://localhost:8000${NC}"
 echo ""
-echo -e "    Terminal 2 (Frontend):"
-echo -e "      cd frontend"
-echo -e "      npm run dev"
-echo ""
-echo -e "    Then open: ${CYAN}http://localhost:3000${NC}"
+echo -e "    Development mode (two processes):"
+echo -e "      Terminal 1: cd backend && source venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+echo -e "      Terminal 2: cd frontend && npm run dev"
+echo -e "      Then open: ${CYAN}http://localhost:3000${NC}"
 echo ""

@@ -51,16 +51,15 @@ class BaseAgent(ABC):
 
     async def emit(self, ctx: ScanContext, message: str, *, level: str = "info", detail: dict | None = None):
         """Emit a log event to both WebSocket and database."""
-        await event_bus.publish(ctx.scan_id, {
-            "type": "event",
-            "phase": ctx.current_phase,
-            "level": level,
-            "message": message,
-            "detail": detail,
-        })
+        skip_publish = False
         # Persist to scan_events table
         try:
             async with async_session() as session:
+                scan = await session.get(Scan, ctx.scan_id)
+                if scan and scan.status == "cancelled":
+                    ctx.cancelled = True
+                    skip_publish = True
+                    return
                 event = ScanEvent(
                     scan_id=ctx.scan_id,
                     phase=ctx.current_phase,
@@ -72,6 +71,17 @@ class BaseAgent(ABC):
                 await session.commit()
         except Exception:
             pass  # Don't let event persistence failures break the scan
+
+        if skip_publish or ctx.cancelled:
+            return
+
+        await event_bus.publish(ctx.scan_id, {
+            "type": "event",
+            "phase": ctx.current_phase,
+            "level": level,
+            "message": message,
+            "detail": detail,
+        })
 
     async def emit_progress(self, ctx: ScanContext, task: str | None = None):
         """
@@ -86,6 +96,9 @@ class BaseAgent(ABC):
         async with async_session() as session:
             scan = await session.get(Scan, ctx.scan_id)
             if scan:
+                if scan.status == "cancelled":
+                    ctx.cancelled = True
+                    return
                 scan.current_phase = ctx.current_phase
                 scan.current_task = ctx.current_task
                 scan.files_processed = ctx.files_processed
@@ -93,6 +106,9 @@ class BaseAgent(ABC):
                 scan.findings_count = len([f for f in ctx.candidate_findings if f.confidence >= 0.5])
                 scan.ai_calls_made = ctx.ai_calls_made
                 await session.commit()
+
+        if ctx.cancelled:
+            return
 
         # Emit WebSocket progress event with counters
         await event_bus.publish(ctx.scan_id, {

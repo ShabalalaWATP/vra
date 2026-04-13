@@ -1,4 +1,5 @@
-.PHONY: dev setup db migrate backend frontend install install-all clean \
+.PHONY: dev setup db migrate backend frontend serve install install-all clean \
+       airgap-bundle ubuntu-vendor \
        download-rules download-advisories download-icons download-codeql download-data \
        check-tools
 
@@ -20,6 +21,9 @@ backend:
 frontend:
 	cd frontend && npm run dev
 
+serve:
+	cd backend && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
 # ── Installation ─────────────────────────────────────────────────
 # Install Python + Node dependencies only
 install:
@@ -36,6 +40,12 @@ install-all: install install-scanners download-data download-codeql download-jad
 install-scanners:
 	pip install semgrep bandit
 	@echo "ESLint is installed locally in frontend/node_modules via the frontend install step."
+
+airgap-bundle:
+	cd backend && python -m scripts.prepare_airgap_bundle --output ../vragent-airgap-bundle.tar.gz
+
+ubuntu-vendor:
+	cd backend && python -m scripts.prepare_ubuntu_vendor
 
 # ── Offline data downloads ───────────────────────────────────────
 # Download all offline data (rules + advisories + icons)

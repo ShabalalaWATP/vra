@@ -23,6 +23,10 @@ from app.analysis.icons import (
 )
 
 logger = logging.getLogger(__name__)
+ICON_TOKEN_RE = re.compile(
+    r"\b(?:fa[bs]?|fa6-solid|fa6-brands|mdi):[a-z0-9][a-z0-9-]*\b\s*",
+    re.IGNORECASE,
+)
 
 
 # ── Mermaid config for dark theme with icons ─────────────────────
@@ -243,8 +247,15 @@ async def render_diagram_for_report(
     if not mermaid_spec or not mermaid_spec.strip():
         return _render_fallback_svg("(No architecture diagram generated)", techs)
 
+    # Mermaid icon packs are only registered in the browser renderer. For export and
+    # report-side rendering, strip icon tokens so diagrams stay readable even when
+    # backend renderers cannot resolve `fa:` / `mdi:` labels.
+    prepared_spec = _prepare_mermaid_for_backend_render(mermaid_spec)
+    if not prepared_spec:
+        return _render_fallback_svg("(No architecture diagram generated)", techs)
+
     # Strategy 1: Real Mermaid rendering
-    svg = await render_mermaid_to_svg(mermaid_spec)
+    svg = await render_mermaid_to_svg(prepared_spec)
     if svg:
         # Append icon legend below the rendered diagram if we have techs
         if techs:
@@ -269,7 +280,7 @@ async def render_diagram_for_report(
                     f"{icon_hints}\n\n"
                     "Output ONLY valid SVG markup. No explanation."
                 ),
-                user=f"Convert to SVG:\n\n{mermaid_spec}",
+                user=f"Convert to SVG:\n\n{prepared_spec}",
                 max_tokens=6000,
             )
             if "<svg" in svg_text:
@@ -283,7 +294,17 @@ async def render_diagram_for_report(
             logger.warning("LLM SVG generation failed: %s", e)
 
     # Strategy 3: Fallback with icon legend
-    return _render_fallback_svg(mermaid_spec, techs)
+    return _render_fallback_svg(prepared_spec, techs)
+
+
+def _prepare_mermaid_for_backend_render(mermaid_spec: str) -> str:
+    cleaned = mermaid_spec.strip()
+    cleaned = re.sub(r"^```(?:mermaid)?\s*\n?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\n?```\s*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = ICON_TOKEN_RE.sub("", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"[\t ]+\n", "\n", cleaned)
+    return cleaned.strip()
 
 
 def _build_icon_hints(techs: list[str]) -> str:

@@ -8,6 +8,25 @@ from app.orchestrator.scan_context import ScanContext
 
 logger = logging.getLogger(__name__)
 
+CANONICAL_DIAGRAM_METADATA = {
+    "overview": {
+        "title": "System Overview",
+        "description": "High-level architecture showing main components and their connections",
+    },
+    "security": {
+        "title": "Security Architecture",
+        "description": "Trust boundaries, auth flows, data entry points, sensitive data stores",
+    },
+    "data_flow": {
+        "title": "Data Flow",
+        "description": "How data moves through the application from user input to storage and back",
+    },
+    "attack_surface": {
+        "title": "Attack Surface",
+        "description": "All points where an attacker could interact with the application",
+    },
+}
+
 SYSTEM_PROMPT = """You are a senior security researcher analysing a software application.
 Your task is to understand what this application does, how it is structured, and where its security-relevant attack surface lies.
 
@@ -35,21 +54,25 @@ Produce a JSON response with these fields:
   "external_integrations": ["databases, APIs, message queues, cloud services the app connects to"],
   "diagrams": [
     {
+      "kind": "overview",
       "title": "System Overview",
       "description": "High-level architecture showing main components and their connections",
       "mermaid": "<valid mermaid flowchart TD code>"
     },
     {
+      "kind": "security",
       "title": "Security Architecture",
       "description": "Trust boundaries, auth flows, data entry points, sensitive data stores",
       "mermaid": "<valid mermaid flowchart TD code>"
     },
     {
+      "kind": "data_flow",
       "title": "Data Flow",
       "description": "How data moves through the application from user input to storage and back",
       "mermaid": "<valid mermaid flowchart LR code>"
     },
     {
+      "kind": "attack_surface",
       "title": "Attack Surface",
       "description": "All points where an attacker could interact with the application",
       "mermaid": "<valid mermaid flowchart TD code>"
@@ -242,12 +265,22 @@ class ArchitectureAgent(BaseAgent):
         # Support both old single diagram_spec and new multi-diagram format
         diagrams = result.get("diagrams", [])
         if diagrams and isinstance(diagrams, list):
+            diagrams = self._normalise_architecture_diagrams(diagrams)
             ctx.diagram_spec = diagrams[0].get("mermaid", "") if diagrams else ""
         else:
             ctx.diagram_spec = result.get("diagram_spec", "")
             # Wrap legacy single diagram in the new format
             if ctx.diagram_spec:
-                diagrams = [{"title": "System Architecture", "description": "Overall system architecture", "mermaid": ctx.diagram_spec}]
+                diagrams = self._normalise_architecture_diagrams(
+                    [
+                        {
+                            "kind": "overview",
+                            "title": "System Overview",
+                            "description": "High-level architecture showing main components and their connections",
+                            "mermaid": ctx.diagram_spec,
+                        }
+                    ]
+                )
 
         ctx.architecture_notes = json.dumps({
             "components": result.get("components", []),
@@ -301,6 +334,178 @@ class ArchitectureAgent(BaseAgent):
             files_inspected=top_files,
             output_summary=ctx.app_summary[:500],
         )
+
+    @classmethod
+    def _normalise_architecture_diagrams(cls, diagrams: list[dict]) -> list[dict]:
+        normalised: list[tuple[int, dict]] = []
+        seen_keys: set[str] = set()
+        for position, diagram in enumerate(diagrams or []):
+            if not isinstance(diagram, dict):
+                continue
+            mermaid = str(diagram.get("mermaid") or "").strip()
+            if not mermaid:
+                continue
+            kind = cls._diagram_kind(str(diagram.get("kind") or ""), str(diagram.get("title") or ""))
+            metadata = CANONICAL_DIAGRAM_METADATA.get(kind or "")
+            title = metadata["title"] if metadata else str(diagram.get("title") or "Architecture Overview").strip()
+            description = str(diagram.get("description") or "").strip()
+            if metadata and not description:
+                description = metadata["description"]
+            entry = {
+                "title": title,
+                "description": description,
+                "kind": kind or str(diagram.get("kind") or "").strip() or None,
+                "mermaid": mermaid,
+            }
+            if "highlights" in diagram and isinstance(diagram.get("highlights"), list):
+                entry["highlights"] = [
+                    str(item).strip()
+                    for item in diagram.get("highlights", [])
+                    if str(item).strip()
+                ]
+            key = f"kind:{entry['kind']}" if entry.get("kind") else f"title:{title.lower()}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            normalised.append((cls._diagram_sort_rank(entry.get("kind")), position, entry))
+
+        normalised.sort(key=lambda item: (item[0], item[1]))
+        return [entry for _rank, _position, entry in normalised]
+
+    @staticmethod
+    def _diagram_kind(raw_kind: str, title: str) -> str | None:
+        kind = str(raw_kind or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if kind in CANONICAL_DIAGRAM_METADATA:
+            return kind
+
+        title_key = " ".join(str(title or "").strip().lower().split())
+        title_map = {
+            "system overview": "overview",
+            "overview": "overview",
+            "architecture overview": "overview",
+            "system architecture": "overview",
+            "security architecture": "security",
+            "security overview": "security",
+            "data flow": "data_flow",
+            "dataflow": "data_flow",
+            "attack surface": "attack_surface",
+        }
+        return title_map.get(title_key)
+
+    @staticmethod
+    def _diagram_sort_rank(kind: str | None) -> int:
+        order = {
+            "overview": 0,
+            "security": 1,
+            "data_flow": 2,
+            "attack_surface": 3,
+        }
+        return order.get(str(kind or ""), 100)
+
+    @staticmethod
+    def _dedupe_preserve_order(values: list[str], limit: int) -> list[str]:
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for value in values:
+            text = str(value).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            deduped.append(text)
+            if len(deduped) >= limit:
+                break
+        return deduped
+
+    def _collect_route_inventory(self, ctx: ScanContext, limit: int = 20) -> list[str]:
+        routes: list[str] = []
+        for file_path, analysis in sorted(ctx.file_analyses.items()):
+            for route in getattr(analysis, "routes", []) or []:
+                if not isinstance(route, dict):
+                    continue
+                method = str(route.get("method") or "").strip().upper()
+                path = str(route.get("path") or route.get("route") or "").strip()
+                line = route.get("line")
+                location = f"{file_path}:{line}" if isinstance(line, int) else file_path
+                headline = " ".join(part for part in (method, path) if part).strip() or "route"
+                routes.append(f"{headline} ({location})")
+        return self._dedupe_preserve_order(routes, limit)
+
+    def _collect_entrypoint_signals(self, ctx: ScanContext, limit: int = 12) -> list[str]:
+        signals: list[str] = []
+        for file_path, analysis in sorted(ctx.file_analyses.items()):
+            if getattr(analysis, "has_main", False):
+                signals.append(f"Main entrypoint in {file_path}")
+            route_count = len(getattr(analysis, "routes", []) or [])
+            if route_count > 0:
+                signals.append(f"Route hub in {file_path} ({route_count} routes)")
+        return self._dedupe_preserve_order(signals, limit)
+
+    def _collect_call_graph_hotspots(self, ctx: ScanContext, limit: int = 10) -> list[str]:
+        if not ctx.call_graph or not hasattr(ctx.call_graph, "get_high_indegree_files"):
+            return []
+        hotspots = [
+            f"{file_path} ({count} incoming calls)"
+            for file_path, count in ctx.call_graph.get_high_indegree_files(limit=limit)
+            if file_path
+        ]
+        return self._dedupe_preserve_order(hotspots, limit)
+
+    def _collect_external_touchpoints(self, ctx: ScanContext, limit: int = 15) -> list[str]:
+        module_to_files: dict[str, set[str]] = {}
+        for file_path, resolutions in (ctx.import_graph or {}).items():
+            for resolution in resolutions:
+                if not getattr(resolution, "is_external", False):
+                    continue
+                module_name = str(getattr(resolution, "import_module", "") or "").strip()
+                if not module_name:
+                    continue
+                top_level = module_name.split(".")[0].split("/")[0]
+                if not top_level:
+                    continue
+                module_to_files.setdefault(top_level, set()).add(file_path)
+
+        ordered = sorted(
+            module_to_files.items(),
+            key=lambda item: (-len(item[1]), item[0]),
+        )
+        touchpoints = [
+            f"{module} used by {', '.join(sorted(files)[:3])}"
+            for module, files in ordered
+        ]
+        return self._dedupe_preserve_order(touchpoints, limit)
+
+    def _collect_auth_and_config_touchpoints(self, ctx: ScanContext, limit: int = 15) -> list[str]:
+        keywords = {
+            "auth": "auth",
+            "login": "auth",
+            "oauth": "auth",
+            "jwt": "auth",
+            "session": "auth",
+            "permission": "authorization",
+            "role": "authorization",
+            "middleware": "middleware",
+            "guard": "middleware",
+            "config": "config",
+            "settings": "config",
+            "env": "config",
+            "secret": "secrets",
+            "credential": "secrets",
+        }
+        touchpoints: list[str] = []
+        for file_path, analysis in sorted(ctx.file_analyses.items()):
+            lower_path = file_path.lower()
+            reasons: set[str] = set()
+            for token, label in keywords.items():
+                if token in lower_path:
+                    reasons.add(label)
+            for ts_import in getattr(analysis, "imports", []) or []:
+                module = str(getattr(ts_import, "module", "") or "").lower()
+                for token, label in keywords.items():
+                    if token in module:
+                        reasons.add(label)
+            if reasons:
+                touchpoints.append(f"{file_path} [{', '.join(sorted(reasons))}]")
+        return self._dedupe_preserve_order(touchpoints, limit)
 
     def _build_prompt(self, ctx: ScanContext, file_contents: dict[str, str]) -> str:
         parts = [
@@ -411,6 +616,39 @@ class ArchitectureAgent(BaseAgent):
                 for pkg in sorted(external_pkgs)[:20]:
                     parts.append(f"- {pkg}")
                 parts.append("Include significant external services/databases in the architecture diagram.")
+
+        route_inventory = self._collect_route_inventory(ctx)
+        entrypoint_signals = self._collect_entrypoint_signals(ctx)
+        if route_inventory or entrypoint_signals:
+            parts.append("\n## Route Inventory / Entry Point Signals")
+            parts.append(
+                "Use these discovered routes and entrypoint hints to ground the architecture and attack-surface diagrams."
+            )
+            for route in route_inventory:
+                parts.append(f"- Route: {route}")
+            for signal in entrypoint_signals:
+                parts.append(f"- Signal: {signal}")
+
+        call_graph_hotspots = self._collect_call_graph_hotspots(ctx)
+        if call_graph_hotspots:
+            parts.append("\n## Call Graph Hotspots")
+            parts.append("These files attract the most incoming call traffic and are likely architectural hubs:")
+            for hotspot in call_graph_hotspots:
+                parts.append(f"- {hotspot}")
+
+        external_touchpoints = self._collect_external_touchpoints(ctx)
+        if external_touchpoints:
+            parts.append("\n## External Integration Touchpoints")
+            parts.append("These external modules appear in the codebase and should inform integration nodes in the diagrams:")
+            for touchpoint in external_touchpoints:
+                parts.append(f"- {touchpoint}")
+
+        auth_touchpoints = self._collect_auth_and_config_touchpoints(ctx)
+        if auth_touchpoints:
+            parts.append("\n## Auth / Middleware / Config Touchpoints")
+            parts.append("These files are likely to define trust boundaries, security controls, or runtime configuration:")
+            for touchpoint in auth_touchpoints:
+                parts.append(f"- {touchpoint}")
 
         parts.append("\n## Source Files")
         for path, content in file_contents.items():

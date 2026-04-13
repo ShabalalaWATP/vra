@@ -276,7 +276,8 @@ export default function HomePage() {
               <p className="text-sm text-text-secondary max-w-lg mx-auto leading-relaxed">
                 Before your first scan, configure your local LLM endpoint in <strong>Settings</strong>.
                 VRAgent needs a local OpenAI-compatible API (e.g., vLLM, Ollama, llama.cpp server).
-                Set the base URL, API key, model name, and select your context window size (128K, 200K, or 400K tokens).
+                Set the base URL, API key, model name, and select your context window size from the available presets,
+                now ranging up to 1M tokens.
                 Click "Test Connection" to verify.
               </p>
               <div className="flex items-center justify-center gap-4 pt-2">

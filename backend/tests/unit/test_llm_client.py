@@ -1,5 +1,7 @@
 import asyncio
 
+import httpx
+
 from app.orchestrator.llm_client import LLMClient, estimate_tokens
 
 
@@ -26,5 +28,52 @@ def test_truncate_messages_trims_multiple_large_messages_and_preserves_system():
     assert sum(estimate_tokens(message.get("content", "")) for message in truncated) <= (
         client.context_window - 200 - 200
     )
+
+    asyncio.run(client.close())
+
+
+def test_chat_retries_transient_transport_errors(monkeypatch):
+    client = LLMClient(
+        base_url="http://localhost:1234",
+        model_name="test-model",
+        context_window=4096,
+        max_output_tokens=256,
+    )
+    calls = {"count": 0}
+
+    async def fake_resolve_chat_path(_headers):
+        return "/v1/chat/completions"
+
+    async def fake_post(path, *, headers=None, json=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise httpx.ConnectError("getaddrinfo failed", request=httpx.Request("POST", f"http://localhost:1234{path}"))
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", f"http://localhost:1234{path}"),
+            json={
+                "choices": [
+                    {
+                        "message": {"content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+                "model": "test-model",
+            },
+        )
+
+    monkeypatch.setattr(client, "_resolve_chat_path", fake_resolve_chat_path)
+    monkeypatch.setattr(client._client, "post", fake_post)
+
+    result = asyncio.run(
+        client.chat(
+            [{"role": "user", "content": "hello"}],
+            max_tokens=64,
+        )
+    )
+
+    assert result["content"] == "ok"
+    assert calls["count"] == 2
 
     asyncio.run(client.close())

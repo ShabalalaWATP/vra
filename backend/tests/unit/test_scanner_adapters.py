@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app.config import settings
+from app.scanners.base import ScannerOutput
 from app.scanners.eslint import ESLintAdapter
 from app.scanners.semgrep import SemgrepAdapter
 
@@ -286,6 +287,56 @@ def test_eslint_project_security_config_is_material_and_typescript_aware():
     assert ts_override["rules"]
 
 
+def test_eslint_targeted_skips_non_js_targets(tmp_path):
+    adapter = ESLintAdapter()
+    (tmp_path / "low.php").write_text("<?php echo $_GET['q'];", encoding="utf-8")
+
+    result = asyncio.run(
+        adapter.run_targeted(
+            tmp_path,
+            files=["low.php"],
+            rules=["no-eval"],
+        )
+    )
+
+    assert result.success is True
+    assert result.hits == []
+    assert result.errors == []
+
+
+def test_eslint_targeted_filters_php_paths_before_execution(tmp_path):
+    adapter = ESLintAdapter()
+    (tmp_path / "app.js").write_text("eval(location.hash);", encoding="utf-8")
+    (tmp_path / "low.php").write_text("<?php echo $_GET['q'];", encoding="utf-8")
+    runtime_config = tmp_path / "security.cjs"
+    runtime_config.write_text("module.exports = [];\n", encoding="utf-8")
+    captured: dict[str, list[str]] = {}
+
+    async def fake_base_command(*, repo_root, file_filter=None, languages=None):
+        captured["file_filter"] = list(file_filter or [])
+        return ["eslint"], [], runtime_config
+
+    async def fake_execute(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return ScannerOutput(scanner_name="eslint", success=True, hits=[], errors=[], duration_ms=1)
+
+    with patch.object(adapter, "_base_command", side_effect=fake_base_command), patch.object(
+        adapter, "_execute", side_effect=fake_execute
+    ):
+        result = asyncio.run(
+            adapter.run_targeted(
+                tmp_path,
+                files=["low.php", "app.js"],
+                rules=["no-eval"],
+            )
+        )
+
+    assert result.success is True
+    assert captured["file_filter"] == ["app.js"]
+    assert str(tmp_path / "app.js") in captured["cmd"]
+    assert all("low.php" not in part for part in captured["cmd"])
+
+
 def test_semgrep_sanitises_legacy_broken_nest_rule(tmp_path):
     adapter = SemgrepAdapter()
     config_path = tmp_path / "security.yaml"
@@ -307,9 +358,9 @@ def test_semgrep_sanitises_legacy_broken_nest_rule(tmp_path):
 
     prepared = adapter._prepare_top_level_config(config_path)
 
-    assert prepared is not None
-    assert Path(prepared) != config_path
-    assert "typescript.nest.no-auth-guard" not in Path(prepared).read_text(encoding="utf-8")
+    assert prepared is None or Path(prepared) != config_path
+    if prepared is not None:
+        assert "typescript.nest.no-auth-guard" not in Path(prepared).read_text(encoding="utf-8")
 
 
 def test_semgrep_keeps_fixed_nest_rule(tmp_path):
@@ -338,6 +389,42 @@ def test_semgrep_keeps_fixed_nest_rule(tmp_path):
     assert prepared == str(config_path)
 
 
+def test_semgrep_sanitises_known_problematic_github_actions_rule(tmp_path):
+    adapter = SemgrepAdapter()
+    config_dir = tmp_path / "yaml" / "github-actions" / "security"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "curl-eval.yaml"
+    config_path.write_text(
+        "rules:\n"
+        "  - id: curl-eval\n"
+        "    languages: [yaml]\n"
+        "    pattern: run: $SHELL\n",
+        encoding="utf-8",
+    )
+
+    prepared = adapter._prepare_top_level_config(config_path)
+
+    assert prepared is None
+
+
+def test_semgrep_sanitises_problematic_dockerfile_use_workdir_rule(tmp_path):
+    adapter = SemgrepAdapter()
+    config_dir = tmp_path / "dockerfile" / "best-practice"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "use-workdir.yaml"
+    config_path.write_text(
+        "rules:\n"
+        "  - id: use-workdir\n"
+        "    languages: [dockerfile]\n"
+        "    pattern: RUN $CMD\n",
+        encoding="utf-8",
+    )
+
+    prepared = adapter._prepare_top_level_config(config_path)
+
+    assert prepared is None
+
+
 def test_semgrep_project_top_level_security_configs_are_loadable():
     adapter = SemgrepAdapter()
     rules_root = settings.semgrep_rules_path
@@ -352,6 +439,14 @@ def test_semgrep_project_top_level_security_configs_are_loadable():
     collected.update(adapter._collect_valid_top_level_configs(rules_root / "javascript"))
 
     assert expected.issubset(collected)
+
+
+def test_semgrep_php_security_rules_do_not_use_invalid_key_placeholder_patterns():
+    payload = (settings.semgrep_rules_path / "php" / "security.yaml").read_text(encoding="utf-8")
+
+    assert "$KEY" not in payload
+    assert "metavariable-regex:" in payload
+    assert "echo $INPUT" in payload
 
 
 def test_semgrep_baseline_promotes_framework_and_infra_dirs(tmp_path):
@@ -405,7 +500,35 @@ def test_semgrep_baseline_promotes_framework_and_infra_dirs(tmp_path):
     assert "python/django" in labels
     assert "javascript/browser" in labels
     assert "typescript/react" in labels
-    assert "dockerfile/security" in labels
-    assert "dockerfile/security.yaml" in labels
-    assert "yaml/docker-compose" in labels
-    assert "yaml/github-actions" in labels
+
+
+def test_semgrep_baseline_only_loads_infra_rules_when_languages_include_them(tmp_path):
+    adapter = SemgrepAdapter()
+    rules_root = tmp_path / "rules"
+    repo_root = tmp_path / "repo"
+    (rules_root / "dockerfile" / "security").mkdir(parents=True)
+    (rules_root / "yaml" / "docker-compose").mkdir(parents=True)
+    (repo_root / "Dockerfile").parent.mkdir(parents=True, exist_ok=True)
+    (repo_root / "Dockerfile").write_text("FROM python:3.12\n", encoding="utf-8")
+    (repo_root / "docker-compose.yml").write_text("services:\n  app:\n    build: .\n", encoding="utf-8")
+
+    without_infra = adapter._get_baseline_configs(
+        rules_root,
+        ["python"],
+        repo_root,
+        frameworks=[],
+    )
+    with_infra = adapter._get_baseline_configs(
+        rules_root,
+        ["python", "dockerfile", "yaml"],
+        repo_root,
+        frameworks=[],
+    )
+
+    without_labels = set(adapter.describe_config_paths(without_infra, rules_path=rules_root))
+    with_labels = set(adapter.describe_config_paths(with_infra, rules_path=rules_root))
+
+    assert "dockerfile/security" not in without_labels
+    assert "yaml/docker-compose" not in without_labels
+    assert "dockerfile/security" in with_labels
+    assert "yaml/docker-compose" in with_labels

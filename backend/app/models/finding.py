@@ -23,6 +23,13 @@ class Finding(Base):
     remediation: Mapped[str | None] = mapped_column(Text)
     code_snippet: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="confirmed")
+    provenance: Mapped[str | None] = mapped_column(String(20))
+    source_scanners: Mapped[list | None] = mapped_column(JSONType)
+    source_rules: Mapped[list | None] = mapped_column(JSONType)
+    verification_level: Mapped[str | None] = mapped_column(String(32))
+    verification_notes: Mapped[str | None] = mapped_column(Text)
+    canonical_key: Mapped[str | None] = mapped_column(String(255))
+    merge_metadata: Mapped[dict | None] = mapped_column(JSONType)
     cwe_ids: Mapped[list | None] = mapped_column(JSONType)
     related_cves: Mapped[list | None] = mapped_column(JSONType)  # [{cve_id, summary, severity, package, fixed_version}]
     # Exploit evidence
@@ -30,6 +37,7 @@ class Finding(Base):
     exploit_prerequisites: Mapped[list | None] = mapped_column(JSONType)
     exploit_template: Mapped[str | None] = mapped_column(Text)
     attack_scenario: Mapped[str | None] = mapped_column(Text)
+    exploit_evidence: Mapped[dict | None] = mapped_column(JSONType)
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     evidence: Mapped[list["Evidence"]] = relationship(

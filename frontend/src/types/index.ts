@@ -55,9 +55,30 @@ export interface Finding {
   exploit_prerequisites: string[] | null;
   exploit_template: string | null;
   attack_scenario: string | null;
+  exploit_evidence: ExploitEvidence | null;
+  provenance?: "llm" | "scanner" | "hybrid" | string | null;
+  source_scanners?: string[] | null;
+  source_rules?: string[] | null;
+  verification_level?: string | null;
+  verification_notes?: string | null;
+  canonical_key?: string | null;
+  merge_metadata?: Record<string, unknown> | null;
   evidence: Evidence[];
   file_paths: string[];
   created_at: string;
+}
+
+export interface ExploitEvidence {
+  difficulty?: string | null;
+  target_route?: string | null;
+  prerequisites?: string[] | null;
+  validation_steps?: string[] | null;
+  cleanup_notes?: string[] | null;
+  exploit_template?: string | null;
+  attack_scenario?: string | null;
+  components?: string[] | null;
+  related_entry_points?: string[] | null;
+  related_taint_flows?: string[] | null;
 }
 
 export interface Evidence {
@@ -76,6 +97,8 @@ export interface Report {
   architecture: string | null;
   diagram_spec: string | null;
   has_diagram_image: boolean;
+  diagram_count?: number;
+  diagram_media_type?: string | null;
   narrative: string | null;
   methodology: string | null;
   limitations: string | null;
@@ -265,6 +288,7 @@ export interface ScanProgress {
 export interface WSEvent {
   type: "event" | "progress";
   phase?: string;
+  task?: string;
   level?: string;
   message?: string;
   detail?: Record<string, unknown>;

@@ -1,7 +1,9 @@
 """Tests for CVE correlation helpers."""
 
+import gzip
 import json
 
+from app.analysis.advisory_db import load_ecosystem_advisories
 from app.analysis import cve_correlator
 from app.analysis.import_resolver import ImportResolution
 
@@ -281,6 +283,14 @@ def test_find_vulnerable_function_calls_loads_enriched_functions_from_disk(tmp_p
                 "advisories": {
                     "GO-001": {
                         "vulnerable_functions": ["Repository::revparse_single"],
+                        "vulnerable_symbols": [
+                            {
+                                "symbol": "Repository::revparse_single",
+                                "sources": ["details_inline_code"],
+                                "confidence": 0.45,
+                                "import_path": "example.com/lib/git",
+                            }
+                        ],
                         "sources": ["details_inline_code"],
                     }
                 }
@@ -303,3 +313,117 @@ def test_find_vulnerable_function_calls_loads_enriched_functions_from_disk(tmp_p
     assert results[0]["display_id"] == "GO-001"
     assert results[0]["package"] == "example.com/lib"
     assert results[0]["evidence_strength"] == "weak"
+
+
+def test_find_vulnerable_function_calls_uses_structured_import_hints(monkeypatch):
+    monkeypatch.setattr(cve_correlator, "_cwe_index", {})
+    monkeypatch.setattr(
+        cve_correlator,
+        "_func_index",
+        {
+            "serve": [
+                {
+                    "display_id": "GO-STRUCT-1",
+                    "advisory_id": "GO-STRUCT-1",
+                    "cve_id": None,
+                    "package": "github.com/example/mod",
+                    "ecosystem": "go",
+                    "severity": "high",
+                    "summary": "Structured import metadata",
+                    "vulnerable_symbols": [
+                        {
+                            "symbol": "Serve",
+                            "import_path": "github.com/example/mod/http",
+                            "sources": ["ecosystem_specific.imports"],
+                            "confidence": 1.0,
+                        }
+                    ],
+                    "vulnerable_import_paths": ["github.com/example/mod/http"],
+                }
+            ]
+        },
+    )
+
+    results = cve_correlator.find_vulnerable_function_calls(
+        "main.go",
+        "Serve()\n",
+        languages=["go"],
+        import_resolutions=[
+            ImportResolution(
+                import_module="github.com/example/mod/http",
+                imported_names=["Serve"],
+                is_external=True,
+                source_file="main.go",
+                line=1,
+            )
+        ],
+    )
+
+    assert len(results) == 1
+    assert results[0]["display_id"] == "GO-STRUCT-1"
+    assert results[0]["evidence_strength"] == "medium"
+    assert results[0]["package_evidence_source"] == "advisory_import_path"
+    assert results[0]["import_module"] == "github.com/example/mod/http"
+
+
+def test_load_ecosystem_advisories_backfills_symbol_entries_from_flat_functions(tmp_path):
+    advisories_dir = tmp_path / "advisories" / "pypi"
+    advisories_dir.mkdir(parents=True)
+    (advisories_dir / "advisories.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "PY-001",
+                    "package": "pyyaml",
+                    "severity": "high",
+                    "summary": "Unsafe yaml loader",
+                    "vulnerable_functions": ["load"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_ecosystem_advisories(tmp_path / "advisories", "pypi")
+
+    assert loaded[0]["vulnerable_functions"] == ["load"]
+    assert loaded[0]["vulnerable_symbols"] == [
+        {
+            "symbol": "load",
+            "sources": [],
+        }
+    ]
+
+
+def test_load_ecosystem_advisories_falls_back_to_gzip_when_json_is_lfs_pointer(tmp_path):
+    advisories_dir = tmp_path / "advisories" / "npm"
+    advisories_dir.mkdir(parents=True)
+    (advisories_dir / "advisories.json").write_text(
+        "\n".join(
+            [
+                "version https://git-lfs.github.com/spec/v1",
+                "oid sha256:deadbeef",
+                "size 245812629",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with gzip.open(advisories_dir / "advisories.json.gz", "wt", encoding="utf-8") as handle:
+        json.dump(
+            [
+                {
+                    "id": "NPM-001",
+                    "package": "lodash",
+                    "severity": "high",
+                    "summary": "Prototype pollution",
+                    "vulnerable_functions": ["merge"],
+                }
+            ],
+            handle,
+        )
+
+    loaded = load_ecosystem_advisories(tmp_path / "advisories", "npm")
+
+    assert loaded[0]["id"] == "NPM-001"
+    assert loaded[0]["package"] == "lodash"
+    assert loaded[0]["vulnerable_functions"] == ["merge"]

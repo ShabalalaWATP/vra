@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { api } from "@/api/client";
-import type { Scan } from "@/types";
+import type { Project, Scan } from "@/types";
 
 type StatusFilter = "all" | "completed" | "running" | "failed" | "cancelled" | "pending";
 
@@ -29,6 +29,13 @@ export default function HistoryPage() {
     queryKey: ["scans"],
     queryFn: () => api.get("/scans"),
   });
+
+  const { data: projects } = useQuery<Project[]>({
+    queryKey: ["projects"],
+    queryFn: () => api.get("/projects"),
+  });
+
+  const projectMap = new Map((projects ?? []).map((project) => [project.id, project]));
 
   const deleteMutation = useMutation({
     mutationFn: (scanId: string) => api.delete(`/scans/${scanId}`),
@@ -49,13 +56,16 @@ export default function HistoryPage() {
 
   // Filter and search
   const filtered = scans?.filter((s) => {
+    const project = projectMap.get(s.project_id);
     if (filter !== "all" && s.status !== filter) return false;
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       return (
         s.id.toLowerCase().includes(q) ||
         s.mode.toLowerCase().includes(q) ||
-        s.status.toLowerCase().includes(q)
+        s.status.toLowerCase().includes(q) ||
+        project?.name.toLowerCase().includes(q) ||
+        project?.repo_path.toLowerCase().includes(q)
       );
     }
     return true;
@@ -145,6 +155,7 @@ export default function HistoryPage() {
             <ScanCard
               key={scan.id}
               scan={scan}
+              project={projectMap.get(scan.project_id)}
               isDeleting={deletingId === scan.id}
               isConfirmingDelete={confirmDeleteId === scan.id}
               onConfirmDelete={() => setConfirmDeleteId(scan.id)}
@@ -183,6 +194,7 @@ const MODE_COLORS: Record<string, string> = {
 
 function ScanCard({
   scan,
+  project,
   isDeleting,
   isConfirmingDelete,
   onConfirmDelete,
@@ -190,6 +202,7 @@ function ScanCard({
   onDelete,
 }: {
   scan: Scan;
+  project?: Project;
   isDeleting: boolean;
   isConfirmingDelete: boolean;
   onConfirmDelete: () => void;
@@ -237,6 +250,11 @@ function ScanCard({
             </span>
           </div>
           <div className="flex items-center gap-4 mt-1 text-xs text-text-muted">
+            {project && (
+              <span className="truncate max-w-[22rem]">
+                {project.name} {project.repo_path ? `• ${project.repo_path}` : ""}
+              </span>
+            )}
             {scan.started_at && (
               <span className="flex items-center gap-1">
                 <Clock className="w-3 h-3" />

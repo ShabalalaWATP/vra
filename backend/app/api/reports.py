@@ -8,16 +8,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.report import ExportArtifact, Report
 from app.schemas.report import ExportOut, ExportRequest, ReportOut
+from app.services.report_diagrams import (
+    count_report_diagrams,
+    primary_diagram_media_type,
+    render_report_diagram,
+)
 
 router = APIRouter(prefix="/scans/{scan_id}/report", tags=["reports"])
 
 
-@router.get("", response_model=ReportOut)
-async def get_report(scan_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Report).where(Report.scan_id == scan_id))
-    report = result.scalar_one_or_none()
-    if not report:
-        raise HTTPException(404, "Report not found")
+def _report_out(report: Report) -> ReportOut:
     return ReportOut(
         id=report.id,
         scan_id=report.scan_id,
@@ -25,6 +25,9 @@ async def get_report(scan_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
         architecture=report.architecture,
         diagram_spec=report.diagram_spec,
         has_diagram_image=report.diagram_image is not None,
+        diagram_count=count_report_diagrams(report),
+        diagram_media_type=primary_diagram_media_type(report),
+        narrative=report.narrative,
         methodology=report.methodology,
         limitations=report.limitations,
         tech_stack=report.tech_stack,
@@ -40,15 +43,35 @@ async def get_report(scan_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     )
 
 
+@router.get("", response_model=ReportOut)
+async def get_report(scan_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Report).where(Report.scan_id == scan_id))
+    report = result.scalar_one_or_none()
+    if not report:
+        raise HTTPException(404, "Report not found")
+    return _report_out(report)
+
+
 @router.get("/diagram")
 async def get_diagram(scan_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Report).where(Report.scan_id == scan_id))
     report = result.scalar_one_or_none()
-    if not report or not report.diagram_image:
+    if not report:
         raise HTTPException(404, "Diagram not found")
-    from fastapi.responses import Response
+    return await _diagram_response(report, 0)
 
-    return Response(content=report.diagram_image, media_type="image/svg+xml")
+
+@router.get("/diagram/{diagram_index}")
+async def get_diagram_at_index(
+    scan_id: uuid.UUID,
+    diagram_index: int,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Report).where(Report.scan_id == scan_id))
+    report = result.scalar_one_or_none()
+    if not report:
+        raise HTTPException(404, "Diagram not found")
+    return await _diagram_response(report, diagram_index)
 
 
 @router.post("/export", response_model=ExportOut)
@@ -93,4 +116,20 @@ async def download_export(
         artifact.file_path,
         media_type=media,
         filename=f"report.{artifact.format}",
+    )
+
+
+async def _diagram_response(report: Report, diagram_index: int):
+    if diagram_index < 0:
+        raise HTTPException(404, "Diagram not found")
+
+    diagram = await render_report_diagram(report, diagram_index)
+    if not diagram or not diagram.image_bytes:
+        raise HTTPException(404, "Diagram not found")
+
+    from fastapi.responses import Response
+
+    return Response(
+        content=diagram.image_bytes,
+        media_type=diagram.media_type or primary_diagram_media_type(report) or "application/octet-stream",
     )

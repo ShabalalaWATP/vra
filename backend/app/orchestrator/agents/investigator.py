@@ -398,6 +398,7 @@ class InvestigatorAgent(BaseAgent):
 
         # Process findings
         for fd in result.get("findings", []):
+            matched_scanner_hits = self._match_scanner_hits_for_finding(file_path, fd, scanner_context)
             ctx.candidate_findings.append(CandidateFinding(
                 title=fd.get("title", "Untitled"),
                 category=fd.get("category", "other"),
@@ -412,6 +413,11 @@ class InvestigatorAgent(BaseAgent):
                 input_sources=fd.get("input_sources", []),
                 sinks=fd.get("sinks", []),
                 cwe_ids=fd.get("cwe_ids", []),
+                provenance=self._derive_provenance(matched_scanner_hits),
+                source_scanners=self._collect_source_scanners(matched_scanner_hits),
+                source_rules=self._collect_source_rules(matched_scanner_hits),
+                source_scanner_hits=matched_scanner_hits,
+                verification_level="hypothesis",
             ))
 
         # Process taint flows
@@ -516,6 +522,110 @@ class InvestigatorAgent(BaseAgent):
             richness,
             int(hit.get("line") or 0),
         )
+
+    @staticmethod
+    def _parse_line_range(line_range: str | None) -> tuple[int | None, int | None]:
+        text = str(line_range or "").strip()
+        if not text:
+            return None, None
+        parts = text.split("-", 1)
+        try:
+            start = int(parts[0].strip())
+        except (TypeError, ValueError):
+            return None, None
+        end = start
+        if len(parts) > 1:
+            try:
+                end = int(parts[1].strip())
+            except (TypeError, ValueError):
+                end = start
+        if end < start:
+            start, end = end, start
+        return start, end
+
+    @staticmethod
+    def _category_matches_hit(category: str, hit: dict) -> bool:
+        keywords = {
+            "sqli": ["sql", "injection", "query"],
+            "xss": ["xss", "html", "script", "template", "unescaped"],
+            "auth_bypass": ["auth", "authentication", "authorization", "access"],
+            "idor": ["idor", "access control", "object reference"],
+            "ssrf": ["ssrf", "request forgery", "fetch"],
+            "rce": ["command", "exec", "shell", "code execution"],
+            "path_traversal": ["path", "traversal", "file read", "directory"],
+            "crypto": ["crypto", "cipher", "hash", "tls", "certificate"],
+            "info_disclosure": ["disclosure", "leak", "exposure", "sensitive"],
+            "deserialization": ["deserialize", "yaml", "pickle", "object injection"],
+            "csrf": ["csrf", "request forgery"],
+            "open_redirect": ["redirect", "location header"],
+            "xxe": ["xxe", "xml external entity", "xml parser"],
+            "prototype_pollution": ["prototype", "pollution"],
+            "log_injection": ["log", "injection"],
+        }
+        haystack = " ".join(
+            [
+                str(hit.get("rule_id") or ""),
+                str(hit.get("message") or ""),
+                str(hit.get("scanner") or ""),
+            ]
+        ).lower()
+        return any(keyword in haystack for keyword in keywords.get(str(category or "").lower(), []))
+
+    def _match_scanner_hits_for_finding(
+        self,
+        default_file: str,
+        finding_payload: dict,
+        scanner_hits: list[dict],
+    ) -> list[dict]:
+        candidate_file = str(finding_payload.get("file_path") or default_file or "")
+        if candidate_file != default_file:
+            return []
+
+        start, end = self._parse_line_range(finding_payload.get("line_range"))
+        matched: list[dict] = []
+        for hit in scanner_hits or []:
+            hit_start = int(hit.get("line") or 0)
+            hit_end = int(hit.get("end_line") or hit_start or 0)
+            overlaps = False
+            if start and hit_start:
+                overlaps = hit_start <= (end or start) and (hit_end or hit_start) >= start
+            category_match = self._category_matches_hit(str(finding_payload.get("category") or ""), hit)
+            if overlaps or category_match:
+                matched.append(
+                    {
+                        "scanner": str(hit.get("scanner") or "").strip(),
+                        "rule_id": str(hit.get("rule_id") or "").strip(),
+                        "message": str(hit.get("message") or "").strip(),
+                        "line": hit_start or None,
+                        "end_line": hit_end or None,
+                        "severity": str(hit.get("severity") or "").strip() or None,
+                    }
+                )
+        return matched[:5]
+
+    @staticmethod
+    def _collect_source_scanners(scanner_hits: list[dict]) -> list[str]:
+        return sorted(
+            {
+                str(hit.get("scanner") or "").strip()
+                for hit in scanner_hits or []
+                if str(hit.get("scanner") or "").strip()
+            }
+        )
+
+    @staticmethod
+    def _collect_source_rules(scanner_hits: list[dict]) -> list[str]:
+        return sorted(
+            {
+                str(hit.get("rule_id") or "").strip()
+                for hit in scanner_hits or []
+                if str(hit.get("rule_id") or "").strip()
+            }
+        )
+
+    @staticmethod
+    def _derive_provenance(scanner_hits: list[dict]) -> str:
+        return "hybrid" if scanner_hits else "llm"
 
     @staticmethod
     def _summarise_scanner_snippet(snippet: str | None, max_lines: int = 6, max_chars: int = 320) -> str:
@@ -963,6 +1073,8 @@ class InvestigatorAgent(BaseAgent):
                 input_sources=fd.get("input_sources", []),
                 sinks=fd.get("sinks", []),
                 cwe_ids=fd.get("cwe_ids", []),
+                provenance="llm",
+                verification_level="hypothesis",
             ))
 
         for tf in result.get("taint_flows", []):

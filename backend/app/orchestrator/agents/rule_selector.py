@@ -104,6 +104,11 @@ CODEQL_QUERY_GROUPS = {
     "swift": ["swift-security-and-quality.qls", "swift-security-experimental.qls"],
 }
 
+SCANNER_TARGET_SUFFIXES = {
+    "bandit": {".py", ".pyi"},
+    "eslint": {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"},
+}
+
 SEMGREP_DIR_SIGNAL_HINTS = {
     "python/django": {"django"},
     "python/flask": {"flask"},
@@ -237,65 +242,73 @@ class RuleSelectorAgent(BaseAgent):
 
         # Targeted Bandit
         if bandit_rules and "bandit" in available and "python" in ctx.languages and runs_done < budget:
-            ctx.current_task = f"Running targeted Bandit ({', '.join(bandit_rules[:5])})"
-            await self.emit(ctx, f"Running targeted Bandit: {', '.join(bandit_rules[:5])}")
+            bandit_target_files = self._filter_target_files("bandit", safe_target_files)
+            if not bandit_target_files:
+                await self.emit(ctx, "Skipping targeted Bandit; no Python files matched the follow-up target set.")
+            else:
+                ctx.current_task = f"Running targeted Bandit ({', '.join(bandit_rules[:5])})"
+                await self.emit(ctx, f"Running targeted Bandit: {', '.join(bandit_rules[:5])}")
 
-            output = await available["bandit"].run_targeted(
-                repo_path,
-                files=safe_target_files or [],
-                rules=bandit_rules,
-            )
-
-            summary = ctx.record_scanner_run(
-                "bandit_targeted",
-                success=output.success,
-                hit_count=len(output.hits),
-                duration_ms=output.duration_ms,
-                errors=output.errors,
-            )
-            if output.hits:
-                await self.emit(
-                    ctx,
-                    f"Targeted Bandit found {len(output.hits)} additional hits",
-                    detail=summary,
+                output = await available["bandit"].run_targeted(
+                    repo_path,
+                    files=bandit_target_files,
+                    rules=bandit_rules,
                 )
-                await self._persist_targeted_hits(ctx, "bandit_targeted", output.hits, repo_path)
-            elif summary["errors"]:
-                await self.emit(ctx, "Targeted Bandit completed with scanner errors", level="warn", detail=summary)
 
-            runs_done += 1
+                summary = ctx.record_scanner_run(
+                    "bandit_targeted",
+                    success=output.success,
+                    hit_count=len(output.hits),
+                    duration_ms=output.duration_ms,
+                    errors=output.errors,
+                )
+                if output.hits:
+                    await self.emit(
+                        ctx,
+                        f"Targeted Bandit found {len(output.hits)} additional hits",
+                        detail=summary,
+                    )
+                    await self._persist_targeted_hits(ctx, "bandit_targeted", output.hits, repo_path)
+                elif summary["errors"]:
+                    await self.emit(ctx, "Targeted Bandit completed with scanner errors", level="warn", detail=summary)
+
+                runs_done += 1
 
         # Targeted ESLint
         if eslint_rules and "eslint" in available and any(
             l in ctx.languages for l in ("javascript", "typescript")
         ) and runs_done < budget:
-            ctx.current_task = f"Running targeted ESLint ({', '.join(eslint_rules[:5])})"
-            await self.emit(ctx, f"Running targeted ESLint: {', '.join(eslint_rules[:5])}")
+            eslint_target_files = self._filter_target_files("eslint", safe_target_files)
+            if not eslint_target_files:
+                await self.emit(ctx, "Skipping targeted ESLint; no JS/TS files matched the follow-up target set.")
+            else:
+                ctx.current_task = f"Running targeted ESLint ({', '.join(eslint_rules[:5])})"
+                await self.emit(ctx, f"Running targeted ESLint: {', '.join(eslint_rules[:5])}")
 
-            output = await available["eslint"].run_targeted(
-                repo_path,
-                files=safe_target_files or [],
-                rules=eslint_rules,
-            )
-
-            summary = ctx.record_scanner_run(
-                "eslint_targeted",
-                success=output.success,
-                hit_count=len(output.hits),
-                duration_ms=output.duration_ms,
-                errors=output.errors,
-            )
-            if output.hits:
-                await self.emit(
-                    ctx,
-                    f"Targeted ESLint found {len(output.hits)} additional hits",
-                    detail=summary,
+                output = await available["eslint"].run_targeted(
+                    repo_path,
+                    files=eslint_target_files,
+                    rules=eslint_rules,
                 )
-                await self._persist_targeted_hits(ctx, "eslint_targeted", output.hits, repo_path)
-            elif summary["errors"]:
-                await self.emit(ctx, "Targeted ESLint completed with scanner errors", level="warn", detail=summary)
 
-            runs_done += 1
+                summary = ctx.record_scanner_run(
+                    "eslint_targeted",
+                    success=output.success,
+                    hit_count=len(output.hits),
+                    duration_ms=output.duration_ms,
+                    errors=output.errors,
+                )
+                if output.hits:
+                    await self.emit(
+                        ctx,
+                        f"Targeted ESLint found {len(output.hits)} additional hits",
+                        detail=summary,
+                    )
+                    await self._persist_targeted_hits(ctx, "eslint_targeted", output.hits, repo_path)
+                elif summary["errors"]:
+                    await self.emit(ctx, "Targeted ESLint completed with scanner errors", level="warn", detail=summary)
+
+                runs_done += 1
 
         # Targeted CodeQL
         if codeql_queries and "codeql" in available and runs_done < budget:
@@ -604,3 +617,22 @@ class RuleSelectorAgent(BaseAgent):
                 seen.add(expanded)
                 optimised.append(expanded)
         return optimised
+
+    @staticmethod
+    def _filter_target_files(scanner_name: str, files: list[str]) -> list[str]:
+        allowed_suffixes = SCANNER_TARGET_SUFFIXES.get(scanner_name)
+        if not allowed_suffixes:
+            return list(dict.fromkeys(file for file in files if file))
+
+        filtered: list[str] = []
+        seen: set[str] = set()
+        for file_path in files:
+            if not file_path:
+                continue
+            normalised = str(file_path).replace("\\", "/")
+            suffix = Path(normalised).suffix.lower()
+            if suffix not in allowed_suffixes or normalised in seen:
+                continue
+            seen.add(normalised)
+            filtered.append(normalised)
+        return filtered

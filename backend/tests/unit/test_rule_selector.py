@@ -38,3 +38,17 @@ def test_rule_selector_optimises_semgrep_dirs(monkeypatch, tmp_path):
         "javascript/express",
         "dockerfile/audit",
     ]
+
+
+def test_rule_selector_filters_target_files_by_scanner_suffix():
+    agent = RuleSelectorAgent(llm=SimpleNamespace())
+
+    assert agent._filter_target_files(
+        "eslint",
+        ["src/app.ts", "src/view.js", "backend/route.php", "src/view.js"],
+    ) == ["src/app.ts", "src/view.js"]
+
+    assert agent._filter_target_files(
+        "bandit",
+        ["service.py", "client.ts", "typed.pyi"],
+    ) == ["service.py", "typed.pyi"]

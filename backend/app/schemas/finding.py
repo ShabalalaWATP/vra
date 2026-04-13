@@ -28,12 +28,20 @@ class FindingOut(BaseModel):
     remediation: str | None
     code_snippet: str | None
     status: str
+    provenance: str | None = None
+    source_scanners: list[str] | None = None
+    source_rules: list[str] | None = None
+    verification_level: str | None = None
+    verification_notes: str | None = None
+    canonical_key: str | None = None
+    merge_metadata: dict | None = None
     cwe_ids: list[str] | None = None
     related_cves: list[dict] | None = None
     exploit_difficulty: str | None = None
     exploit_prerequisites: list | None = None
     exploit_template: str | None = None
     attack_scenario: str | None = None
+    exploit_evidence: dict | None = None
     evidence: list[EvidenceOut] = []
     file_paths: list[str] = []
     created_at: datetime

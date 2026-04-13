@@ -126,10 +126,10 @@ async function getMermaid(): Promise<MermaidApi> {
           startOnLoad: false,
           theme: "dark",
           securityLevel: "strict",
+          htmlLabels: true,
           fontFamily: "'JetBrains Mono', ui-monospace, monospace",
           flowchart: {
             useMaxWidth: true,
-            htmlLabels: false,
             curve: "basis",
             nodeSpacing: 50,
             rankSpacing: 50,
@@ -187,6 +187,10 @@ function getIconSvg(prefix: string, iconName: string, sizePx = 24): string | nul
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${sizePx}" height="${sizePx}" fill="${color}" style="display:inline-block;vertical-align:middle;margin-right:6px;flex-shrink:0;filter:drop-shadow(0 0 2px ${color}40)">${icon.body}</svg>`;
 }
 
+function humanizeIconName(iconName: string): string {
+  return iconName.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
+}
+
 // Match patterns like "fa:user", "fab:php", "mdi:database" in text
 const ICON_RE = /\b(fa[bs]?|fa6-solid|fa6-brands|mdi):([a-z0-9][a-z0-9-]*)/gi;
 
@@ -200,30 +204,34 @@ function injectIcons(svgHtml: string): string {
   const doc = parser.parseFromString(svgHtml, "image/svg+xml");
   const svg = doc.querySelector("svg");
   if (!svg) return svgHtml;
+  let replacedHtmlLabel = false;
 
   // Process foreignObject HTML labels (most common with htmlLabels: true)
   svg.querySelectorAll("foreignObject span, foreignObject div, foreignObject p").forEach((el) => {
     const html = el.innerHTML;
     if (!ICON_RE.test(html)) return;
     ICON_RE.lastIndex = 0;
-    el.innerHTML = html.replace(ICON_RE, (match, prefix, name) => {
+    const updated = html.replace(ICON_RE, (match, prefix, name) => {
       const iconSvg = getIconSvg(prefix.toLowerCase(), name, 24);
       return iconSvg || match; // Keep original text if icon not found
     });
+    if (updated !== html) {
+      replacedHtmlLabel = true;
+      el.innerHTML = updated;
+    }
   });
 
-  // Process SVG <text> / <tspan> elements (non-htmlLabels mode)
-  svg.querySelectorAll("text, tspan").forEach((textEl) => {
-    const content = textEl.textContent || "";
-    ICON_RE.lastIndex = 0;
-    if (!ICON_RE.test(content)) return;
-    ICON_RE.lastIndex = 0;
-    // For SVG text, we can't embed HTML. Just strip the prefix to clean up.
-    textEl.textContent = content.replace(ICON_RE, (_match, _prefix, name) => {
-      // Convert icon-name to Title Case label
-      return name.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
+  // If Mermaid falls back to plain SVG text labels, keep them readable instead
+  // of surfacing raw `fa:*` / `mdi:*` tokens to the user.
+  if (!replacedHtmlLabel) {
+    svg.querySelectorAll("text, tspan").forEach((textEl) => {
+      const content = textEl.textContent || "";
+      ICON_RE.lastIndex = 0;
+      if (!ICON_RE.test(content)) return;
+      ICON_RE.lastIndex = 0;
+      textEl.textContent = content.replace(ICON_RE, (_match, _prefix, name) => humanizeIconName(name));
     });
-  });
+  }
 
   return new XMLSerializer().serializeToString(svg);
 }

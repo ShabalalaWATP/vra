@@ -12,10 +12,13 @@ __pycache__/
 
 # ── Node ──────────────────────────────────────────────────────
 frontend/node_modules/
+offline-packages/
+vragent-airgap-bundle.tar.gz
 
 # ── Large downloaded tools (binaries — installed via scripts on target) ──
 backend/tools/codeql/
 backend/tools/jadx/
+backend/tools/python_vendor/
 
 # ── Runtime / user data ───────────────────────────────────────
 backend/uploads/

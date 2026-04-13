@@ -35,7 +35,7 @@ export function useWebSocket(scanId: string | undefined) {
       setConnected(false);
       // Auto-reconnect after 2s unless scan is done — use ref for current value
       const status = lastProgressRef.current?.status;
-      if (status !== "completed" && status !== "failed") {
+      if (status !== "completed" && status !== "failed" && status !== "cancelled") {
         reconnectTimer.current = setTimeout(() => {
           if (mountedRef.current) connect();
         }, 2000);
@@ -67,6 +67,14 @@ export function useWebSocket(scanId: string | undefined) {
       }
     };
   }, [scanId, updateProgress]);
+
+  useEffect(() => {
+    setEvents([]);
+    setConnected(false);
+    setLastProgress(null);
+    lastProgressRef.current = null;
+    lastEventMsg.current = "";
+  }, [scanId]);
 
   useEffect(() => {
     mountedRef.current = true;

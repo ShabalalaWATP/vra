@@ -368,6 +368,12 @@ function LLMProfilesTab() {
                 <option value={131072}>128K tokens (recommended)</option>
                 <option value={200000}>200K tokens</option>
                 <option value={400000}>400K tokens</option>
+                <option value={500000}>500K tokens</option>
+                <option value={600000}>600K tokens</option>
+                <option value={700000}>700K tokens</option>
+                <option value={800000}>800K tokens</option>
+                <option value={900000}>900K tokens</option>
+                <option value={1000000}>1M tokens</option>
               </select>
               <p className="text-xs text-text-muted mt-1">
                 Total input + output capacity. Must match the model you are running.

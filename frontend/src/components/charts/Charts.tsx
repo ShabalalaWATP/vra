@@ -67,6 +67,19 @@ const SCANNER_COLORS: Record<string, string> = {
   dep_audit: "#22c55e",
 };
 
+const FINDING_SOURCE_COLORS: Record<string, string> = {
+  scanner: "#06b6d4",
+  llm: "#f59e0b",
+  hybrid: "#ec4899",
+};
+
+const VERIFICATION_COLORS: Record<string, string> = {
+  hypothesis: "#6b7280",
+  statically_verified: "#3b82f6",
+  strongly_verified: "#22c55e",
+  runtime_validated: "#ef4444",
+};
+
 const LANG_COLORS: Record<string, string> = {
   python: "#3572A5",
   javascript: "#f1e05a",
@@ -252,8 +265,135 @@ export function ScannerHitsChart({
   const height = Math.max(140, data.labels.length * 36 + 30);
 
   return (
-    <ChartContainer title="Scanner Hit Distribution" maxWidth={maxWidth} maxHeight={300}>
+    <ChartContainer title="Raw Scanner Leads" maxWidth={maxWidth} maxHeight={300}>
       <div style={{ height: Math.min(height, 280) }}>
+        <Bar data={data} options={options} />
+      </div>
+    </ChartContainer>
+  );
+}
+
+export function FindingSourceChart({
+  counts,
+  maxWidth = 400,
+}: {
+  counts: Record<string, number>;
+  maxWidth?: number;
+}) {
+  const data = useMemo(() => {
+    const ordered = [
+      ["Scanner-led", "scanner", counts.scanner || 0],
+      ["LLM-only", "llm", counts.llm || 0],
+      ["Hybrid", "hybrid", counts.hybrid || 0],
+    ] as Array<[string, string, number]>;
+    const filtered = ordered.filter(([, , value]) => value > 0);
+
+    if (!filtered.length) return null;
+
+    return {
+      labels: filtered.map(([label]) => label),
+      datasets: [
+        {
+          data: filtered.map(([, , value]) => value),
+          backgroundColor: filtered.map(([, key]) => (FINDING_SOURCE_COLORS[key] || "#6b7280") + "cc"),
+          borderColor: filtered.map(([, key]) => FINDING_SOURCE_COLORS[key] || "#6b7280"),
+          borderWidth: 1,
+          borderRadius: 4,
+          barThickness: 22,
+        },
+      ],
+    };
+  }, [counts]);
+
+  if (!data) return null;
+
+  const options: ChartOptions<"bar"> = {
+    indexAxis: "y",
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+    },
+    scales: {
+      x: {
+        grid: { color: "rgba(255,255,255,0.04)" },
+        ticks: { precision: 0 },
+      },
+      y: {
+        grid: { display: false },
+      },
+    },
+  };
+
+  const height = Math.max(140, data.labels.length * 36 + 30);
+
+  return (
+    <ChartContainer title="Final Finding Sources" maxWidth={maxWidth} maxHeight={300}>
+      <div style={{ height: Math.min(height, 220) }}>
+        <Bar data={data} options={options} />
+      </div>
+    </ChartContainer>
+  );
+}
+
+export function VerificationLevelChart({
+  counts,
+  maxWidth = 400,
+}: {
+  counts: Record<string, number>;
+  maxWidth?: number;
+}) {
+  const data = useMemo(() => {
+    const ordered = [
+      ["Hypothesis", "hypothesis", counts.hypothesis || 0],
+      ["Static", "statically_verified", counts.statically_verified || 0],
+      ["Strong", "strongly_verified", counts.strongly_verified || 0],
+      ["Runtime", "runtime_validated", counts.runtime_validated || 0],
+    ] as Array<[string, string, number]>;
+    const filtered = ordered.filter(([, , value]) => value > 0);
+
+    if (!filtered.length) return null;
+
+    return {
+      labels: filtered.map(([label]) => label),
+      datasets: [
+        {
+          data: filtered.map(([, , value]) => value),
+          backgroundColor: filtered.map(([, key]) => (VERIFICATION_COLORS[key] || "#6b7280") + "cc"),
+          borderColor: filtered.map(([, key]) => VERIFICATION_COLORS[key] || "#6b7280"),
+          borderWidth: 1,
+          borderRadius: 4,
+          barThickness: 22,
+        },
+      ],
+    };
+  }, [counts]);
+
+  if (!data) return null;
+
+  const options: ChartOptions<"bar"> = {
+    indexAxis: "y",
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+    },
+    scales: {
+      x: {
+        grid: { color: "rgba(255,255,255,0.04)" },
+        ticks: { precision: 0 },
+      },
+      y: {
+        grid: { display: false },
+      },
+    },
+  };
+
+  const height = Math.max(140, data.labels.length * 36 + 30);
+
+  return (
+    <ChartContainer title="Verification Levels" maxWidth={maxWidth} maxHeight={300}>
+      <div style={{ height: Math.min(height, 240) }}>
         <Bar data={data} options={options} />
       </div>
     </ChartContainer>

@@ -9,6 +9,7 @@ Key improvements:
 """
 
 import logging
+import re
 from pathlib import Path
 
 from app.analysis.dependency_context import vulnerable_dependency_context_for_file
@@ -123,21 +124,23 @@ class VerifierAgent(BaseAgent):
 
         # ── Phase 4: Exploit evidence generation ─────────────────
         if verification_depth in ("standard", "deep"):
-            confirmed_high = [
-                f for f in ctx.candidate_findings
-                if f.status == "confirmed"
-                and f.severity in ("critical", "high")
-                and f.confidence >= 0.7
-            ]
-            if confirmed_high:
-                await self.emit_progress(ctx, task=f"Generating exploit evidence for {len(confirmed_high)} findings")
-                await self.emit(ctx, f"Generating PoC for {len(confirmed_high)} critical/high findings...")
-                await self._generate_exploit_evidence(ctx, confirmed_high)
+            exploitable = self._eligible_exploit_evidence_findings(ctx, verification_depth)
+            if exploitable:
+                await self.emit_progress(ctx, task=f"Generating exploit evidence for {len(exploitable)} findings")
+                await self.emit(ctx, f"Generating PoC for {len(exploitable)} confirmed findings...")
+                await self._generate_exploit_evidence(ctx, exploitable)
 
         # ── CVE Correlation ────────────────────────────────────────
         await self.emit_progress(ctx, task="Correlating findings with CVE database")
         await self.emit(ctx, "Correlating findings against CVE/advisory database...")
         await self._correlate_cves(ctx)
+
+        deduped_count, merged_count = self._finalise_verified_findings(ctx)
+        if merged_count:
+            await self.emit(
+                ctx,
+                f"Deduplicated verified findings: {deduped_count} canonical findings, {merged_count} duplicates merged",
+            )
 
         # ── Persist confirmed findings ────────────────────────────
         await self.emit(ctx, "Persisting findings to database...")
@@ -207,11 +210,21 @@ class VerifierAgent(BaseAgent):
             title = v.get("original_title", "")
             for finding in batch:
                 if finding.title == title:
+                    verification_notes = str(v.get("verification_notes", "")).strip()
                     if v.get("is_valid", False):
                         finding.status = "confirmed"
                         finding.severity = v.get("adjusted_severity", finding.severity)
                         finding.confidence = v.get("adjusted_confidence", finding.confidence)
-                        finding.opposing_evidence.extend(v.get("counter_evidence", []))
+                        finding.verification_level = "statically_verified"
+                        finding.verification_notes = verification_notes or finding.verification_notes
+                        finding.supporting_evidence = self._merge_string_lists(
+                            finding.supporting_evidence,
+                            [verification_notes] if verification_notes else [],
+                        )
+                        finding.opposing_evidence = self._merge_string_lists(
+                            finding.opposing_evidence,
+                            v.get("counter_evidence", []),
+                        )
                         # Store exploitability and prereqs in hypothesis
                         exploitability = v.get("exploitability", "")
                         prereqs = v.get("prerequisites", [])
@@ -221,6 +234,8 @@ class VerifierAgent(BaseAgent):
                             finding.hypothesis += f"\nPrerequisites: {', '.join(prereqs)}"
                     else:
                         finding.status = "dismissed"
+                        finding.verification_level = "dismissed"
+                        finding.verification_notes = verification_notes or finding.verification_notes
                         finding.confidence = v.get("adjusted_confidence", 0.1)
                     break
 
@@ -247,6 +262,9 @@ class VerifierAgent(BaseAgent):
                     supporting_evidence=chain.get("steps", []),
                     confidence=0.7,
                     status="confirmed",
+                    provenance="hybrid",
+                    verification_level="strongly_verified",
+                    verification_notes=chain.get("combined_impact", ""),
                     related_findings=involved,
                 ))
 
@@ -301,6 +319,9 @@ class VerifierAgent(BaseAgent):
                     supporting_evidence=chain.get("steps", []),
                     confidence=0.65,
                     status="confirmed",
+                    provenance="hybrid",
+                    verification_level="strongly_verified",
+                    verification_notes=chain.get("combined_impact", ""),
                     related_findings=chain.get("findings_involved", []),
                 ))
                 await self.emit(
@@ -372,45 +393,89 @@ class VerifierAgent(BaseAgent):
             except Exception:
                 pass
 
+    @staticmethod
+    def _eligible_exploit_evidence_findings(
+        ctx: ScanContext,
+        verification_depth: str,
+    ) -> list[CandidateFinding]:
+        eligible: list[CandidateFinding] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+
+        for finding in ctx.candidate_findings:
+            if finding.status != "confirmed":
+                continue
+
+            severity = str(finding.severity or "").lower()
+            confidence = float(finding.confidence or 0.0)
+            has_supporting_context = bool(
+                finding.related_cves
+                or finding.attack_scenario
+                or finding.exploit_template
+                or finding.related_findings
+            )
+
+            qualifies = (
+                severity in {"critical", "high"}
+                and confidence >= 0.55
+            ) or (
+                verification_depth == "deep"
+                and severity == "medium"
+                and (confidence >= 0.75 or has_supporting_context)
+            )
+            if not qualifies:
+                continue
+
+            dedupe_key = (
+                str(finding.title or ""),
+                str(finding.file_path or ""),
+                severity,
+            )
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            eligible.append(finding)
+
+        return sorted(
+            eligible,
+            key=lambda item: (
+                item.severity != "critical",
+                item.severity != "high",
+                -(item.confidence or 0.0),
+                str(item.title or ""),
+            ),
+        )
+
     async def _generate_exploit_evidence(self, ctx: ScanContext, findings: list):
-        """Generate PoC templates and exploit evidence for confirmed high-severity findings."""
+        """Generate PoC templates and exploit evidence for confirmed findings."""
         POC_SYSTEM = """You are a security researcher generating proof-of-concept evidence
 for a confirmed vulnerability. Your goal is to help analysts validate the finding.
 
 Rules:
 1. Generate SAFE detection payloads only — NO destructive exploits
 2. Use benign probes: sleep-based SQLi, harmless XSS (alert), file existence checks, DNS lookups
-3. Provide practical reproduction steps (curl, Python, browser)
-4. Assess difficulty and prerequisites honestly
+3. The exploit template MUST be real runnable code or commands, not pseudocode
+4. The exploit template MUST include setup/auth placeholders, the exact request method/path or invocation route when it can be inferred, the parameters/payload/body, and inline comments showing the expected safe validation signal
+5. The attack scenario MUST include: route or entry point, prerequisites, step-by-step execution, expected validation result, and cleanup notes if applicable
+6. If some details are uncertain, use explicit placeholders such as <BASE_URL>, <TOKEN>, <ROUTE>, or <ID> rather than omitting them
+7. Assess difficulty and prerequisites honestly
 
 Respond with JSON:
 {
   "exploit_difficulty": "easy|moderate|difficult|theoretical",
   "prerequisites": ["list of what attacker needs — e.g. authenticated, same network, admin role"],
+  "target_route": "HTTP method/path or local invocation route",
+  "validation_steps": ["How the analyst confirms the issue safely"],
+  "cleanup_notes": ["Any clean-up or state reset guidance"],
   "exploit_template": "The actual PoC code — curl command, Python script, or test case",
-  "attack_scenario": "Step by step: 1. Attacker does X. 2. Input reaches Y. 3. Result is Z."
+  "attack_scenario": "Step-by-step attack flow with explicit setup, execution, and expected result."
 }"""
 
-        for finding in findings[:5]:  # Cap at 5 to control AI budget
+        for finding in findings:
             if ctx.cancelled:
                 return
 
             code_context = await self.read_file(ctx, finding.file_path, max_lines=200)
-
-            user_prompt = (
-                f"## Vulnerability: {finding.title}\n"
-                f"Severity: {finding.severity} | Category: {finding.category}\n"
-                f"File: {finding.file_path}\n"
-                f"Description: {finding.hypothesis}\n"
-            )
-            if finding.code_snippet:
-                user_prompt += f"\nVulnerable code:\n```\n{finding.code_snippet[:500]}\n```\n"
-            if finding.input_sources:
-                user_prompt += f"\nInput sources: {', '.join(finding.input_sources[:3])}\n"
-            if finding.sinks:
-                user_prompt += f"\nSinks: {', '.join(finding.sinks[:3])}\n"
-
-            user_prompt += f"\nFull file context:\n```\n{code_context[:2000]}\n```"
+            user_prompt = await self._build_exploit_evidence_prompt(ctx, finding, code_context)
 
             try:
                 result = await self.llm.chat_json(POC_SYSTEM, user_prompt, max_tokens=1500)
@@ -419,7 +484,8 @@ Respond with JSON:
                 finding.exploit_difficulty = result.get("exploit_difficulty", "")
                 finding.exploit_prerequisites = result.get("prerequisites", [])
                 finding.exploit_template = result.get("exploit_template", "")
-                finding.attack_scenario = result.get("attack_scenario", "")
+                finding.attack_scenario = self._format_attack_scenario(result)
+                finding.exploit_evidence = self._build_structured_exploit_evidence(ctx, finding, result)
 
                 await self.emit(
                     ctx,
@@ -428,6 +494,228 @@ Respond with JSON:
 
             except Exception as e:
                 await self.emit(ctx, f"PoC generation failed for {finding.title}: {e}", level="warn")
+
+    async def _build_exploit_evidence_prompt(
+        self,
+        ctx: ScanContext,
+        finding: CandidateFinding,
+        code_context: str,
+    ) -> str:
+        entry_points = self._relevant_entry_points(ctx, finding)
+        related_taint_flows = self._relevant_taint_flows(ctx, finding)
+        components = self._components_for_finding(ctx, finding)
+        caller_hints: list[str] = []
+        if ctx.call_graph:
+            for edge in ctx.call_graph.get_file_callers(finding.file_path)[:5]:
+                caller_hints.append(
+                    f"{edge.caller_symbol} in {edge.caller_file} -> {edge.callee_symbol} "
+                    f"(confidence {edge.confidence:.2f})"
+                )
+
+        related_file_contexts: list[str] = []
+        seen_files = {finding.file_path}
+        for ep in entry_points[:2]:
+            ep_file = str(ep.get("file") or "").strip()
+            if not ep_file or ep_file in seen_files:
+                continue
+            seen_files.add(ep_file)
+            ep_content = await self.read_file(ctx, ep_file, max_lines=120)
+            related_file_contexts.append(
+                f"### Entry point file: {ep_file}\n```\n{ep_content[:1400]}\n```"
+            )
+
+        parts = [
+            f"## Vulnerability: {finding.title}",
+            f"Severity: {finding.severity} | Category: {finding.category}",
+            f"File: {finding.file_path}",
+            f"Description: {finding.hypothesis}",
+            "",
+            "## Analyst Output Requirements",
+            "- Generate actual code or commands, not pseudocode.",
+            "- Provide the likely route, handler, or invocation path when you can infer it.",
+            "- Include authentication/setup assumptions, exact payload parameters or body fields, expected safe validation signals, and cleanup notes.",
+            "- Use explicit placeholders when repository context is still incomplete.",
+        ]
+
+        if components:
+            parts.append("\n## Component Context")
+            parts.append("- Components: " + ", ".join(components))
+
+        if finding.code_snippet:
+            parts.append(f"\nVulnerable code:\n```\n{finding.code_snippet[:700]}\n```")
+        if finding.input_sources:
+            parts.append(f"\nInput sources: {', '.join(finding.input_sources[:5])}")
+        if finding.sinks:
+            parts.append(f"Sinks: {', '.join(finding.sinks[:5])}")
+
+        if entry_points:
+            parts.append("\n## Likely Entry Points / Routes")
+            for ep in entry_points[:6]:
+                label = ep.get("path") or ep.get("function") or ep.get("file") or "entry point"
+                ep_type = ep.get("type") or ep.get("method") or "entry point"
+                ep_file = ep.get("file") or finding.file_path
+                parts.append(f"- {ep_type}: {label} ({ep_file})")
+
+        if caller_hints:
+            parts.append("\n## Static Call-Graph Hints")
+            for hint in caller_hints:
+                parts.append(f"- {hint}")
+
+        if related_taint_flows:
+            parts.append("\n## Related Taint Flows")
+            for flow in related_taint_flows[:4]:
+                parts.append(f"- {flow}")
+
+        parts.append(f"\n## Full File Context\n```\n{code_context[:2600]}\n```")
+        if related_file_contexts:
+            parts.append("\n## Additional Reachability Context")
+            parts.extend(related_file_contexts)
+
+        return "\n".join(parts)
+
+    def _build_structured_exploit_evidence(
+        self,
+        ctx: ScanContext,
+        finding: CandidateFinding,
+        result: dict,
+    ) -> dict:
+        prerequisites = self._clean_string_list(result.get("prerequisites"))
+        validation_steps = self._clean_string_list(result.get("validation_steps"))
+        cleanup_notes = self._clean_string_list(result.get("cleanup_notes"))
+        related_entry_points = [
+            self._format_entry_point_hint(entry_point)
+            for entry_point in self._relevant_entry_points(ctx, finding)[:4]
+        ]
+        related_taint_flows = self._relevant_taint_flows(ctx, finding)[:4]
+        target_route = str(result.get("target_route") or "").strip()
+        if not target_route and related_entry_points:
+            target_route = related_entry_points[0]
+
+        payload = {
+            "difficulty": str(result.get("exploit_difficulty") or "").strip() or None,
+            "target_route": target_route or None,
+            "prerequisites": prerequisites,
+            "validation_steps": validation_steps,
+            "cleanup_notes": cleanup_notes,
+            "exploit_template": str(result.get("exploit_template") or "").strip() or None,
+            "attack_scenario": str(result.get("attack_scenario") or "").strip() or None,
+            "components": self._components_for_finding(ctx, finding),
+            "related_entry_points": related_entry_points,
+            "related_taint_flows": related_taint_flows,
+        }
+        return {
+            key: value
+            for key, value in payload.items()
+            if value not in (None, [], "")
+        }
+
+    @staticmethod
+    def _format_attack_scenario(result: dict) -> str:
+        parts: list[str] = []
+        route = str(result.get("target_route") or "").strip()
+        if route:
+            parts.append(f"Route or entry point: {route}")
+
+        scenario = str(result.get("attack_scenario") or "").strip()
+        if scenario:
+            parts.append(scenario)
+
+        validation_steps = [
+            str(step).strip()
+            for step in (result.get("validation_steps") or [])
+            if str(step).strip()
+        ]
+        if validation_steps:
+            parts.append("Validation:\n" + "\n".join(f"- {step}" for step in validation_steps))
+
+        cleanup_notes = [
+            str(step).strip()
+            for step in (result.get("cleanup_notes") or [])
+            if str(step).strip()
+        ]
+        if cleanup_notes:
+            parts.append("Cleanup:\n" + "\n".join(f"- {step}" for step in cleanup_notes))
+
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _clean_string_list(values) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        cleaned: list[str] = []
+        for value in values:
+            text = str(value).strip()
+            if text:
+                cleaned.append(text)
+        return cleaned
+
+    @staticmethod
+    def _format_entry_point_hint(entry_point: dict) -> str:
+        method = str(entry_point.get("method") or "").strip()
+        path = str(entry_point.get("path") or "").strip()
+        entry_type = str(entry_point.get("type") or "").strip()
+        file_path = str(entry_point.get("file") or "").strip()
+        function = str(entry_point.get("function") or "").strip()
+
+        headline = " ".join(part for part in [method, path] if part).strip()
+        if not headline:
+            headline = entry_type or function or file_path or "entry point"
+
+        location_bits = []
+        if file_path:
+            location_bits.append(file_path)
+        if function:
+            location_bits.append(function)
+        if location_bits:
+            headline += f" in {'::'.join(location_bits)}"
+        if entry_type and entry_type not in headline:
+            headline += f" [{entry_type}]"
+        return headline
+
+    @staticmethod
+    def _components_for_finding(ctx: ScanContext, finding: CandidateFinding) -> list[str]:
+        names: list[str] = []
+        for component in ctx.components:
+            for path in component.get("files", []):
+                if finding.file_path.startswith(path) or finding.file_path == path:
+                    name = str(component.get("name") or "component")
+                    if name not in names:
+                        names.append(name)
+                    break
+        return names
+
+    @staticmethod
+    def _relevant_entry_points(ctx: ScanContext, finding: CandidateFinding) -> list[dict]:
+        matches: list[dict] = []
+        file_dir = finding.file_path.rsplit("/", 1)[0] if "/" in finding.file_path else finding.file_path
+        for entry_point in ctx.entry_points:
+            ep_file = str(entry_point.get("file") or "").strip()
+            ep_function = str(entry_point.get("function") or "").strip()
+            if ep_file == finding.file_path:
+                matches.append(entry_point)
+                continue
+            if ep_file and file_dir and ep_file.startswith(file_dir):
+                matches.append(entry_point)
+                continue
+            if ep_function and (
+                ep_function in (finding.code_snippet or "")
+                or ep_function in finding.hypothesis
+            ):
+                matches.append(entry_point)
+        return matches
+
+    @staticmethod
+    def _relevant_taint_flows(ctx: ScanContext, finding: CandidateFinding) -> list[str]:
+        flows: list[str] = []
+        for flow in ctx.taint_flows:
+            if finding.file_path not in {flow.source_file, flow.sink_file}:
+                continue
+            verified = " [CALL GRAPH VERIFIED]" if flow.graph_verified else ""
+            flows.append(
+                f"{flow.source_type} {flow.source_file}:{flow.source_line} -> "
+                f"{flow.sink_type} {flow.sink_file}:{flow.sink_line}{verified}"
+            )
+        return flows
 
     async def _correlate_cves(self, ctx: ScanContext):
         """Correlate findings with advisory data and persist strong package evidence."""
@@ -604,6 +892,432 @@ Respond with JSON:
         )
         return ranked[:max_results]
 
+    @staticmethod
+    def _severity_rank(severity: str | None) -> int:
+        return {
+            "critical": 5,
+            "high": 4,
+            "medium": 3,
+            "low": 2,
+            "info": 1,
+        }.get(str(severity or "").lower(), 0)
+
+    @staticmethod
+    def _verification_rank(level: str | None) -> int:
+        return {
+            "dismissed": -1,
+            "hypothesis": 0,
+            "statically_verified": 1,
+            "strongly_verified": 2,
+            "runtime_validated": 3,
+        }.get(str(level or "").lower(), 0)
+
+    @staticmethod
+    def _normalise_text(value: str | None, *, limit: int = 160) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+        return text[:limit]
+
+    @staticmethod
+    def _normalise_path(value: str | None) -> str:
+        return str(value or "").replace("\\", "/").strip().lstrip("./").lower()
+
+    @staticmethod
+    def _parse_line_range(line_range: str | None) -> tuple[int | None, int | None]:
+        text = str(line_range or "").strip()
+        if not text:
+            return None, None
+        parts = text.split("-", 1)
+        try:
+            start = int(parts[0].strip())
+        except (TypeError, ValueError):
+            return None, None
+        end = start
+        if len(parts) > 1:
+            try:
+                end = int(parts[1].strip())
+            except (TypeError, ValueError):
+                end = start
+        if end < start:
+            start, end = end, start
+        return start, end
+
+    @staticmethod
+    def _token_set(value: str | None) -> set[str]:
+        return {
+            token
+            for token in re.split(r"[^a-z0-9]+", str(value or "").lower())
+            if len(token) >= 3
+        }
+
+    @classmethod
+    def _build_canonical_key(cls, finding: CandidateFinding) -> str:
+        path_key = cls._normalise_path(finding.file_path)
+        category_key = cls._normalise_text(finding.category, limit=60)
+        line_start, _line_end = cls._parse_line_range(finding.line_range)
+        cwe_key = "|".join(sorted(str(cwe).upper() for cwe in (finding.cwe_ids or [])[:3]))
+        sink_key = cls._normalise_text((finding.sinks or [""])[0], limit=60)
+        title_key = cls._normalise_text(finding.title, limit=80)
+        anchor = cwe_key or sink_key or (str(line_start) if line_start else title_key)
+        return "|".join(part for part in [path_key, category_key, anchor] if part)
+
+    @classmethod
+    def _line_ranges_overlap(cls, finding_a: CandidateFinding, finding_b: CandidateFinding) -> bool:
+        start_a, end_a = cls._parse_line_range(finding_a.line_range)
+        start_b, end_b = cls._parse_line_range(finding_b.line_range)
+        if not start_a or not start_b:
+            return False
+        return start_a <= (end_b or start_b) and start_b <= (end_a or start_a)
+
+    @classmethod
+    def _title_similarity(cls, left: str | None, right: str | None) -> float:
+        left_tokens = cls._token_set(left)
+        right_tokens = cls._token_set(right)
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / max(len(left_tokens | right_tokens), 1)
+
+    @classmethod
+    def _is_probable_duplicate(cls, canonical: CandidateFinding, candidate: CandidateFinding) -> bool:
+        if cls._build_canonical_key(canonical) == cls._build_canonical_key(candidate):
+            return True
+
+        if cls._normalise_path(canonical.file_path) != cls._normalise_path(candidate.file_path):
+            return False
+
+        if cls._normalise_text(canonical.category, limit=60) != cls._normalise_text(candidate.category, limit=60):
+            return False
+
+        if cls._line_ranges_overlap(canonical, candidate):
+            return True
+
+        if set(canonical.cwe_ids or []) & set(candidate.cwe_ids or []):
+            return True
+
+        if set(canonical.sinks or []) & set(candidate.sinks or []):
+            return True
+
+        if set(canonical.input_sources or []) & set(candidate.input_sources or []):
+            return True
+
+        return cls._title_similarity(canonical.title, candidate.title) >= 0.55
+
+    @staticmethod
+    def _merge_string_lists(existing: list[str] | None, new_values: list[str] | None) -> list[str]:
+        seen: set[str] = set()
+        merged: list[str] = []
+        for value in [*(existing or []), *(new_values or [])]:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(text)
+        return merged
+
+    @staticmethod
+    def _merge_dict_list(
+        existing: list[dict] | None,
+        new_values: list[dict] | None,
+        *,
+        key_fields: tuple[str, ...],
+    ) -> list[dict]:
+        merged: list[dict] = []
+        seen: set[tuple] = set()
+        for item in [*(existing or []), *(new_values or [])]:
+            if not isinstance(item, dict):
+                continue
+            key = tuple(str(item.get(field) or "").strip().lower() for field in key_fields)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged
+
+    @classmethod
+    def _merge_provenance(cls, left: str | None, right: str | None) -> str:
+        values = {str(left or "").strip().lower(), str(right or "").strip().lower()} - {""}
+        if "hybrid" in values or values == {"llm", "scanner"}:
+            return "hybrid"
+        if "scanner" in values and len(values) == 1:
+            return "scanner"
+        if "llm" in values and len(values) == 1:
+            return "llm"
+        return "hybrid" if len(values) > 1 else (values.pop() if values else "llm")
+
+    @classmethod
+    def _merge_findings(cls, canonical: CandidateFinding, duplicate: CandidateFinding) -> CandidateFinding:
+        if cls._severity_rank(duplicate.severity) > cls._severity_rank(canonical.severity):
+            canonical.severity = duplicate.severity
+        canonical.confidence = max(float(canonical.confidence or 0.0), float(duplicate.confidence or 0.0))
+        if duplicate.code_snippet and not canonical.code_snippet:
+            canonical.code_snippet = duplicate.code_snippet
+        if duplicate.hypothesis and len(str(duplicate.hypothesis)) > len(str(canonical.hypothesis or "")):
+            canonical.hypothesis = duplicate.hypothesis
+        canonical.supporting_evidence = cls._merge_string_lists(
+            canonical.supporting_evidence,
+            duplicate.supporting_evidence,
+        )
+        canonical.opposing_evidence = cls._merge_string_lists(
+            canonical.opposing_evidence,
+            duplicate.opposing_evidence,
+        )
+        canonical.input_sources = cls._merge_string_lists(canonical.input_sources, duplicate.input_sources)
+        canonical.sinks = cls._merge_string_lists(canonical.sinks, duplicate.sinks)
+        canonical.cwe_ids = cls._merge_string_lists(canonical.cwe_ids, duplicate.cwe_ids)
+        canonical.related_findings = cls._merge_string_lists(
+            canonical.related_findings,
+            duplicate.related_findings,
+        )
+        canonical.source_scanners = cls._merge_string_lists(
+            canonical.source_scanners,
+            duplicate.source_scanners,
+        )
+        canonical.source_rules = cls._merge_string_lists(canonical.source_rules, duplicate.source_rules)
+        canonical.source_scanner_hits = cls._merge_dict_list(
+            canonical.source_scanner_hits,
+            duplicate.source_scanner_hits,
+            key_fields=("scanner", "rule_id", "message", "line"),
+        )
+        canonical.related_cves = cls._merge_dict_list(
+            canonical.related_cves,
+            duplicate.related_cves,
+            key_fields=("display_id", "cve_id", "advisory_id", "package"),
+        )
+        canonical.exploit_prerequisites = cls._merge_string_lists(
+            canonical.exploit_prerequisites,
+            duplicate.exploit_prerequisites,
+        )
+        canonical.provenance = cls._merge_provenance(canonical.provenance, duplicate.provenance)
+        if cls._verification_rank(duplicate.verification_level) > cls._verification_rank(canonical.verification_level):
+            canonical.verification_level = duplicate.verification_level
+        canonical.verification_notes = "\n\n".join(
+            cls._merge_string_lists(
+                [canonical.verification_notes] if canonical.verification_notes else [],
+                [duplicate.verification_notes] if duplicate.verification_notes else [],
+            )
+        )
+        if not canonical.exploit_evidence and duplicate.exploit_evidence:
+            canonical.exploit_evidence = duplicate.exploit_evidence
+        if not canonical.exploit_template and duplicate.exploit_template:
+            canonical.exploit_template = duplicate.exploit_template
+        if not canonical.attack_scenario and duplicate.attack_scenario:
+            canonical.attack_scenario = duplicate.attack_scenario
+        if not canonical.exploit_difficulty and duplicate.exploit_difficulty:
+            canonical.exploit_difficulty = duplicate.exploit_difficulty
+        merged_titles = cls._merge_string_lists(
+            list((canonical.merge_metadata or {}).get("merged_titles") or [canonical.title]),
+            list((duplicate.merge_metadata or {}).get("merged_titles") or [duplicate.title]),
+        )
+        merged_provenance = cls._merge_string_lists(
+            list((canonical.merge_metadata or {}).get("merged_provenance") or [canonical.provenance]),
+            list((duplicate.merge_metadata or {}).get("merged_provenance") or [duplicate.provenance]),
+        )
+        canonical.merge_metadata = {
+            "merged_count": len(merged_titles),
+            "merged_titles": merged_titles,
+            "merged_provenance": merged_provenance,
+            "source_file": canonical.file_path,
+        }
+        canonical.canonical_key = cls._build_canonical_key(canonical)
+        return canonical
+
+    def _relevant_taint_flows_for_finding(self, ctx: ScanContext, finding: CandidateFinding) -> list:
+        flows = []
+        path_key = self._normalise_path(finding.file_path)
+        for flow in ctx.taint_flows:
+            if self._normalise_path(flow.source_file) == path_key or self._normalise_path(flow.sink_file) == path_key:
+                flows.append(flow)
+        return flows
+
+    def _finalise_verified_findings(self, ctx: ScanContext) -> tuple[int, int]:
+        confirmed = [finding for finding in ctx.candidate_findings if finding.status != "dismissed"]
+        dismissed = [finding for finding in ctx.candidate_findings if finding.status == "dismissed"]
+
+        for finding in confirmed:
+            strong_signals = 0
+            if finding.exploit_evidence or finding.exploit_template:
+                strong_signals += 1
+            if any(
+                str(advisory.get("evidence_strength") or "").lower() in {"strong", "medium"}
+                or "confirmed" in str(advisory.get("evidence_type") or "").lower()
+                for advisory in (finding.related_cves or [])
+                if isinstance(advisory, dict)
+            ):
+                strong_signals += 1
+            if any(flow.graph_verified and not flow.sanitised for flow in self._relevant_taint_flows_for_finding(ctx, finding)):
+                strong_signals += 1
+            if float(finding.confidence or 0.0) >= 0.9:
+                strong_signals += 1
+
+            if self._verification_rank(finding.verification_level) < self._verification_rank("statically_verified"):
+                finding.verification_level = "statically_verified"
+            if strong_signals >= 2:
+                finding.verification_level = "strongly_verified"
+
+            if (
+                str(finding.severity or "").lower() in {"critical", "high"}
+                and strong_signals == 0
+                and float(finding.confidence or 0.0) < 0.65
+            ):
+                original = str(finding.severity or "").lower()
+                finding.severity = "high" if original == "critical" else "medium"
+                downgrade_note = (
+                    f"Severity downgraded from {original} because verification remained purely static "
+                    "and supporting signals were limited."
+                )
+                finding.verification_notes = "\n\n".join(
+                    self._merge_string_lists(
+                        [finding.verification_notes] if finding.verification_notes else [],
+                        [downgrade_note],
+                    )
+                )
+
+            finding.canonical_key = self._build_canonical_key(finding)
+
+        confirmed.sort(
+            key=lambda item: (
+                -self._severity_rank(item.severity),
+                -float(item.confidence or 0.0),
+                self._normalise_text(item.title),
+            )
+        )
+
+        canonical_findings: list[CandidateFinding] = []
+        merged_count = 0
+        for finding in confirmed:
+            duplicate_of = next(
+                (existing for existing in canonical_findings if self._is_probable_duplicate(existing, finding)),
+                None,
+            )
+            if duplicate_of is None:
+                canonical_findings.append(finding)
+                if not finding.merge_metadata:
+                    finding.merge_metadata = {
+                        "merged_count": 1,
+                        "merged_titles": [finding.title],
+                        "merged_provenance": [finding.provenance],
+                        "source_file": finding.file_path,
+                    }
+                continue
+            self._merge_findings(duplicate_of, finding)
+            merged_count += 1
+
+        ctx.candidate_findings = [*canonical_findings, *dismissed]
+        return len(canonical_findings), merged_count
+
+    @staticmethod
+    def _candidate_attack_text(candidate: CandidateFinding) -> str | None:
+        if not candidate.attack_scenario:
+            return None
+        if isinstance(candidate.attack_scenario, list):
+            return "\n".join(str(s) for s in candidate.attack_scenario)
+        return str(candidate.attack_scenario)
+
+    @staticmethod
+    def _candidate_description(candidate: CandidateFinding) -> str:
+        description = candidate.hypothesis or candidate.title or "No description"
+        if isinstance(description, list):
+            return "\n".join(str(s) for s in description)
+        return str(description)
+
+    @staticmethod
+    def _candidate_confidence(candidate: CandidateFinding) -> float:
+        confidence = candidate.confidence
+        if isinstance(confidence, str):
+            try:
+                return float(confidence)
+            except (TypeError, ValueError):
+                return 0.5
+        return float(confidence or 0.0)
+
+    def _build_finding_model(self, ctx: ScanContext, candidate: CandidateFinding) -> Finding:
+        return Finding(
+            scan_id=ctx.scan_id,
+            title=str(candidate.title or "Untitled")[:500],
+            severity=str(candidate.severity or "medium")[:20],
+            confidence=self._candidate_confidence(candidate),
+            category=str(candidate.category or "general")[:100] if candidate.category else None,
+            description=self._candidate_description(candidate),
+            code_snippet=str(candidate.code_snippet) if candidate.code_snippet else None,
+            status=str(candidate.status or "confirmed")[:20],
+            provenance=str(candidate.provenance or "llm")[:20],
+            source_scanners=candidate.source_scanners if isinstance(candidate.source_scanners, list) else None,
+            source_rules=candidate.source_rules if isinstance(candidate.source_rules, list) else None,
+            verification_level=str(candidate.verification_level or "hypothesis")[:32],
+            verification_notes=str(candidate.verification_notes) if candidate.verification_notes else None,
+            canonical_key=str(candidate.canonical_key)[:255] if candidate.canonical_key else None,
+            merge_metadata=candidate.merge_metadata if isinstance(candidate.merge_metadata, dict) else None,
+            cwe_ids=candidate.cwe_ids if isinstance(candidate.cwe_ids, list) else None,
+            related_cves=candidate.related_cves if isinstance(candidate.related_cves, list) else None,
+            exploit_difficulty=str(candidate.exploit_difficulty)[:20] if candidate.exploit_difficulty else None,
+            exploit_prerequisites=candidate.exploit_prerequisites if isinstance(candidate.exploit_prerequisites, list) else None,
+            exploit_template=str(candidate.exploit_template) if candidate.exploit_template else None,
+            attack_scenario=self._candidate_attack_text(candidate),
+            exploit_evidence=candidate.exploit_evidence if isinstance(candidate.exploit_evidence, dict) else None,
+        )
+
+    @staticmethod
+    def _resolve_file_id(candidate: CandidateFinding, path_to_file_id: dict) -> object | None:
+        if not candidate.file_path:
+            return None
+        fp = candidate.file_path.replace("\\", "/")
+        file_id = path_to_file_id.get(fp)
+        if not file_id and fp.startswith("/"):
+            file_id = path_to_file_id.get(fp.lstrip("/"))
+        if not file_id:
+            for db_path, fid in path_to_file_id.items():
+                if db_path.endswith(fp) or fp.endswith(db_path):
+                    file_id = fid
+                    break
+        return file_id
+
+    def _attach_candidate_evidence(self, session, finding: Finding, candidate: CandidateFinding) -> None:
+        for hit in candidate.source_scanner_hits or []:
+            scanner_name = str(hit.get("scanner") or "").strip()
+            rule_id = str(hit.get("rule_id") or "").strip()
+            message = str(hit.get("message") or "").strip()
+            if not any([scanner_name, rule_id, message]):
+                continue
+            line = hit.get("line")
+            end_line = hit.get("end_line")
+            line_range = None
+            if isinstance(line, int) and line > 0:
+                line_range = f"{line}-{end_line}" if isinstance(end_line, int) and end_line and end_line != line else str(line)
+            description_bits = [bit for bit in [rule_id, message] if bit]
+            session.add(
+                Evidence(
+                    finding_id=finding.id,
+                    type="contextual",
+                    description=" | ".join(description_bits) if description_bits else scanner_name,
+                    line_range=line_range,
+                    source=scanner_name or "scanner",
+                )
+            )
+
+        for ev_text in (candidate.supporting_evidence or []):
+            if ev_text:
+                session.add(
+                    Evidence(
+                        finding_id=finding.id,
+                        type="supporting",
+                        description=str(ev_text),
+                        source="ai_inspection",
+                    )
+                )
+
+        for ev_text in (candidate.opposing_evidence or []):
+            if ev_text:
+                session.add(
+                    Evidence(
+                        finding_id=finding.id,
+                        type="opposing",
+                        description=str(ev_text),
+                        source="ai_inspection",
+                    )
+                )
+
     async def _persist_findings(self, ctx: ScanContext):
         """Save confirmed findings to the database."""
         from sqlalchemy import select
@@ -623,79 +1337,21 @@ Respond with JSON:
                     continue
 
                 try:
-                    # Safely coerce fields
-                    attack_text = None
-                    if candidate.attack_scenario:
-                        if isinstance(candidate.attack_scenario, list):
-                            attack_text = "\n".join(str(s) for s in candidate.attack_scenario)
-                        else:
-                            attack_text = str(candidate.attack_scenario)
-
-                    desc = candidate.hypothesis or candidate.title or "No description"
-                    if isinstance(desc, list):
-                        desc = "\n".join(str(s) for s in desc)
-
-                    conf = candidate.confidence
-                    if isinstance(conf, str):
-                        try:
-                            conf = float(conf)
-                        except (ValueError, TypeError):
-                            conf = 0.5
-
-                    finding = Finding(
-                        scan_id=ctx.scan_id,
-                        title=str(candidate.title or "Untitled")[:500],
-                        severity=str(candidate.severity or "medium")[:20],
-                        confidence=conf,
-                        category=str(candidate.category or "general")[:100] if candidate.category else None,
-                        description=desc,
-                        code_snippet=str(candidate.code_snippet) if candidate.code_snippet else None,
-                        status=str(candidate.status or "confirmed")[:20],
-                        cwe_ids=candidate.cwe_ids if isinstance(candidate.cwe_ids, list) else None,
-                        related_cves=candidate.related_cves if isinstance(candidate.related_cves, list) else None,
-                        exploit_difficulty=str(candidate.exploit_difficulty)[:20] if candidate.exploit_difficulty else None,
-                        exploit_prerequisites=candidate.exploit_prerequisites if isinstance(candidate.exploit_prerequisites, list) else None,
-                        exploit_template=str(candidate.exploit_template) if candidate.exploit_template else None,
-                        attack_scenario=attack_text,
-                    )
+                    finding = self._build_finding_model(ctx, candidate)
                     session.add(finding)
                     await session.flush()
+                    candidate.finding_id = str(finding.id)
                     persisted += 1
 
                     # Link finding to its source file
-                    if candidate.file_path:
-                        fp = candidate.file_path.replace("\\", "/")
-                        file_id = path_to_file_id.get(fp)
-                        if not file_id and fp.startswith("/"):
-                            file_id = path_to_file_id.get(fp.lstrip("/"))
-                        if not file_id:
-                            for db_path, fid in path_to_file_id.items():
-                                if db_path.endswith(fp) or fp.endswith(db_path):
-                                    file_id = fid
-                                    break
-                        if file_id:
-                            session.add(FindingFile(
-                                finding_id=finding.id,
-                                file_id=file_id,
-                            ))
+                    file_id = self._resolve_file_id(candidate, path_to_file_id)
+                    if file_id:
+                        session.add(FindingFile(
+                            finding_id=finding.id,
+                            file_id=file_id,
+                        ))
 
-                    for ev_text in (candidate.supporting_evidence or []):
-                        if ev_text:
-                            session.add(Evidence(
-                                finding_id=finding.id,
-                                type="supporting",
-                                description=str(ev_text),
-                                source="ai_inspection",
-                            ))
-
-                    for ev_text in (candidate.opposing_evidence or []):
-                        if ev_text:
-                            session.add(Evidence(
-                                finding_id=finding.id,
-                                type="opposing",
-                                description=str(ev_text),
-                                source="ai_inspection",
-                            ))
+                    self._attach_candidate_evidence(session, finding, candidate)
 
                 except Exception as e:
                     logger.error(
@@ -724,54 +1380,16 @@ Respond with JSON:
                 continue
             try:
                 async with async_session() as session:
-                    attack_text = None
-                    if candidate.attack_scenario:
-                        attack_text = (
-                            "\n".join(str(s) for s in candidate.attack_scenario)
-                            if isinstance(candidate.attack_scenario, list)
-                            else str(candidate.attack_scenario)
-                        )
-                    desc = candidate.hypothesis or candidate.title or "No description"
-                    if isinstance(desc, list):
-                        desc = "\n".join(str(s) for s in desc)
-                    conf = candidate.confidence
-                    if isinstance(conf, str):
-                        try:
-                            conf = float(conf)
-                        except (ValueError, TypeError):
-                            conf = 0.5
-
-                    finding = Finding(
-                        scan_id=ctx.scan_id,
-                        title=str(candidate.title or "Untitled")[:500],
-                        severity=str(candidate.severity or "medium")[:20],
-                        confidence=conf,
-                        category=str(candidate.category or "general")[:100] if candidate.category else None,
-                        description=desc,
-                        code_snippet=str(candidate.code_snippet) if candidate.code_snippet else None,
-                        status=str(candidate.status or "confirmed")[:20],
-                        cwe_ids=candidate.cwe_ids if isinstance(candidate.cwe_ids, list) else None,
-                        related_cves=candidate.related_cves if isinstance(candidate.related_cves, list) else None,
-                        exploit_difficulty=str(candidate.exploit_difficulty)[:20] if candidate.exploit_difficulty else None,
-                        exploit_prerequisites=candidate.exploit_prerequisites if isinstance(candidate.exploit_prerequisites, list) else None,
-                        exploit_template=str(candidate.exploit_template) if candidate.exploit_template else None,
-                        attack_scenario=attack_text,
-                    )
+                    finding = self._build_finding_model(ctx, candidate)
                     session.add(finding)
                     await session.flush()
+                    candidate.finding_id = str(finding.id)
 
-                    if candidate.file_path:
-                        fp = candidate.file_path.replace("\\", "/")
-                        file_id = path_to_file_id.get(fp)
-                        if not file_id and fp.startswith("/"):
-                            file_id = path_to_file_id.get(fp.lstrip("/"))
-                        if not file_id:
-                            for db_path, fid in path_to_file_id.items():
-                                if db_path.endswith(fp) or fp.endswith(db_path):
-                                    file_id = fid
-                                    break
-                        if file_id:
-                            session.add(FindingFile(finding_id=finding.id, file_id=file_id))
+                    file_id = self._resolve_file_id(candidate, path_to_file_id)
+                    if file_id:
+                        session.add(FindingFile(finding_id=finding.id, file_id=file_id))
+
+                    self._attach_candidate_evidence(session, finding, candidate)
 
                     await session.commit()
                     persisted += 1
@@ -814,6 +1432,13 @@ Respond with JSON:
             parts.append(f"File: {f.file_path}")
             parts.append(f"Hypothesis: {f.hypothesis}")
             parts.append(f"Current confidence: {f.confidence}")
+            parts.append(f"Current verification level: {f.verification_level}")
+            if f.provenance:
+                parts.append(f"Provenance: {f.provenance}")
+            if f.source_scanners:
+                parts.append(f"Source scanners: {'; '.join(f.source_scanners[:5])}")
+            if f.source_rules:
+                parts.append(f"Source rules: {'; '.join(f.source_rules[:5])}")
             if f.input_sources:
                 parts.append(f"Input sources: {'; '.join(f.input_sources[:5])}")
             if f.sinks:
