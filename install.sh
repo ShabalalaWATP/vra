@@ -48,12 +48,17 @@ VENDOR_JADX="$VENDOR_ROOT/tools/jadx"
 VENDOR_JADX_ARCHIVE="$VENDOR_ROOT/tools/jadx.tar.gz"
 VENDOR_JADX_PART_GLOB="$VENDOR_ROOT/tools/jadx.tar.gz.part-*"
 LOCAL_SCANNERS="$BACKEND/tools/python_vendor"
+VENV_DIR="$ROOT/.venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
 
 OFFLINE=false
 SKIP_CODEQL=false
 SKIP_DB=false
 SKIP_DATA=false
 DB_PATH="$BACKEND/data/vragent.db"
+VENDOR_USABLE=true
+MIN_NODE_MAJOR=22
+MIN_NPM_MAJOR=10
 
 # ── Parse arguments ────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -88,13 +93,74 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-header() { echo -e "\n${CYAN}${"="*60}\n  $1\n${"="*60}${NC}\n"; }
 step()   { echo -e "  ${GREEN}[+]${NC} $1"; }
 warn()   { echo -e "  ${YELLOW}[!]${NC} $1"; }
 err()    { echo -e "  ${RED}[X]${NC} $1"; }
 
 has_cmd() { command -v "$1" &>/dev/null; }
 glob_exists() { compgen -G "$1" > /dev/null; }
+major_version() {
+    local raw="${1#v}"
+    raw="${raw%%.*}"
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        echo "$raw"
+    else
+        echo 0
+    fi
+}
+
+validate_vendor_manifest() {
+    if [[ ! -d "$VENDOR_ROOT" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$VENDOR_ROOT/manifest.json" ]]; then
+        warn "vendor/ubuntu exists but manifest.json is missing; ignoring vendored Ubuntu assets."
+        VENDOR_USABLE=false
+        return 0
+    fi
+
+    local target_python_minor
+    local manifest_python_minor
+    local target_machine
+    local manifest_machine
+
+    target_python_minor="$("$SYSTEM_PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    target_machine="$(uname -m)"
+    manifest_python_minor="$("$SYSTEM_PYTHON" - "$VENDOR_ROOT/manifest.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+required = manifest.get("required_target", {})
+prepared = manifest.get("prepared_on", {})
+value = required.get("python_minor") or ".".join(str(prepared.get("python", "")).split(".")[:2])
+print(value)
+PY
+)"
+    manifest_machine="$("$SYSTEM_PYTHON" - "$VENDOR_ROOT/manifest.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+required = manifest.get("required_target", {})
+prepared = manifest.get("prepared_on", {})
+print(required.get("machine") or prepared.get("machine") or "")
+PY
+)"
+
+    if [[ "$manifest_python_minor" != "$target_python_minor" ]]; then
+        warn "Ignoring vendor/ubuntu: prepared for Python $manifest_python_minor, target is Python $target_python_minor."
+        warn "Rebuild from the repo root with: bash ./prepare_ubuntu_vendor.sh"
+        VENDOR_USABLE=false
+    fi
+    if [[ -n "$manifest_machine" && "$manifest_machine" != "$target_machine" ]]; then
+        warn "Ignoring vendor/ubuntu: prepared for $manifest_machine, target is $target_machine."
+        warn "Rebuild vendor/ubuntu on the same CPU architecture as the target Ubuntu host."
+        VENDOR_USABLE=false
+    fi
+}
 
 copy_tree() {
     local src="$1"
@@ -144,36 +210,79 @@ echo ""
 # ── Check prerequisites ────────────────────────────────────────────
 header "Checking Prerequisites"
 
-# Python
-if has_cmd python3; then
-    PY_VER=$(python3 --version 2>&1)
-    step "Python: $PY_VER"
-    PY_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
-    if [[ "$PY_MINOR" -lt 11 ]]; then
-        err "Python 3.11+ required. Found: $PY_VER"
-        exit 1
-    fi
-elif has_cmd python; then
-    PY_VER=$(python --version 2>&1)
-    step "Python: $PY_VER"
+# Python 3.12 is required because tree-sitter-languages 1.10.2 does not
+# publish wheels for Python 3.13 or 3.14.
+if has_cmd python3.12; then
+    SYSTEM_PYTHON="$(command -v python3.12)"
+elif has_cmd python3 && [[ "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" == "3.12" ]]; then
+    SYSTEM_PYTHON="$(command -v python3)"
+elif has_cmd python && [[ "$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" == "3.12" ]]; then
+    SYSTEM_PYTHON="$(command -v python)"
 else
-    err "Python not found. Install Python 3.11+ first."
+    err "Python 3.12 is required. Install python3.12 and python3.12-venv first."
     exit 1
 fi
 
-PYTHON=$(has_cmd python3 && echo python3 || echo python)
-PIP=$(has_cmd pip3 && echo pip3 || echo pip)
+step "Python for VRAgent: $("$SYSTEM_PYTHON" --version 2>&1) ($SYSTEM_PYTHON)"
+validate_vendor_manifest
+
+if [[ -x "$VENV_PYTHON" ]]; then
+    VENV_VERSION="$("$VENV_PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    if [[ "$VENV_VERSION" != "3.12" ]]; then
+        warn "Existing .venv uses Python $VENV_VERSION; recreating it with Python 3.12."
+        if [[ "$(cd "$VENV_DIR" && pwd)" == "$ROOT/.venv" ]]; then
+            rm -rf "$VENV_DIR"
+        else
+            err "Refusing to remove unexpected venv path: $VENV_DIR"
+            exit 1
+        fi
+    fi
+fi
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
+    step "Creating local virtual environment: $VENV_DIR"
+    "$SYSTEM_PYTHON" -m venv "$VENV_DIR"
+fi
+
+PYTHON="$VENV_PYTHON"
+if [[ "$OFFLINE" == true ]]; then
+    if [[ "$VENDOR_USABLE" == true && -d "$VENDOR_PYTHON" ]]; then
+        "$PYTHON" -m pip install --no-index --find-links="$VENDOR_PYTHON" --upgrade pip setuptools wheel >/dev/null || \
+            warn "Could not upgrade pip/setuptools/wheel from vendored wheelhouse; continuing with venv defaults."
+    elif [[ -d "$OFFLINE_PYTHON" ]]; then
+        "$PYTHON" -m pip install --no-index --find-links="$OFFLINE_PYTHON" --upgrade pip setuptools wheel >/dev/null || \
+            warn "Could not upgrade pip/setuptools/wheel from offline wheelhouse; continuing with venv defaults."
+    else
+        warn "No offline wheelhouse available for pip bootstrap; continuing with venv defaults."
+    fi
+else
+    "$PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null
+fi
 
 # Node.js
 if has_cmd node; then
-    step "Node.js: $(node --version)"
+    NODE_VERSION="$(node --version)"
+    NODE_MAJOR="$(major_version "$NODE_VERSION")"
+    if (( NODE_MAJOR < MIN_NODE_MAJOR )); then
+        err "Node.js $MIN_NODE_MAJOR or newer is required. Current version: $NODE_VERSION"
+        err "Install Node.js 22.x LTS from your internal mirror or NodeSource package mirror."
+        exit 1
+    fi
+    step "Node.js: $NODE_VERSION"
 else
-    err "Node.js not found. Install Node.js 18+ first."
+    err "Node.js not found. Install Node.js 22.x LTS first."
     exit 1
 fi
 
 if has_cmd npm; then
-    step "npm: $(npm --version)"
+    NPM_VERSION="$(npm --version)"
+    NPM_MAJOR="$(major_version "$NPM_VERSION")"
+    if (( NPM_MAJOR < MIN_NPM_MAJOR )); then
+        err "npm $MIN_NPM_MAJOR or newer is required. Current version: $NPM_VERSION"
+        err "Install the npm version bundled with Node.js 22.x LTS."
+        exit 1
+    fi
+    step "npm: $NPM_VERSION"
 else
     err "npm not found."
     exit 1
@@ -185,12 +294,12 @@ header "Installing Backend Dependencies"
 cd "$BACKEND"
 
 if [[ "$OFFLINE" == true ]]; then
-    if [[ -d "$VENDOR_PYTHON" ]]; then
+    if [[ "$VENDOR_USABLE" == true && -d "$VENDOR_PYTHON" ]]; then
         step "Installing from vendored Ubuntu wheelhouse: $VENDOR_PYTHON"
-        $PIP install --no-index --find-links="$VENDOR_PYTHON" -e ".[dev]" 2>&1 | tail -1
+        "$PYTHON" -m pip install --no-index --find-links="$VENDOR_PYTHON" -e ".[dev]" 2>&1 | tail -1
     elif [[ -d "$OFFLINE_PYTHON" ]]; then
         step "Installing from offline packages: $OFFLINE_PYTHON"
-        $PIP install --no-index --find-links="$OFFLINE_PYTHON" -e ".[dev]" 2>&1 | tail -1
+        "$PYTHON" -m pip install --no-index --find-links="$OFFLINE_PYTHON" -e ".[dev]" 2>&1 | tail -1
     else
         err "No vendored Ubuntu wheelhouse or offline wheelhouse found."
         err "Expected one of:"
@@ -198,25 +307,25 @@ if [[ "$OFFLINE" == true ]]; then
         err "  - $OFFLINE_PYTHON"
         exit 1
     fi
-elif [[ -d "$VENDOR_PYTHON" ]]; then
+elif [[ "$VENDOR_USABLE" == true && -d "$VENDOR_PYTHON" ]]; then
     step "Installing from vendored Ubuntu wheelhouse: $VENDOR_PYTHON"
-    if ! $PIP install --no-index --find-links="$VENDOR_PYTHON" -e ".[dev]" 2>&1 | tail -1; then
+    if ! "$PYTHON" -m pip install --no-index --find-links="$VENDOR_PYTHON" -e ".[dev]" 2>&1 | tail -1; then
         warn "Vendored Ubuntu wheelhouse install failed; falling back to PyPI/internal mirror."
-        $PIP install -e ".[dev]" 2>&1 | tail -1
+        "$PYTHON" -m pip install -e ".[dev]" 2>&1 | tail -1
     fi
 else
     step "Installing Python packages from PyPI..."
-    $PIP install -e ".[dev]" 2>&1 | tail -1
+    "$PYTHON" -m pip install -e ".[dev]" 2>&1 | tail -1
 fi
 step "Backend dependencies installed"
 
 # Bundle Semgrep + Bandit locally under backend/tools/
-if [[ -d "$VENDOR_SCANNERS" ]]; then
+if [[ "$VENDOR_USABLE" == true && -d "$VENDOR_SCANNERS" ]]; then
     step "Restoring bundled Python scanners from vendored assets..."
     rm -rf "$LOCAL_SCANNERS"
     mkdir -p "$(dirname "$LOCAL_SCANNERS")"
     copy_tree "$VENDOR_SCANNERS" "$LOCAL_SCANNERS"
-elif [[ -f "$VENDOR_SCANNERS_ARCHIVE" ]] || glob_exists "$VENDOR_SCANNERS_PART_GLOB"; then
+elif [[ "$VENDOR_USABLE" == true ]] && { [[ -f "$VENDOR_SCANNERS_ARCHIVE" ]] || glob_exists "$VENDOR_SCANNERS_PART_GLOB"; }; then
     step "Restoring bundled Python scanners from vendored archive..."
     rm -rf "$LOCAL_SCANNERS"
     if [[ -f "$VENDOR_SCANNERS_ARCHIVE" ]]; then
@@ -236,25 +345,25 @@ else
             err "Offline Python packages not found: $OFFLINE_PYTHON"
             exit 1
         fi
-        $PYTHON -m scripts.bundle_python_scanners --no-index --wheelhouse "$OFFLINE_PYTHON" 2>&1 | tail -3
-    elif [[ -d "$VENDOR_PYTHON" ]]; then
-        if ! $PYTHON -m scripts.bundle_python_scanners --no-index --wheelhouse "$VENDOR_PYTHON" 2>&1 | tail -3; then
+        "$PYTHON" -m scripts.bundle_python_scanners --no-index --wheelhouse "$OFFLINE_PYTHON" 2>&1 | tail -3
+    elif [[ "$VENDOR_USABLE" == true && -d "$VENDOR_PYTHON" ]]; then
+        if ! "$PYTHON" -m scripts.bundle_python_scanners --no-index --wheelhouse "$VENDOR_PYTHON" 2>&1 | tail -3; then
             warn "Vendored scanner bundle failed; falling back to live download."
-            $PYTHON -m scripts.bundle_python_scanners 2>&1 | tail -3
+            "$PYTHON" -m scripts.bundle_python_scanners 2>&1 | tail -3
         fi
     else
-        $PYTHON -m scripts.bundle_python_scanners 2>&1 | tail -3
+        "$PYTHON" -m scripts.bundle_python_scanners 2>&1 | tail -3
     fi
 fi
 
 if [[ -f "$BACKEND/tools/bin/run_semgrep.py" && -d "$LOCAL_SCANNERS" ]]; then
-    step "Bundled Semgrep ready: $($PYTHON "$BACKEND/tools/bin/run_semgrep.py" --version 2>&1 | head -1)"
+    step "Bundled Semgrep ready: $("$PYTHON" "$BACKEND/tools/bin/run_semgrep.py" --version 2>&1 | sed '/^[[:space:]]*$/d' | head -1)"
 else
     warn "Bundled Semgrep was not created successfully."
 fi
 
 if [[ -f "$BACKEND/tools/bin/run_bandit.py" && -d "$LOCAL_SCANNERS" ]]; then
-    step "Bundled Bandit ready: $($PYTHON "$BACKEND/tools/bin/run_bandit.py" --version 2>&1 | head -1)"
+    step "Bundled Bandit ready: $("$PYTHON" "$BACKEND/tools/bin/run_bandit.py" --version 2>&1 | sed '/^[[:space:]]*$/d' | head -1)"
 else
     warn "Bundled Bandit was not created successfully."
 fi
@@ -267,10 +376,10 @@ header "Installing Frontend Dependencies"
 cd "$FRONTEND"
 
 if [[ "$OFFLINE" == true ]]; then
-    if [[ -f "$VENDOR_NODE" ]]; then
+    if [[ "$VENDOR_USABLE" == true && -f "$VENDOR_NODE" ]]; then
         step "Extracting vendored Ubuntu node_modules..."
         extract_tar_archive_into "$VENDOR_NODE" "$FRONTEND"
-    elif glob_exists "$VENDOR_NODE_PART_GLOB"; then
+    elif [[ "$VENDOR_USABLE" == true ]] && glob_exists "$VENDOR_NODE_PART_GLOB"; then
         step "Extracting vendored Ubuntu node_modules from split archive..."
         extract_tar_archive_parts_into "$VENDOR_NODE_PART_GLOB" "$FRONTEND"
     elif [[ -f "$OFFLINE_NODE" ]]; then
@@ -280,10 +389,10 @@ if [[ "$OFFLINE" == true ]]; then
         err "No vendored Ubuntu node_modules archive or offline node_modules archive found."
         exit 1
     fi
-elif [[ -f "$VENDOR_NODE" ]]; then
+elif [[ "$VENDOR_USABLE" == true && -f "$VENDOR_NODE" ]]; then
     step "Extracting vendored Ubuntu node_modules..."
     extract_tar_archive_into "$VENDOR_NODE" "$FRONTEND"
-elif glob_exists "$VENDOR_NODE_PART_GLOB"; then
+elif [[ "$VENDOR_USABLE" == true ]] && glob_exists "$VENDOR_NODE_PART_GLOB"; then
     step "Extracting vendored Ubuntu node_modules from split archive..."
     extract_tar_archive_parts_into "$VENDOR_NODE_PART_GLOB" "$FRONTEND"
 else
@@ -300,6 +409,10 @@ else
 fi
 step "Frontend dependencies installed"
 
+step "Building frontend..."
+npm run build
+step "Frontend build complete"
+
 # ESLint
 if [[ -x "$FRONTEND/node_modules/.bin/eslint" ]]; then
     step "ESLint available locally: $FRONTEND/node_modules/.bin/eslint"
@@ -313,14 +426,14 @@ cd "$ROOT"
 if [[ -f "$BACKEND/tools/codeql/codeql" ]]; then
     header "CodeQL"
     step "CodeQL already installed at: $BACKEND/tools/codeql/codeql"
-elif [[ -f "$VENDOR_CODEQL/codeql" ]]; then
+elif [[ "$VENDOR_USABLE" == true && -f "$VENDOR_CODEQL/codeql" ]]; then
     header "CodeQL (Vendored Ubuntu Bundle)"
     step "Restoring CodeQL from $VENDOR_CODEQL"
     rm -rf "$BACKEND/tools/codeql"
     copy_tree "$VENDOR_CODEQL" "$BACKEND/tools/codeql"
     chmod +x "$BACKEND/tools/codeql/codeql" || true
     step "CodeQL restored to $BACKEND/tools/codeql/codeql"
-elif [[ -f "$VENDOR_CODEQL_ARCHIVE" ]] || glob_exists "$VENDOR_CODEQL_PART_GLOB"; then
+elif [[ "$VENDOR_USABLE" == true ]] && { [[ -f "$VENDOR_CODEQL_ARCHIVE" ]] || glob_exists "$VENDOR_CODEQL_PART_GLOB"; }; then
     header "CodeQL (Vendored Ubuntu Archive)"
     step "Restoring CodeQL from vendored archive"
     rm -rf "$BACKEND/tools/codeql"
@@ -341,7 +454,7 @@ elif [[ "$SKIP_CODEQL" == false && "$OFFLINE" == false ]]; then
     else
         step "Downloading CodeQL CLI (~500MB, please wait)..."
         cd "$BACKEND"
-        $PYTHON -m scripts.download_codeql --output tools/codeql 2>&1 | while IFS= read -r line; do
+        "$PYTHON" -m scripts.download_codeql --output tools/codeql 2>&1 | while IFS= read -r line; do
             if [[ "$line" == *"Version:"* || "$line" == *"installed"* || "$line" == *"Binary:"* ]]; then
                 step "$line"
             fi
@@ -380,14 +493,14 @@ fi
 if [[ -f "$BACKEND/tools/jadx/bin/jadx" ]]; then
     header "jadx (APK decompiler)"
     step "jadx already installed at: $BACKEND/tools/jadx/bin/jadx"
-elif [[ -f "$VENDOR_JADX/bin/jadx" ]]; then
+elif [[ "$VENDOR_USABLE" == true && -f "$VENDOR_JADX/bin/jadx" ]]; then
     header "jadx (Vendored Ubuntu Bundle)"
     step "Restoring jadx from $VENDOR_JADX"
     rm -rf "$BACKEND/tools/jadx"
     copy_tree "$VENDOR_JADX" "$BACKEND/tools/jadx"
     chmod +x "$BACKEND/tools/jadx/bin/jadx" || true
     step "jadx restored to $BACKEND/tools/jadx/bin/jadx"
-elif [[ -f "$VENDOR_JADX_ARCHIVE" ]] || glob_exists "$VENDOR_JADX_PART_GLOB"; then
+elif [[ "$VENDOR_USABLE" == true ]] && { [[ -f "$VENDOR_JADX_ARCHIVE" ]] || glob_exists "$VENDOR_JADX_PART_GLOB"; }; then
     header "jadx (Vendored Ubuntu Archive)"
     step "Restoring jadx from vendored archive"
     rm -rf "$BACKEND/tools/jadx"
@@ -407,7 +520,7 @@ elif [[ "$OFFLINE" == false ]]; then
     else
         step "Downloading jadx..."
         cd "$BACKEND"
-        $PYTHON -m scripts.download_jadx --output tools/jadx 2>&1 | while IFS= read -r line; do
+        "$PYTHON" -m scripts.download_jadx --output tools/jadx 2>&1 | while IFS= read -r line; do
             if [[ "$line" == *"Version:"* || "$line" == *"installed"* || "$line" == *"Binary:"* ]]; then
                 step "$line"
             fi
@@ -455,7 +568,7 @@ if [[ "$SKIP_DATA" == false && "$OFFLINE" == false ]]; then
         step "Semgrep rules already present ($RULE_COUNT rules)"
     else
         step "Downloading Semgrep rules..."
-        $PYTHON -m scripts.download_semgrep_rules --output data/semgrep-rules/ 2>&1 | tail -1 || \
+        "$PYTHON" -m scripts.download_semgrep_rules --output data/semgrep-rules/ 2>&1 | tail -1 || \
             warn "Semgrep rules download failed. Using bundled rules."
     fi
 
@@ -465,7 +578,7 @@ if [[ "$SKIP_DATA" == false && "$OFFLINE" == false ]]; then
         step "Advisory database already present"
     else
         step "Downloading OSV advisory database (~250MB)..."
-        $PYTHON -m scripts.sync_advisories --output data/advisories/ 2>&1 | tail -1 || \
+        "$PYTHON" -m scripts.sync_advisories --output data/advisories/ 2>&1 | tail -1 || \
             warn "Advisory database download failed."
     fi
 
@@ -476,7 +589,7 @@ if [[ "$SKIP_DATA" == false && "$OFFLINE" == false ]]; then
         step "Technology icons already present ($ICON_COUNT icons)"
     else
         step "Downloading technology icons..."
-        $PYTHON -m scripts.download_icons --output data/icons/ 2>&1 | tail -1 || \
+        "$PYTHON" -m scripts.download_icons --output data/icons/ 2>&1 | tail -1 || \
             warn "Icons download failed."
     fi
 
@@ -498,7 +611,7 @@ if [[ "$SKIP_DB" == false ]]; then
     step "Running database migrations..."
     cd "$BACKEND"
     export VRAGENT_DATABASE_URL="$CONN_STR"
-    $PYTHON -m alembic upgrade head 2>&1 | tail -1 || warn "Migration failed. Check SQLite database path."
+    "$PYTHON" -m alembic upgrade head 2>&1 | tail -1 || warn "Migration failed. Check SQLite database path."
     cd "$ROOT"
 fi
 
@@ -535,7 +648,7 @@ echo -e "      bash ./start.sh"
 echo -e "      Then open: ${CYAN}http://localhost:8000${NC}"
 echo ""
 echo -e "    Development mode (two processes):"
-echo -e "      Terminal 1: cd backend && source venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+echo -e "      Terminal 1: cd backend && ../.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
 echo -e "      Terminal 2: cd frontend && npm run dev"
 echo -e "      Then open: ${CYAN}http://localhost:3000${NC}"
 echo ""

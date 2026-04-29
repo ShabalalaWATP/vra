@@ -181,6 +181,68 @@ IMPORTANT: Every node MUST have an icon. Use at least 3 different node shapes pe
 Do NOT include any markdown fencing or backticks — just the raw mermaid code starting with "flowchart"."""
 
 
+ARCHITECTURE_MODEL_SYSTEM_PROMPT = """You are a senior security researcher analysing a software application.
+Your task is to understand what this application does, how it is structured, and where its security-relevant attack surface lies.
+
+This is the first architecture pass. Produce only the factual architecture model. Do not generate Mermaid diagrams in this response.
+
+You will be given:
+- A repository fingerprint (languages, frameworks, file count)
+- The top priority files with their code contents
+- Discovered routes, call graph hotspots, and integration signals where available
+
+Produce a JSON response with these fields:
+{
+  "app_summary": "2-4 paragraph detailed description of what this application does, what problem it solves, who its users are, and how it is deployed",
+  "app_type": "web_app|api|cli|library|microservice|mobile_backend|monolith|static_site|android_app|android_library",
+  "components": [{"name": "component name", "purpose": "what it does", "files": ["key files"], "criticality": "critical|high|medium|low", "in_attack_surface": true, "handles_user_input": true}],
+  "layers": {
+    "frontend": ["files/dirs"],
+    "backend": ["files/dirs"],
+    "database": ["files/dirs"],
+    "config": ["files/dirs"],
+    "infra": ["files/dirs"]
+  },
+  "entry_points": [{"file": "path", "function": "name", "type": "http_endpoint|cli_command|websocket|scheduled_task|message_handler", "method": "GET|POST|etc", "path": "/api/..."}],
+  "trust_boundaries": ["list of trust boundary descriptions"],
+  "data_flows": [{"from": "component/file", "to": "component/file", "data": "what flows", "sensitive": true}],
+  "attack_surface": ["specific attack surface points referencing actual files and functions"],
+  "auth_mechanisms": [{"type": "jwt|session|oauth|api_key|basic|none", "implementation": "where and how", "weaknesses": "any observed weaknesses"}],
+  "external_integrations": ["databases, APIs, message queues, cloud services the app connects to"],
+  "security_observations": ["specific security observations referencing actual code seen"]
+}
+
+Return only one JSON object. Do not include markdown fences, explanations, or reasoning text."""
+
+
+DIAGRAM_SYSTEM_PROMPT = """You are a senior security architect generating Mermaid diagrams from an existing architecture model.
+
+This is the second architecture pass. Do not re-analyse source code. Use the supplied architecture model and signals to produce diagrams only.
+
+Produce a JSON response with this shape:
+{
+  "diagrams": [
+    {"kind": "overview", "title": "System Overview", "description": "High-level architecture showing main components and their connections", "mermaid": "<valid mermaid flowchart TD code>"},
+    {"kind": "security", "title": "Security Architecture", "description": "Trust boundaries, auth flows, data entry points, sensitive data stores", "mermaid": "<valid mermaid flowchart TD code>"},
+    {"kind": "data_flow", "title": "Data Flow", "description": "How data moves through the application from user input to storage and back", "mermaid": "<valid mermaid flowchart LR code>"},
+    {"kind": "attack_surface", "title": "Attack Surface", "description": "All points where an attacker could interact with the application", "mermaid": "<valid mermaid flowchart TD code>"}
+  ]
+}
+
+CRITICAL MERMAID RULES:
+1. Use only standard "flowchart TD" or "flowchart LR" syntax.
+2. Do not use architecture-beta, C4, or experimental diagram types.
+3. Node IDs must be simple alphanumeric identifiers with no spaces or punctuation.
+4. Labels must avoid quotes, unescaped parentheses, ampersands, and angle brackets.
+5. Every node must have an icon at the start of its label, such as fa:globe, fa:server, fa:database, fa:shield, fa:lock, fa:user, fa:bug, fa:key, fa:file, fa:code, fab:react, fab:node-js, fab:python, mdi:api, mdi:web, or mdi:security.
+6. Use at least three node shapes per diagram: rectangle, stadium, cylinder, hexagon, or circle.
+7. Include classDef danger, warn, safe, and store color assignments at the bottom.
+8. Keep each diagram clean with roughly 8-15 nodes.
+9. Do not include markdown fences or backticks inside the mermaid field.
+
+Return only one JSON object. Do not include markdown fences, explanations, or reasoning text."""
+
+
 class ArchitectureAgent(BaseAgent):
     @property
     def name(self) -> str:
@@ -207,29 +269,29 @@ class ArchitectureAgent(BaseAgent):
 
         await self.emit(ctx, f"Read {len(file_contents)} files for architecture analysis")
 
-        # Build prompt
+        # Build the source-grounded prompt for the first, non-diagram pass.
         user_content = self._build_prompt(ctx, file_contents)
 
-        # Call LLM
         ctx.current_task = "AI analysing architecture"
         await self.emit(ctx, "AI building application model...")
 
-        # Architecture JSON is large (4 mermaid diagrams + components + data flows).
-        # Use max_output_tokens from the LLM profile, minimum 8192.
-        output_tokens = max(8192, self.llm.max_output_tokens)
+        # Use the profile's configured output cap. Do not force a larger minimum:
+        # some compatible endpoints behave better when asked for only what is needed.
+        output_tokens = self.llm.max_output_tokens
 
         result = None
         last_error = None
-        for attempt in range(2):
+        max_retries = 3
+        for attempt in range(max_retries + 1):
             try:
                 result = await self.llm.chat_json(
-                    SYSTEM_PROMPT, user_content, max_tokens=output_tokens,
+                    ARCHITECTURE_MODEL_SYSTEM_PROMPT, user_content, max_tokens=output_tokens,
                 )
                 ctx.ai_calls_made += 1
                 if result and (result.get("app_summary") or result.get("components")):
                     break
                 # Empty result — retry with fewer files
-                if attempt == 0:
+                if attempt < max_retries:
                     await self.emit(ctx, "Architecture AI returned empty — retrying with reduced context...", level="warn")
                     half = len(file_contents) // 2
                     for path in list(file_contents.keys())[half:]:
@@ -237,7 +299,7 @@ class ArchitectureAgent(BaseAgent):
                     user_content = self._build_prompt(ctx, file_contents)
             except Exception as e:
                 last_error = e
-                if attempt == 0:
+                if attempt < max_retries:
                     await self.emit(ctx, f"Architecture attempt failed: {e}. Retrying with less context...", level="warn")
                     half = len(file_contents) // 2
                     for path in list(file_contents.keys())[half:]:
@@ -259,28 +321,25 @@ class ArchitectureAgent(BaseAgent):
             ctx.trust_boundaries = []
             return
 
+        # Diagrams are generated in a second, smaller call from the compact model.
+        diagrams: list[dict] = []
+        try:
+            ctx.current_task = "AI generating architecture diagrams"
+            await self.emit(ctx, "AI generating architecture diagrams...")
+            diagrams = await self._generate_architecture_diagrams(ctx, result, output_tokens)
+        except Exception as e:
+            logger.exception("Architecture diagram generation failed")
+            await self.emit(
+                ctx,
+                f"Architecture diagrams failed: {e}. Continuing with text model.",
+                level="warn",
+            )
+            await self.log_decision(ctx, action="architecture_diagrams_failed", reasoning=str(e))
+
         # Update context with all extracted fields
         ctx.app_summary = result.get("app_summary", "")
         ctx.app_type = result.get("app_type", "")
-        # Support both old single diagram_spec and new multi-diagram format
-        diagrams = result.get("diagrams", [])
-        if diagrams and isinstance(diagrams, list):
-            diagrams = self._normalise_architecture_diagrams(diagrams)
-            ctx.diagram_spec = diagrams[0].get("mermaid", "") if diagrams else ""
-        else:
-            ctx.diagram_spec = result.get("diagram_spec", "")
-            # Wrap legacy single diagram in the new format
-            if ctx.diagram_spec:
-                diagrams = self._normalise_architecture_diagrams(
-                    [
-                        {
-                            "kind": "overview",
-                            "title": "System Overview",
-                            "description": "High-level architecture showing main components and their connections",
-                            "mermaid": ctx.diagram_spec,
-                        }
-                    ]
-                )
+        ctx.diagram_spec = diagrams[0].get("mermaid", "") if diagrams else ""
 
         ctx.architecture_notes = json.dumps({
             "components": result.get("components", []),
@@ -325,7 +384,8 @@ class ArchitectureAgent(BaseAgent):
             ctx,
             f"Architecture analysis complete. "
             f"{len(components)} components ({attack_surface_count} files in attack surface), "
-            f"{len(entry_pts)} entry points, {len(ctx.attack_surface)} attack surface points.",
+            f"{len(entry_pts)} entry points, {len(ctx.attack_surface)} attack surface points, "
+            f"{len(diagrams)} diagrams.",
         )
 
         await self.log_decision(
@@ -334,6 +394,100 @@ class ArchitectureAgent(BaseAgent):
             files_inspected=top_files,
             output_summary=ctx.app_summary[:500],
         )
+
+    async def _generate_architecture_diagrams(
+        self,
+        ctx: ScanContext,
+        architecture_model: dict,
+        output_tokens: int,
+    ) -> list[dict]:
+        diagram_user_content = self._build_diagram_prompt(ctx, architecture_model)
+        max_retries = 3
+        last_error: Exception | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                result = await self.llm.chat_json(
+                    DIAGRAM_SYSTEM_PROMPT,
+                    diagram_user_content,
+                    max_tokens=output_tokens,
+                )
+                ctx.ai_calls_made += 1
+                diagrams = self._normalise_architecture_diagrams(result.get("diagrams", []))
+                if diagrams:
+                    return diagrams
+                if attempt < max_retries:
+                    await self.emit(
+                        ctx,
+                        "Architecture diagram AI returned empty - retrying...",
+                        level="warn",
+                    )
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    await self.emit(
+                        ctx,
+                        f"Architecture diagram attempt failed: {e}. Retrying...",
+                        level="warn",
+                    )
+
+        reason = str(last_error) if last_error else "LLM returned empty diagram response"
+        await self.emit(
+            ctx,
+            f"Architecture diagrams unavailable after retries: {reason}. Continuing without diagrams.",
+            level="warn",
+        )
+        await self.log_decision(ctx, action="architecture_diagrams_unavailable", reasoning=reason)
+        return []
+
+    def _build_diagram_prompt(self, ctx: ScanContext, architecture_model: dict) -> str:
+        compact_model = {
+            "app_summary": architecture_model.get("app_summary", ""),
+            "app_type": architecture_model.get("app_type", ""),
+            "components": architecture_model.get("components", []),
+            "layers": architecture_model.get("layers", {}),
+            "entry_points": architecture_model.get("entry_points", []),
+            "trust_boundaries": architecture_model.get("trust_boundaries", []),
+            "data_flows": architecture_model.get("data_flows", []),
+            "attack_surface": architecture_model.get("attack_surface", []),
+            "auth_mechanisms": architecture_model.get("auth_mechanisms", []),
+            "external_integrations": architecture_model.get("external_integrations", []),
+            "security_observations": architecture_model.get("security_observations", []),
+        }
+
+        parts = [
+            "## Architecture Model",
+            "Use this compact source-grounded model as the sole basis for diagrams.",
+            "```json",
+            json.dumps(compact_model, indent=2),
+            "```",
+        ]
+
+        route_inventory = self._collect_route_inventory(ctx, limit=12)
+        if route_inventory:
+            parts.append("\n## Route Inventory")
+            for route in route_inventory:
+                parts.append(f"- {route}")
+
+        call_graph_hotspots = self._collect_call_graph_hotspots(ctx, limit=8)
+        if call_graph_hotspots:
+            parts.append("\n## Call Graph Hotspots")
+            for hotspot in call_graph_hotspots:
+                parts.append(f"- {hotspot}")
+
+        external_touchpoints = self._collect_external_touchpoints(ctx, limit=10)
+        if external_touchpoints:
+            parts.append("\n## External Integration Touchpoints")
+            for touchpoint in external_touchpoints:
+                parts.append(f"- {touchpoint}")
+
+        auth_touchpoints = self._collect_auth_and_config_touchpoints(ctx, limit=10)
+        if auth_touchpoints:
+            parts.append("\n## Auth / Middleware / Config Touchpoints")
+            for touchpoint in auth_touchpoints:
+                parts.append(f"- {touchpoint}")
+
+        return "\n".join(parts)
 
     @classmethod
     def _normalise_architecture_diagrams(cls, diagrams: list[dict]) -> list[dict]:
@@ -517,7 +671,7 @@ class ArchitectureAgent(BaseAgent):
 
         # APK decompilation context
         if ctx.source_type in ("apk", "aab", "dex", "jar"):
-            parts.append(f"\n## IMPORTANT: Decompiled Android Application")
+            parts.append("\n## IMPORTANT: Decompiled Android Application")
             parts.append(
                 f"This code was decompiled from an Android {ctx.source_type.upper()} file using jadx. "
                 "Key considerations:"
@@ -548,7 +702,7 @@ class ArchitectureAgent(BaseAgent):
 
         # Documentation intelligence (from READMEs, setup guides, etc.)
         if ctx.doc_intelligence:
-            parts.append(f"\n## Developer Documentation Intelligence")
+            parts.append("\n## Developer Documentation Intelligence")
             parts.append(
                 "The following was extracted from the project's documentation files "
                 "(README, INSTALL, API docs, etc.). Use this to inform your understanding "
@@ -564,7 +718,7 @@ class ArchitectureAgent(BaseAgent):
         # Obfuscation warning
         obf = ctx.obfuscation_summary
         if obf.get("obfuscated_count", 0) > 0:
-            parts.append(f"\n## Obfuscation Warning")
+            parts.append("\n## Obfuscation Warning")
             parts.append(f"- {obf.get('heavily_obfuscated', 0)} files heavily obfuscated (unreadable)")
             parts.append(f"- {obf.get('moderately_obfuscated', 0)} files moderately obfuscated")
             parts.append("Focus your analysis on readable source files. Note obfuscation in your security observations.")
@@ -577,10 +731,10 @@ class ArchitectureAgent(BaseAgent):
             file_budget_tokens = available - system_overhead
             max_chars_per_file = max(1000, int(file_budget_tokens * 3.2 / max(len(file_contents), 1)))
 
-        # Call graph summary for diagram generation
+        # Call graph summary for architecture modelling
         if ctx.call_graph and hasattr(ctx.call_graph, 'edges') and ctx.call_graph.edges:
             parts.append(f"\n## Cross-File Call Relationships ({len(ctx.call_graph.edges)} edges)")
-            parts.append("Use these to draw accurate data flow arrows in the architecture diagram:")
+            parts.append("Use these to understand component relationships and data flows:")
 
             # Group edges by directory pair to show component-level relationships
             dir_edges: dict[tuple[str, str], int] = {}
@@ -615,14 +769,14 @@ class ArchitectureAgent(BaseAgent):
                 parts.append(f"\n## External Dependencies ({len(external_pkgs)} packages)")
                 for pkg in sorted(external_pkgs)[:20]:
                     parts.append(f"- {pkg}")
-                parts.append("Include significant external services/databases in the architecture diagram.")
+                parts.append("Include significant external services/databases in external_integrations and data_flows.")
 
         route_inventory = self._collect_route_inventory(ctx)
         entrypoint_signals = self._collect_entrypoint_signals(ctx)
         if route_inventory or entrypoint_signals:
             parts.append("\n## Route Inventory / Entry Point Signals")
             parts.append(
-                "Use these discovered routes and entrypoint hints to ground the architecture and attack-surface diagrams."
+                "Use these discovered routes and entrypoint hints to ground entry_points and attack_surface."
             )
             for route in route_inventory:
                 parts.append(f"- Route: {route}")

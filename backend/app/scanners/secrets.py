@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass
 from pathlib import Path
 
 from app.analysis.paths import load_repo_path_policy, should_skip_repo_path
@@ -91,11 +90,14 @@ SECRET_PATTERNS: list[tuple[str, str, str, float, float]] = [
 FALSE_POSITIVE_PATTERNS = [
     re.compile(r"(?i)^(example|test|demo|sample|dummy|fake|placeholder|your[_-]?|my[_-]?|xxx|changeme|replace|todo|fixme)"),
     re.compile(r"(?i)^(password|secret|key|token|api_key|none|null|undefined|empty|default|insert)$"),
+    re.compile(r"(?i)^(password1|password123|passwd|pwd|secret[_-]?key|api[_-]?key|apikey|not[_-]?a[_-]?secret|notasecret)$"),
+    re.compile(r"(?i)^(change|replace|insert)[_-]?(me|this|value|secret|password|token|key)$"),
     re.compile(r"^[a-zA-Z]+$"),  # All letters, no numbers/symbols — unlikely to be a real secret
     re.compile(r"^\*+$"),  # All asterisks
     re.compile(r"^\.{3,}$"),  # All dots
     re.compile(r"^<[^>]+>$"),  # XML-style placeholder like <YOUR_KEY>
     re.compile(r"^\$\{.+\}$"),  # Template variable like ${API_KEY}
+    re.compile(r"^\{\{.+\}\}$"),  # Template variable like {{ API_KEY }}
     re.compile(r"^%\(.+\)s$"),  # Python format like %(api_key)s
 ]
 

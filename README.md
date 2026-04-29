@@ -767,8 +767,7 @@ In the preferred runtime, open `http://localhost:8000`. Use `http://localhost:30
 For a truly air-gapped machine, prepare a single transfer bundle on a connected machine with the same OS and CPU architecture as the target host:
 
 ```bash
-cd backend
-python -m scripts.prepare_airgap_bundle --output ../vragent-airgap-bundle.tar.gz
+bash ./prepare_airgap_bundle.sh
 ```
 
 That bundle contains the current repo snapshot, an offline Python wheelhouse, an offline `frontend/node_modules` archive, and optional offline copies of CodeQL and jadx.
@@ -793,11 +792,10 @@ vendor/ubuntu/
 Prepare that tree on a connected Ubuntu machine:
 
 ```bash
-cd backend
-python -m scripts.prepare_ubuntu_vendor --include-node-modules
+bash ./prepare_ubuntu_vendor.sh
 ```
 
-Use `--include-node-modules` if you want the target VM to install with `--offline` and never touch the npm mirror. If you are happy for the target VM to use your internal npm mirror, you can omit that flag and let `install.sh` fetch frontend dependencies there.
+The wrapper selects native Linux Python 3.12 automatically and includes `node_modules.tar.gz` by default so the target VM can install with `--offline` and never touch the npm mirror. Use `--skip-node-modules` only if the target VM is allowed to use your internal npm mirror for frontend dependencies.
 
 After `vendor/ubuntu/` is committed, the target Ubuntu VM flow is:
 
@@ -823,18 +821,83 @@ In clone-only mode, a plain GitHub clone carries:
 
 The large npm advisory feed also has a repo-safe mirror at `backend/data/advisories/npm/advisories.json.gz`. If the clone does not have `git-lfs`, the app automatically falls back to that gzip copy, so the advisory database still loads on Ubuntu.
 
+### Clone Bundle Contract for Coding Agents
+
+For an Ubuntu machine with no direct internet access, the repository is expected to be self-describing after `git clone`. A coding agent should be able to inspect the paths below, verify versions, then run the installer.
+
+The target install layout is:
+
+| Repo path | Installed/extracted path | Required contents | Version/source notes |
+|-----------|--------------------------|-------------------|----------------------|
+| `backend/pyproject.toml` | `.venv/` | Backend Python package and dependencies | Python `3.12.x` only; tree-sitter is pinned to `tree-sitter==0.20.4` with `tree-sitter-languages==1.10.2` |
+| `vendor/ubuntu/python/` | pip wheelhouse input | Linux wheels for backend deps, test deps, Semgrep, Bandit | Must be built for CPython `3.12` and target CPU architecture |
+| `vendor/ubuntu/tools/python_vendor.tar.gz` or `.part-*` | `backend/tools/python_vendor/` | Pre-bundled Semgrep and Bandit runtime | Semgrep `1.156.0`, Bandit `1.9.4` |
+| `frontend/package-lock.json` | npm install input | Exact frontend dependency graph | npm lockfile v3; currently 597 package entries |
+| `vendor/ubuntu/node_modules.tar.gz` or `.part-*` | `frontend/node_modules/` | Optional prebuilt frontend tooling and ESLint | Build this on matching Ubuntu architecture if target cannot use npm mirror |
+| `frontend/dist/` | served directly by FastAPI | Built static UI assets | Committed so production runtime does not require Vite |
+| `backend/data/semgrep-rules/` | same path | Offline Semgrep rules | Committed data; installer does not need internet for rules in `--offline` mode |
+| `backend/data/advisories/` | same path | Offline OSV advisory database | `manifest.json` says 269,920 advisories, synced `2026-04-12` in the current data snapshot |
+| `backend/data/icons/` | same path | Technology SVG icons | Current snapshot has 451 icons |
+| `backend/data/eslint-configs/security.json` | same path | Curated ESLint security policy | Used by JS/TS scanning |
+| `vendor/ubuntu/tools/codeql.tar.gz` or `.part-*` | `backend/tools/codeql/` | Optional Linux CodeQL CLI bundle | Current tested version: CodeQL `2.25.1` |
+| `vendor/ubuntu/tools/jadx.tar.gz` or `.part-*` | `backend/tools/jadx/` | Optional jadx binary distribution | Current tested version: jadx `1.5.5`; requires Java 11+ |
+
+Do **not** commit generated runtime folders such as `.venv/`, `frontend/node_modules/`, `backend/tools/python_vendor/`, `backend/tools/codeql/`, or `backend/tools/jadx/`. Commit the wheelhouse/archives under `vendor/ubuntu/` instead; `install.sh` extracts them into the runtime folders.
+
+The clone bundle must include a valid `vendor/ubuntu/manifest.json`. Check these fields before transferring to the target network:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+manifest = json.loads(Path("vendor/ubuntu/manifest.json").read_text())
+print("prepared_on:", manifest["prepared_on"])
+print("required_target:", manifest.get("required_target"))
+print("versions:", manifest.get("versions"))
+PY
+```
+
+The manifest must show Python `3.12` for `required_target.python_minor` or `prepared_on.python`. If it shows Python `3.11`, the wheelhouse is not compatible with this app version and must be rebuilt:
+
+```bash
+bash ./prepare_ubuntu_vendor.sh
+```
+
+The Ubuntu installer validates `vendor/ubuntu/manifest.json`. If the vendored payload was built for the wrong Python minor version or CPU architecture, it ignores that payload and uses `offline-packages/` or your internal mirrors instead. In strict `--offline` clone-only mode, a mismatched `vendor/ubuntu/` means you must rebuild the vendor tree on a matching Ubuntu host.
+
+### Mirror-Backed Air-Gap Install
+
+If the target network has internal mirrors for pip and npm but no direct internet, configure the mirrors before running the normal installer:
+
+```bash
+export PIP_INDEX_URL="https://your-internal-pypi/simple"
+export PIP_TRUSTED_HOST="your-internal-pypi"
+npm config set registry "https://your-internal-npm/"
+
+git clone <your-vragent-repo-url>
+cd vragent
+bash ./install.sh
+bash ./start.sh
+```
+
+Use `bash ./install.sh --offline` only when the clone contains compatible `vendor/ubuntu/` assets or the extracted bundle contains `offline-packages/`.
+
 ### Prerequisites
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
-| Python | 3.11 or higher | Backend runtime |
-| Node.js | 18 or higher | Frontend build |
-| Java Runtime | 11 or higher | Required if you want APK decompilation via jadx |
+| Python | 3.12.x | Backend runtime; used with `tree-sitter==0.20.4` and `tree-sitter-languages==1.10.2` |
+| pip / setuptools / wheel | From Python 3.12 venv, preferably refreshed from wheelhouse/mirror | Python package installation |
+| Node.js | 22.x LTS or higher; current Ubuntu vendor bundle was built with 22.22.2 | Frontend build and ESLint tooling |
+| npm | 10 or higher; current Ubuntu vendor bundle was built with 10.9.7 | Frontend package installation from lockfile |
+| Java Runtime | 11 or higher | Required only for APK decompilation via jadx |
 | SQLite | bundled | Data persistence |
 | Git | 2.x | Optional — for repo analysis features |
-| Semgrep | bundled by install | Static analysis scanner |
-| Bandit | bundled by install | Python security scanner |
-| CodeQL | bundled by install (optional) | Semantic analysis |
+| Semgrep | 1.156.0, bundled by install | Static analysis scanner |
+| Bandit | 1.9.4, bundled by install | Python security scanner |
+| CodeQL | 2.25.1, bundled by install (optional) | Semantic analysis |
+| jadx | 1.5.5, bundled by install (optional) | APK decompilation |
 
 ---
 
@@ -1044,27 +1107,29 @@ VRAgent works without jadx. If jadx is not installed, the APK upload option will
 
 #### Step 1: Install System Prerequisites
 
-**Python 3.11+**
+**Python 3.12.x**
 
 Download from `https://www.python.org/downloads/` or install via your package manager.
+Python 3.13 and 3.14 are not currently supported by this dependency set because
+`tree-sitter-languages==1.10.2` is paired with `tree-sitter==0.20.4` and this app is tested on CPython 3.12.
 
 ```powershell
 # Run the installer with "Add Python to PATH" checked
 # Verify:
-python --version
-# Expected: Python 3.11.x or higher
+py -3.12 --version
+# Expected: Python 3.12.x
 ```
 
-**Node.js 18+**
+**Node.js 22.x LTS**
 
 Download the LTS installer from `https://nodejs.org/` or install via your package manager.
 
 ```powershell
 node --version
-# Expected: v18.x.x or higher
+# Expected: v22.x.x or higher
 
 npm --version
-# Expected: 9.x.x or higher
+# Expected: 10.x.x or higher
 ```
 
 **SQLite**
@@ -1076,23 +1141,21 @@ SQLite is the default persistence layer. No separate database server is required
 # create or migrate it automatically if it does not exist yet.
 # To run migrations manually:
 cd backend
-python -m alembic upgrade head
+..\.venv\Scripts\python -m alembic upgrade head
 ```
 
 **Semgrep**
 
 ```powershell
-# Semgrep installs via pip (included in offline wheels)
-pip install semgrep
-semgrep --version
+# Installed by .\install.ps1 into backend\tools\python_vendor
+.\.venv\Scripts\python backend\tools\bin\run_semgrep.py --version
 ```
 
 **Bandit**
 
 ```powershell
-# Bandit installs via pip (included in offline wheels)
-pip install bandit
-bandit --version
+# Installed by .\install.ps1 into backend\tools\python_vendor
+.\.venv\Scripts\python backend\tools\bin\run_bandit.py --version
 ```
 
 #### Fast Path: Install from the Air-Gap Bundle
@@ -1117,13 +1180,15 @@ cd vragent
 #### Step 3: Install Backend Dependencies
 
 ```powershell
-cd backend
+py -3.12 -m venv .venv
+.\.venv\Scripts\python -m pip install --upgrade pip setuptools wheel
+cd .\backend
 
 # From offline wheels:
-pip install --no-index --find-links=..\offline-packages\python -e ".[dev]"
+..\.venv\Scripts\python -m pip install --no-index --find-links=..\offline-packages\python -e ".[dev]"
 
 # Or if you have internet on the prep machine and just copied the repo:
-pip install -e ".[dev]"
+..\.venv\Scripts\python -m pip install -e ".[dev]"
 ```
 
 #### Step 4: Install Frontend Dependencies
@@ -1152,7 +1217,7 @@ tar xzf C:\path\to\codeql-bundle-win64.tar.gz
 ```powershell
 # ESLint is included in frontend/node_modules when frontend deps are present.
 # From an online clone:
-cd ..\frontend
+cd ..\..\frontend
 npm ci
 
 # Or from the offline node_modules bundle:
@@ -1163,7 +1228,7 @@ npm ci
 
 ```powershell
 cd ..\..\backend
-python -m alembic upgrade head
+..\.venv\Scripts\python -m alembic upgrade head
 ```
 
 #### Step 8: Start VRAgent
@@ -1182,7 +1247,7 @@ Development mode is still available if you want the Vite dev server:
 ```powershell
 # Terminal 1
 cd vragent\backend
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+..\.venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # Terminal 2
 cd ..\frontend
@@ -1201,22 +1266,23 @@ Open your browser to `http://localhost:3000`
 # Update package list (do this before going air-gapped, or use local apt mirror)
 sudo apt update
 
-# Python 3.11+
-sudo apt install -y python3.11 python3.11-venv python3.11-dev python3-pip
+# Python 3.12.x. VRAgent pins Python to 3.12 because the current
+# tree-sitter-languages/tree-sitter pair is tested on CPython 3.12.
+sudo apt install -y python3.12 python3.12-venv python3.12-dev python3-pip
 
-# Node.js 18+ (via NodeSource or local .deb)
+# Node.js 22.x LTS (via NodeSource or local .deb)
 # Option A: NodeSource (requires internet)
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt install -y nodejs
 
 # Option B: Download .deb files on prep machine, copy to air-gapped
-# wget https://deb.nodesource.com/node_18.x/pool/main/n/nodejs/nodejs_18.x.x-1nodesource1_amd64.deb
-# sudo dpkg -i nodejs_18.x.x-1nodesource1_amd64.deb
+# wget https://deb.nodesource.com/node_22.x/pool/main/n/nodejs/nodejs_22.x.x-1nodesource1_amd64.deb
+# sudo dpkg -i nodejs_22.x.x-1nodesource1_amd64.deb
 
 # Verify
-python3 --version   # 3.11+
-node --version       # v18+
-npm --version        # 9+
+python3.12 --version # 3.12.x
+node --version       # v22+
+npm --version        # 10+
 
 # Build tools (needed for some Python packages)
 sudo apt install -y build-essential libffi-dev
@@ -1252,88 +1318,97 @@ bash ./start.sh
 
 Open your browser to `http://localhost:8000`
 
-#### Step 2: Prepare SQLite database path
+#### Manual Path
 
 ```bash
-mkdir -p backend/data
+# 1. Extract VRAgent
+tar xzf vragent-airgap-bundle.tar.gz
+cd vragent
+
+# 2. Create the root virtual environment
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip setuptools wheel
+
+# 3. Install backend dependencies
 cd backend
-python -m alembic upgrade head
+../.venv/bin/python -m pip install --no-index --find-links=../offline-packages/python -e ".[dev]"
+
+# Or with internet/internal mirror access:
+# ../.venv/bin/python -m pip install -e ".[dev]"
+
 cd ..
 ```
 
-#### Step 3: Extract VRAgent
-
-```bash
-tar xzf vragent-airgap-bundle.tar.gz
-cd vragent
-```
-
-#### Step 4: Create Python Virtual Environment
+#### Step 2: Install Semgrep and Bandit
 
 ```bash
 cd backend
-python3.11 -m venv venv
-source venv/bin/activate
-
-# From offline wheels:
-pip install --no-index --find-links=../offline-packages/python -e ".[dev]"
-
-# Or with internet access:
-pip install -e ".[dev]"
-```
-
-#### Step 5: Install Semgrep and Bandit
-
-```bash
-# From offline wheels:
-pip install --no-index --find-links=../offline-packages/python semgrep bandit
+../.venv/bin/python -m scripts.bundle_python_scanners --no-index --wheelhouse ../offline-packages/python
 
 # Verify:
-semgrep --version
-bandit --version
+../.venv/bin/python tools/bin/run_semgrep.py --version
+../.venv/bin/python tools/bin/run_bandit.py --version
+
+cd ..
 ```
 
-#### Step 6: Install Frontend Dependencies
+#### Step 3: Install Frontend Dependencies
 
 ```bash
-cd ../frontend
+cd frontend
 
 # From offline node_modules:
 tar xzf ../offline-packages/node_modules.tar.gz
 
 # Or with internet:
-npm ci
+# npm ci
+
+# Build the static frontend served by start.sh
+npm run build
+
+cd ..
 ```
 
-#### Step 7: Verify ESLint
+#### Step 4: Verify ESLint
 
 ```bash
+cd frontend
 test -x node_modules/.bin/eslint && node_modules/.bin/eslint --version
+cd ..
 ```
 
-#### Step 8: Install CodeQL (Optional)
+#### Step 5: Install CodeQL (Optional)
 
 ```bash
-cd ../backend/tools
+cd backend/tools
 tar xzf /path/to/codeql-bundle-linux64.tar.gz
 chmod +x codeql/codeql
 ./codeql/codeql version
+cd ../..
 ```
 
-#### Step 9: Run Database Migrations
+#### Step 6: Install jadx (Optional, for APK scanning)
 
 ```bash
+cd backend
+../.venv/bin/python -m scripts.download_jadx --output tools/jadx
+tools/jadx/bin/jadx --version
 cd ..
-source venv/bin/activate
-python -m alembic upgrade head
 ```
 
-#### Step 10: Start VRAgent
+#### Step 7: Run Database Migrations
+
+```bash
+cd backend
+../.venv/bin/python -m alembic upgrade head
+cd ..
+```
+
+#### Step 8: Start VRAgent
 
 Preferred runtime:
 
 ```bash
-cd ..
 bash ./start.sh
 ```
 
@@ -1344,7 +1419,6 @@ Development mode is still available if you want the Vite dev server:
 **Option A: Using Make**
 
 ```bash
-cd ..
 make backend   # Terminal 1
 make frontend  # Terminal 2
 ```
@@ -1354,8 +1428,7 @@ make frontend  # Terminal 2
 Terminal 1 — Backend:
 ```bash
 cd backend
-source venv/bin/activate
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+../.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 Terminal 2 — Frontend:

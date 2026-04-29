@@ -63,7 +63,7 @@ function LLMProfilesTab() {
     api_key: "",
     model_name: "",
     cert_path: "",
-    timeout_seconds: 120,
+    timeout_seconds: 500,
     context_window: 131072,
     max_output_tokens: 4096,
     use_max_completion_tokens: false,
@@ -86,7 +86,7 @@ function LLMProfilesTab() {
       api_key: "",
       model_name: "",
       cert_path: "",
-      timeout_seconds: 120,
+      timeout_seconds: 500,
       context_window: 131072,
       max_output_tokens: 4096,
       use_max_completion_tokens: false,
@@ -207,7 +207,7 @@ function LLMProfilesTab() {
                     api_key: "",
                     model_name: p.model_name,
                     cert_path: "",
-                    timeout_seconds: p.timeout_seconds || 120,
+                    timeout_seconds: p.timeout_seconds || 500,
                     context_window: p.context_window || 131072,
                     max_output_tokens: p.max_output_tokens || 4096,
                     use_max_completion_tokens: p.use_max_completion_tokens || false,
@@ -384,7 +384,7 @@ function LLMProfilesTab() {
               <input
                 className="input"
                 type="number"
-                min={256}
+                min={1}
                 max={32768}
                 value={form.max_output_tokens}
                 onChange={(e) =>

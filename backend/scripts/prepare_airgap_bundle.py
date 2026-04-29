@@ -12,6 +12,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.bundle_python_scanners import PACKAGES as SCANNER_PACKAGES
 
 SKIP_NAMES = {
     ".DS_Store",
@@ -41,6 +42,10 @@ SKIP_PREFIXES = (
     "vendor/ubuntu",
 )
 
+REQUIRED_PYTHON_MINOR = (3, 12)
+MIN_NODE_MAJOR = 22
+MIN_NPM_MAJOR = 10
+
 
 def log(message: str) -> None:
     print(f"[+] {message}")
@@ -55,6 +60,21 @@ def run(cmd: list[str], *, cwd: Path, description: str) -> None:
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
+def output_or_none(cmd: list[str], *, cwd: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        return None
+    return completed.stdout.strip().splitlines()[0] if completed.stdout.strip() else None
+
+
 def find_command(name: str) -> str:
     candidates = [name]
     if os.name == "nt":
@@ -64,6 +84,77 @@ def find_command(name: str) -> str:
         if resolved:
             return resolved
     raise FileNotFoundError(f"{name} is required on PATH")
+
+
+def major_version(version: str | None) -> int | None:
+    if not version:
+        return None
+    token = version.strip().splitlines()[0].removeprefix("v").split(".", 1)[0]
+    return int(token) if token.isdigit() else None
+
+
+def ensure_node_toolchain(frontend_dir: Path) -> str:
+    node = find_command("node")
+    npm = find_command("npm")
+    node_version = output_or_none([node, "--version"], cwd=frontend_dir)
+    npm_version = output_or_none([npm, "--version"], cwd=frontend_dir)
+    node_major = major_version(node_version)
+    npm_major = major_version(npm_version)
+    if node_major is None or node_major < MIN_NODE_MAJOR:
+        raise RuntimeError(
+            f"Node.js {MIN_NODE_MAJOR}+ is required to prepare frontend dependencies; "
+            f"found {node_version or 'unknown'}."
+        )
+    if npm_major is None or npm_major < MIN_NPM_MAJOR:
+        raise RuntimeError(
+            f"npm {MIN_NPM_MAJOR}+ is required to prepare frontend dependencies; "
+            f"found {npm_version or 'unknown'}."
+        )
+    log(f"Using Node.js {node_version} and npm {npm_version}")
+    return npm
+
+
+def venv_python_path(venv_dir: Path) -> Path:
+    if os.name == "nt":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def run_download_module_with_wheelhouse(
+    *,
+    backend_dir: Path,
+    wheelhouse: Path,
+    module_name: str,
+    module_args: list[str],
+    description: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="vragent-tool-download-") as temp_dir:
+        venv_dir = Path(temp_dir) / "venv"
+        run(
+            [sys.executable, "-m", "venv", str(venv_dir)],
+            cwd=backend_dir,
+            description="Creating temporary downloader environment",
+        )
+        downloader_python = venv_python_path(venv_dir)
+        run(
+            [
+                str(downloader_python),
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--find-links",
+                str(wheelhouse),
+                "httpx",
+            ],
+            cwd=backend_dir,
+            description="Installing downloader dependencies from the prepared wheelhouse",
+        )
+        run(
+            [str(downloader_python), "-m", module_name, *module_args],
+            cwd=backend_dir,
+            description=description,
+        )
 
 
 def build_python_wheelhouse(backend_dir: Path, wheelhouse: Path) -> None:
@@ -77,20 +168,19 @@ def build_python_wheelhouse(backend_dir: Path, wheelhouse: Path) -> None:
         str(wheelhouse),
         "setuptools",
         "wheel",
-        "semgrep",
-        "bandit",
         ".[dev]",
+        *SCANNER_PACKAGES,
     ]
     run(cmd, cwd=backend_dir, description=f"Downloading Python wheels into {wheelhouse}")
 
 
 def ensure_frontend_modules(frontend_dir: Path) -> None:
+    npm = ensure_node_toolchain(frontend_dir)
     node_modules = frontend_dir / "node_modules"
     if node_modules.exists():
-        log("Using existing frontend/node_modules")
-        return
+        log("Removing existing frontend/node_modules so native optional packages match this host")
+        shutil.rmtree(node_modules)
 
-    npm = find_command("npm")
     install_args = ["ci"] if (frontend_dir / "package-lock.json").exists() else ["install"]
     run([npm, *install_args], cwd=frontend_dir, description="Installing frontend dependencies")
 
@@ -130,6 +220,7 @@ def stage_tool(
     *,
     tool_name: str,
     backend_dir: Path,
+    wheelhouse: Path,
     staged_dir: Path,
     download_module: str,
     skip_download: bool,
@@ -147,15 +238,17 @@ def stage_tool(
         return False
 
     staged_dir.mkdir(parents=True, exist_ok=True)
-    run(
-        [sys.executable, "-m", download_module, "--output", str(staged_dir)],
-        cwd=backend_dir,
+    run_download_module_with_wheelhouse(
+        backend_dir=backend_dir,
+        wheelhouse=wheelhouse,
+        module_name=download_module,
+        module_args=["--output", str(staged_dir)],
         description=f"Downloading {tool_name} into the bundle staging area",
     )
     return has_tool_binary(tool_name, staged_dir)
 
 
-def stage_python_scanners(*, backend_dir: Path, staged_dir: Path) -> bool:
+def stage_python_scanners(*, backend_dir: Path, staged_dir: Path, wheelhouse: Path) -> bool:
     if staged_dir.exists():
         shutil.rmtree(staged_dir)
     run(
@@ -165,6 +258,9 @@ def stage_python_scanners(*, backend_dir: Path, staged_dir: Path) -> bool:
             "scripts.bundle_python_scanners",
             "--output-dir",
             str(staged_dir),
+            "--no-index",
+            "--wheelhouse",
+            str(wheelhouse),
         ],
         cwd=backend_dir,
         description=f"Bundling project-local Python scanners into {staged_dir}",
@@ -182,6 +278,7 @@ def write_manifest(
     jadx_included: bool,
     build_frontend: bool,
 ) -> None:
+    wheel_files = sorted(path.name for path in wheelhouse.iterdir()) if wheelhouse.exists() else []
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "prepared_on": {
@@ -189,12 +286,24 @@ def write_manifest(
             "machine": platform.machine(),
             "python": platform.python_version(),
         },
+        "required_target": {
+            "python_minor": f"{REQUIRED_PYTHON_MINOR[0]}.{REQUIRED_PYTHON_MINOR[1]}",
+            "same_os_and_cpu_architecture": True,
+        },
+        "versions": {
+            "semgrep": "1.156.0",
+            "bandit": "1.9.4",
+            "tree_sitter": "0.20.4",
+            "tree_sitter_languages": "1.10.2",
+        },
         "notes": [
             "Prepare the bundle on the same OS and CPU architecture as the target air-gapped machine.",
+            "Prepare with Python 3.12.x; wheels built with Python 3.11 are not compatible with this app version.",
             "Do not commit the generated tarball into Git history; publish it as a release artifact or transfer it out-of-band.",
         ],
         "included": {
             "python_packages": len(list(wheelhouse.iterdir())) if wheelhouse.exists() else 0,
+            "python_wheel_files": wheel_files,
             "node_modules_archive": node_archive.exists(),
             "python_scanners": python_scanners_included,
             "codeql": codeql_included,
@@ -321,6 +430,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    if sys.version_info[:2] != REQUIRED_PYTHON_MINOR:
+        required = f"{REQUIRED_PYTHON_MINOR[0]}.{REQUIRED_PYTHON_MINOR[1]}"
+        current = f"{sys.version_info.major}.{sys.version_info.minor}"
+        warn(
+            f"Python {required} is required to prepare this air-gap bundle. "
+            f"Current interpreter is Python {current}."
+        )
+        warn("Run from the repo root: bash ./prepare_airgap_bundle.sh")
+        return 1
+
     repo_root = Path(__file__).resolve().parents[2]
     backend_dir = repo_root / "backend"
     frontend_dir = repo_root / "frontend"
@@ -336,6 +455,7 @@ def main() -> int:
         python_scanners_included = stage_python_scanners(
             backend_dir=backend_dir,
             staged_dir=tools_root / "python_vendor",
+            wheelhouse=python_root,
         )
         ensure_frontend_modules(frontend_dir)
         if not args.skip_frontend_build:
@@ -345,6 +465,7 @@ def main() -> int:
         codeql_included = stage_tool(
             tool_name="codeql",
             backend_dir=backend_dir,
+            wheelhouse=python_root,
             staged_dir=tools_root / "codeql",
             download_module="scripts.download_codeql",
             skip_download=args.skip_codeql,
@@ -352,6 +473,7 @@ def main() -> int:
         jadx_included = stage_tool(
             tool_name="jadx",
             backend_dir=backend_dir,
+            wheelhouse=python_root,
             staged_dir=tools_root / "jadx",
             download_module="scripts.download_jadx",
             skip_download=args.skip_jadx,

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +18,9 @@ NODE_ARCHIVE_BASENAME = "node_modules.tar.gz"
 SCANNERS_ARCHIVE_BASENAME = "python_vendor.tar.gz"
 CODEQL_ARCHIVE_BASENAME = "codeql.tar.gz"
 JADX_ARCHIVE_BASENAME = "jadx.tar.gz"
+REQUIRED_PYTHON_MINOR = (3, 12)
+MIN_NODE_MAJOR = 22
+MIN_NPM_MAJOR = 10
 
 
 def log(message: str) -> None:
@@ -32,11 +36,97 @@ def run(cmd: list[str], *, cwd: Path, description: str) -> None:
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
+def venv_python_path(venv_dir: Path) -> Path:
+    if sys.platform == "win32":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def run_download_module_with_wheelhouse(
+    *,
+    backend_dir: Path,
+    wheelhouse: Path,
+    module_name: str,
+    module_args: list[str],
+    description: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="vragent-tool-download-") as temp_dir:
+        venv_dir = Path(temp_dir) / "venv"
+        run(
+            [sys.executable, "-m", "venv", str(venv_dir)],
+            cwd=backend_dir,
+            description="Creating temporary downloader environment",
+        )
+        downloader_python = venv_python_path(venv_dir)
+        run(
+            [
+                str(downloader_python),
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--find-links",
+                str(wheelhouse),
+                "httpx",
+            ],
+            cwd=backend_dir,
+            description="Installing downloader dependencies from the prepared wheelhouse",
+        )
+        run(
+            [str(downloader_python), "-m", module_name, *module_args],
+            cwd=backend_dir,
+            description=description,
+        )
+
+
+def output_or_none(cmd: list[str], *, cwd: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        return None
+    return completed.stdout.strip().splitlines()[0] if completed.stdout.strip() else None
+
+
 def find_command(name: str) -> str:
     resolved = shutil.which(name)
     if not resolved:
         raise FileNotFoundError(f"{name} is required on PATH")
     return resolved
+
+
+def major_version(version: str | None) -> int | None:
+    if not version:
+        return None
+    token = version.strip().splitlines()[0].removeprefix("v").split(".", 1)[0]
+    return int(token) if token.isdigit() else None
+
+
+def ensure_node_toolchain(frontend_dir: Path) -> str:
+    node = find_command("node")
+    npm = find_command("npm")
+    node_version = output_or_none([node, "--version"], cwd=frontend_dir)
+    npm_version = output_or_none([npm, "--version"], cwd=frontend_dir)
+    node_major = major_version(node_version)
+    npm_major = major_version(npm_version)
+    if node_major is None or node_major < MIN_NODE_MAJOR:
+        raise RuntimeError(
+            f"Node.js {MIN_NODE_MAJOR}+ is required to prepare frontend dependencies; "
+            f"found {node_version or 'unknown'}."
+        )
+    if npm_major is None or npm_major < MIN_NPM_MAJOR:
+        raise RuntimeError(
+            f"npm {MIN_NPM_MAJOR}+ is required to prepare frontend dependencies; "
+            f"found {npm_version or 'unknown'}."
+        )
+    log(f"Using Node.js {node_version} and npm {npm_version}")
+    return npm
 
 
 def ensure_clean_dir(path: Path, *, clean: bool) -> None:
@@ -63,12 +153,12 @@ def build_python_wheelhouse(backend_dir: Path, wheelhouse: Path) -> None:
 
 
 def ensure_frontend_modules(frontend_dir: Path) -> None:
+    npm = ensure_node_toolchain(frontend_dir)
     node_modules = frontend_dir / "node_modules"
     if node_modules.exists():
-        log("Using existing frontend/node_modules")
-        return
+        log("Removing existing frontend/node_modules so native optional packages match this Linux host")
+        shutil.rmtree(node_modules)
 
-    npm = find_command("npm")
     install_args = ["ci"] if (frontend_dir / "package-lock.json").exists() else ["install"]
     run([npm, *install_args], cwd=frontend_dir, description="Installing frontend dependencies")
 
@@ -145,15 +235,18 @@ def archive_directory(source_dir: Path, archive_path: Path) -> list[Path]:
 def stage_tool(
     *,
     backend_dir: Path,
+    wheelhouse: Path,
     output_dir: Path,
     module_name: str,
     description: str,
 ) -> None:
     if output_dir.exists():
         shutil.rmtree(output_dir)
-    run(
-        [sys.executable, "-m", module_name, "--output", str(output_dir)],
-        cwd=backend_dir,
+    run_download_module_with_wheelhouse(
+        backend_dir=backend_dir,
+        wheelhouse=wheelhouse,
+        module_name=module_name,
+        module_args=["--output", str(output_dir)],
         description=description,
     )
 
@@ -185,7 +278,21 @@ def write_manifest(
     node_archives: list[Path],
     codeql_archives: list[Path],
     jadx_archives: list[Path],
+    frontend_dir: Path,
+    codeql_version: str | None,
+    jadx_version: str | None,
 ) -> None:
+    package_lock = frontend_dir / "package-lock.json"
+    node_version = output_or_none(["node", "--version"], cwd=frontend_dir)
+    npm_version = output_or_none(["npm", "--version"], cwd=frontend_dir)
+    package_lock_version = None
+    package_count = None
+    if package_lock.exists():
+        package_lock_data = json.loads(package_lock.read_text(encoding="utf-8"))
+        package_lock_version = package_lock_data.get("lockfileVersion")
+        package_count = len(package_lock_data.get("packages", {}))
+
+    wheel_files = sorted(path.name for path in wheelhouse.iterdir()) if wheelhouse.exists() else []
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "prepared_on": {
@@ -193,9 +300,27 @@ def write_manifest(
             "machine": platform.machine(),
             "python": platform.python_version(),
         },
-        "intended_target": "Ubuntu/Linux host with the same CPU architecture",
+        "required_target": {
+            "os": "Ubuntu/Linux",
+            "machine": platform.machine(),
+            "python_minor": f"{REQUIRED_PYTHON_MINOR[0]}.{REQUIRED_PYTHON_MINOR[1]}",
+            "same_cpu_architecture": True,
+        },
+        "versions": {
+            "semgrep": "1.156.0",
+            "bandit": "1.9.4",
+            "codeql": codeql_version,
+            "jadx": jadx_version,
+            "node": node_version,
+            "npm": npm_version,
+            "package_lock_version": package_lock_version,
+            "frontend_package_count": package_count,
+            "tree_sitter": "0.20.4",
+            "tree_sitter_languages": "1.10.2",
+        },
         "included": {
             "python_wheels": len(list(wheelhouse.iterdir())) if wheelhouse.exists() else 0,
+            "python_wheel_files": wheel_files,
             "python_scanners": bool(scanner_archives),
             "python_scanners_archive_parts": [path.name for path in scanner_archives],
             "node_modules_archive": bool(node_archives),
@@ -222,7 +347,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-node-modules",
         action="store_true",
-        help="Include a node_modules.tar.gz archive for clone-only frontend tooling bootstraps.",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--skip-node-modules",
+        action="store_true",
+        help="Do not include node_modules.tar.gz; target install will need an internal npm mirror.",
     )
     parser.add_argument(
         "--skip-codeql",
@@ -243,6 +373,15 @@ def main() -> int:
     if platform.system() != "Linux":
         warn("This script is intended to be run on a connected Ubuntu/Linux machine.")
         warn(f"Current platform: {platform.system()} {platform.machine()}")
+        return 1
+    if sys.version_info[:2] != REQUIRED_PYTHON_MINOR:
+        required = f"{REQUIRED_PYTHON_MINOR[0]}.{REQUIRED_PYTHON_MINOR[1]}"
+        current = f"{sys.version_info.major}.{sys.version_info.minor}"
+        warn(
+            f"Python {required} is required to prepare the Ubuntu wheelhouse. "
+            f"Current interpreter is Python {current}."
+        )
+        warn("Run from the repo root: bash ./prepare_ubuntu_vendor.sh")
         return 1
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -275,7 +414,7 @@ def main() -> int:
     )
     scanner_archives = archive_directory(vendor_scanners, vendor_scanners_archive)
 
-    if args.include_node_modules:
+    if not args.skip_node_modules:
         ensure_frontend_modules(frontend_dir)
         archive_node_modules(frontend_dir, vendor_node)
         node_archives = split_archive_if_needed(vendor_node)
@@ -293,13 +432,16 @@ def main() -> int:
             shutil.rmtree(vendor_codeql)
         remove_archive_and_parts(vendor_codeql_archive)
         codeql_archives = []
+        codeql_version = None
     else:
         stage_tool(
             backend_dir=backend_dir,
+            wheelhouse=vendor_python,
             output_dir=vendor_codeql,
             module_name="scripts.download_codeql",
             description=f"Downloading Ubuntu CodeQL bundle into {vendor_codeql}",
         )
+        codeql_version = output_or_none([str(vendor_codeql / "codeql"), "version", "--format=terse"], cwd=backend_dir)
         codeql_archives = archive_directory(vendor_codeql, vendor_codeql_archive)
 
     if args.skip_jadx:
@@ -308,13 +450,16 @@ def main() -> int:
             shutil.rmtree(vendor_jadx)
         remove_archive_and_parts(vendor_jadx_archive)
         jadx_archives = []
+        jadx_version = None
     else:
         stage_tool(
             backend_dir=backend_dir,
+            wheelhouse=vendor_python,
             output_dir=vendor_jadx,
             module_name="scripts.download_jadx",
             description=f"Downloading jadx into {vendor_jadx}",
         )
+        jadx_version = output_or_none([str(vendor_jadx / "bin" / "jadx"), "--version"], cwd=backend_dir)
         jadx_archives = archive_directory(vendor_jadx, vendor_jadx_archive)
 
     write_manifest(
@@ -324,6 +469,9 @@ def main() -> int:
         node_archives=node_archives,
         codeql_archives=codeql_archives,
         jadx_archives=jadx_archives,
+        frontend_dir=frontend_dir,
+        codeql_version=codeql_version,
+        jadx_version=jadx_version,
     )
 
     log(f"Ubuntu vendor tree prepared at {vendor_root}")

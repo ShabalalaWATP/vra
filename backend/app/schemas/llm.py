@@ -1,6 +1,5 @@
 import uuid
 from datetime import datetime
-from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -30,10 +29,19 @@ class LLMProfileCreate(BaseModel):
     api_key: str | None = None
     model_name: str
     cert_path: str | None = None
-    timeout_seconds: int = 120
-    context_window: int = Field(default=131072, description="Total context window size in tokens (input + output). E.g. 131072 for 128k.")
-    max_output_tokens: int = Field(default=4096, description="Max tokens per response (output only).")
-    use_max_completion_tokens: bool = Field(default=False, description="Use max_completion_tokens field instead of max_tokens in API requests.")
+    timeout_seconds: int = 500
+    context_window: int = Field(
+        default=131072,
+        description="Total context window size in tokens (input + output). E.g. 131072 for 128k.",
+    )
+    max_output_tokens: int = Field(
+        default=4096,
+        description="Max tokens per response (output only).",
+    )
+    use_max_completion_tokens: bool = Field(
+        default=False,
+        description="Use max_completion_tokens field instead of max_tokens in API requests.",
+    )
     concurrency: int = 2
     is_default: bool = False
 

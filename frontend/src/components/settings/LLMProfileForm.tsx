@@ -25,7 +25,7 @@ const DEFAULTS: LLMFormData = {
   api_key: "",
   model_name: "",
   cert_path: "",
-  timeout_seconds: 120,
+  timeout_seconds: 500,
   max_tokens: 4096,
   concurrency: 2,
   is_default: false,
@@ -111,7 +111,7 @@ export default function LLMProfileForm({
           <input
             className="input"
             type="number"
-            min={256}
+            min={1}
             max={128000}
             value={form.max_tokens}
             onChange={(e) => update("max_tokens", Number(e.target.value))}

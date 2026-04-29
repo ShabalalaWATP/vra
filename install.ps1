@@ -67,6 +67,10 @@ $OFFLINE_PYTHON = Join-Path $OFFLINE_ROOT "python"
 $OFFLINE_NODE = Join-Path $OFFLINE_ROOT "node_modules.tar.gz"
 $OFFLINE_TOOLS = Join-Path $OFFLINE_ROOT "tools"
 $LOCAL_SCANNERS = Join-Path $BACKEND "tools" "python_vendor"
+$VENV_DIR = Join-Path $ROOT ".venv"
+$VENV_PYTHON = Join-Path $VENV_DIR "Scripts\python.exe"
+$MIN_NODE_MAJOR = 22
+$MIN_NPM_MAJOR = 10
 
 function Write-Header {
     param([string]$Text)
@@ -98,6 +102,60 @@ function Test-Command {
     return $?
 }
 
+function Get-MajorVersion {
+    param([string]$VersionText)
+    if (-not $VersionText) {
+        return 0
+    }
+    $token = (($VersionText.Trim() -replace "^v", "") -split "\.")[0]
+    $major = 0
+    if ([int]::TryParse($token, [ref]$major)) {
+        return $major
+    }
+    return 0
+}
+
+function Find-Python312 {
+    $candidates = @()
+
+    if (Test-Command "py") {
+        try {
+            $launcherPath = (& py -3.12 -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1)
+            if ($launcherPath) {
+                $candidates += $launcherPath
+            }
+        } catch {
+            # Continue to other discovery paths.
+        }
+    }
+
+    foreach ($name in @("python3.12", "python")) {
+        if (Test-Command $name) {
+            try {
+                $candidatePath = (& $name -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1)
+                if ($candidatePath) {
+                    $candidates += $candidatePath
+                }
+            } catch {
+                # Continue to other discovery paths.
+            }
+        }
+    }
+
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        try {
+            $version = (& $candidate -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null | Select-Object -First 1)
+            if ($version -eq "3.12") {
+                return $candidate
+            }
+        } catch {
+            # Continue checking candidates.
+        }
+    }
+
+    return $null
+}
+
 function Get-SqliteUrl {
     param([string]$PathString)
     $fullPath = [System.IO.Path]::GetFullPath(
@@ -115,38 +173,69 @@ Write-Host ""
 # ── Check prerequisites ────────────────────────────────────────────
 Write-Header "Checking Prerequisites"
 
-# Python
-if (Test-Command "python") {
-    $pyVer = python --version 2>&1
-    Write-Step "Python: $pyVer"
-    $pyMajor = [int]($pyVer -replace "Python (\d+)\.(\d+)\.\d+", '$1')
-    $pyMinor = [int]($pyVer -replace "Python (\d+)\.(\d+)\.\d+", '$2')
-    if ($pyMajor -lt 3 -or $pyMinor -lt 11) {
-        Write-Err "Python 3.11+ is required. Found: $pyVer"
-        exit 1
-    }
-} else {
-    Write-Err "Python not found. Install Python 3.11+ and add to PATH."
+# Python 3.12 is required because tree-sitter-languages 1.10.2 does not
+# publish Windows wheels for Python 3.13 or 3.14.
+$SYSTEM_PYTHON = Find-Python312
+if (-not $SYSTEM_PYTHON) {
+    Write-Err "Python 3.12 is required. Install Python 3.12 and ensure the py launcher or python3.12 is available."
     exit 1
 }
+$pyVer = & $SYSTEM_PYTHON --version 2>&1
+Write-Step "Python for VRAgent: $pyVer ($SYSTEM_PYTHON)"
+
+if ((Test-Path $VENV_PYTHON)) {
+    $venvVersion = (& $VENV_PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null | Select-Object -First 1)
+    if ($venvVersion -ne "3.12") {
+        Write-Warn "Existing .venv uses Python $venvVersion; recreating it with Python 3.12."
+        $resolvedVenv = (Resolve-Path $VENV_DIR).Path
+        if ($resolvedVenv -eq (Join-Path $ROOT ".venv")) {
+            Remove-Item -LiteralPath $resolvedVenv -Recurse -Force
+        } else {
+            Write-Err "Refusing to remove unexpected venv path: $resolvedVenv"
+            exit 1
+        }
+    }
+}
+
+if (-not (Test-Path $VENV_PYTHON)) {
+    Write-Step "Creating local virtual environment: $VENV_DIR"
+    & $SYSTEM_PYTHON -m venv $VENV_DIR
+}
+
+$PYTHON = $VENV_PYTHON
+$PIP = @($PYTHON, "-m", "pip")
+& $PYTHON -m pip install --upgrade pip setuptools wheel 2>&1 | Out-Null
 
 # Node.js
 if (Test-Command "node") {
     $nodeVer = node --version 2>&1
+    $nodeMajor = Get-MajorVersion $nodeVer
+    if ($nodeMajor -lt $MIN_NODE_MAJOR) {
+        Write-Err "Node.js $MIN_NODE_MAJOR or newer is required. Current version: $nodeVer"
+        Write-Err "Install Node.js 22.x LTS and add it to PATH."
+        exit 1
+    }
     Write-Step "Node.js: $nodeVer"
 } else {
-    Write-Err "Node.js not found. Install Node.js 18+ and add to PATH."
+    Write-Err "Node.js not found. Install Node.js 22.x LTS and add it to PATH."
     exit 1
 }
 
 # npm
 if (Test-Command "npm") {
     $npmVer = npm --version 2>&1
+    $npmMajor = Get-MajorVersion $npmVer
+    if ($npmMajor -lt $MIN_NPM_MAJOR) {
+        Write-Err "npm $MIN_NPM_MAJOR or newer is required. Current version: $npmVer"
+        Write-Err "Install the npm version bundled with Node.js 22.x LTS."
+        exit 1
+    }
     Write-Step "npm: $npmVer"
 } else {
     Write-Err "npm not found. Should come with Node.js."
     exit 1
 }
+$NPM = if (Test-Command "npm.cmd") { (Get-Command "npm.cmd").Source } else { "npm" }
 
 # ── Install Python backend ─────────────────────────────────────────
 Write-Header "Installing Backend Dependencies"
@@ -156,7 +245,7 @@ try {
     if ($Offline) {
         if (Test-Path $OFFLINE_PYTHON) {
             Write-Step "Installing from offline packages: $OFFLINE_PYTHON"
-            pip install --no-index --find-links=$OFFLINE_PYTHON -e ".[dev]" 2>&1 | Out-Null
+            & $PYTHON -m pip install --no-index --find-links=$OFFLINE_PYTHON -e ".[dev]" 2>&1 | Out-Null
         } else {
             Write-Err "Offline packages not found at: $OFFLINE_PYTHON"
             Write-Err "Prepare offline packages first (see README.md)"
@@ -164,7 +253,7 @@ try {
         }
     } else {
         Write-Step "Installing Python packages from PyPI..."
-        pip install -e ".[dev]" 2>&1 | Out-Null
+        & $PYTHON -m pip install -e ".[dev]" 2>&1 | Out-Null
     }
     Write-Step "Backend dependencies installed"
 
@@ -187,19 +276,19 @@ try {
             }
             $bundleArgs += @("--no-index", "--wheelhouse", $OFFLINE_PYTHON)
         }
-        & python @bundleArgs 2>&1 | Out-Null
+        & $PYTHON @bundleArgs 2>&1 | Out-Null
     }
 
     $localSemgrep = Join-Path $BACKEND "tools" "bin" "run_semgrep.py"
     $localBandit = Join-Path $BACKEND "tools" "bin" "run_bandit.py"
     if ((Test-Path $localSemgrep) -and (Test-Path $LOCAL_SCANNERS)) {
-        $semgrepVer = & python $localSemgrep --version 2>&1
+        $semgrepVer = & $PYTHON $localSemgrep --version 2>$null | Select-Object -First 1
         Write-Step "Bundled Semgrep ready: $semgrepVer"
     } else {
         Write-Warn "Bundled Semgrep was not created successfully."
     }
     if ((Test-Path $localBandit) -and (Test-Path $LOCAL_SCANNERS)) {
-        $banditVer = & python $localBandit --version 2>&1 | Select-Object -First 1
+        $banditVer = & $PYTHON $localBandit --version 2>$null | Select-Object -First 1
         Write-Step "Bundled Bandit ready: $banditVer"
     } else {
         Write-Warn "Bundled Bandit was not created successfully."
@@ -222,12 +311,14 @@ try {
             exit 1
         }
     } else {
-        $npmInstallArgs = if (Test-Path (Join-Path $FRONTEND "package-lock.json")) { @("ci") } else { @("install") }
+        [string[]]$npmInstallArgs = @(
+            if (Test-Path (Join-Path $FRONTEND "package-lock.json")) { "ci" } else { "install" }
+        )
         Write-Step "Running npm $($npmInstallArgs[0])..."
-        & npm @npmInstallArgs 2>&1 | Out-Null
+        & $NPM @npmInstallArgs
         if ($LASTEXITCODE -ne 0 -and $npmInstallArgs[0] -eq "ci") {
             Write-Warn "npm ci failed; falling back to npm install to refresh the lockfile."
-            & npm install 2>&1 | Out-Null
+            & $NPM install
         }
         if ($LASTEXITCODE -ne 0) {
             Write-Err "Frontend dependency installation failed."
@@ -235,6 +326,14 @@ try {
         }
     }
     Write-Step "Frontend dependencies installed"
+
+    Write-Step "Building frontend..."
+    & $NPM run build
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Frontend build failed."
+        exit 1
+    }
+    Write-Step "Frontend build complete"
 
     # ESLint
     $localEslint = Join-Path $FRONTEND "node_modules" ".bin" "eslint.cmd"
@@ -259,7 +358,7 @@ if (-not $SkipCodeQL -and -not $Offline) {
         Write-Step "Downloading CodeQL CLI (~500MB, please wait)..."
         Push-Location $BACKEND
         try {
-            python -m scripts.download_codeql --output tools/codeql 2>&1 | ForEach-Object {
+            & $PYTHON -m scripts.download_codeql --output tools/codeql 2>&1 | ForEach-Object {
                 if ($_ -match "^\s+\[") { Write-Host "`r  $_" -NoNewline }
                 elseif ($_ -match "Version:|installed|Binary:") { Write-Step $_ }
             }
@@ -305,7 +404,7 @@ if (-not $Offline) {
         Write-Step "Downloading jadx..."
         Push-Location $BACKEND
         try {
-            python -m scripts.download_jadx --output tools/jadx 2>&1 | ForEach-Object {
+            & $PYTHON -m scripts.download_jadx --output tools/jadx 2>&1 | ForEach-Object {
                 if ($_ -match "Version:|installed|Binary:") { Write-Step $_ }
             }
         } catch {
@@ -352,7 +451,7 @@ if (-not $SkipData -and -not $Offline) {
         } else {
             Write-Step "Downloading Semgrep rules..."
             try {
-                python -m scripts.download_semgrep_rules --output data/semgrep-rules/ 2>&1 | Out-Null
+                & $PYTHON -m scripts.download_semgrep_rules --output data/semgrep-rules/ 2>&1 | Out-Null
                 $newCount = (Get-ChildItem -Path $rulesDir -Filter "*.yaml" -Recurse | Measure-Object).Count
                 Write-Step "Downloaded $newCount Semgrep rules"
             } catch {
@@ -368,7 +467,7 @@ if (-not $SkipData -and -not $Offline) {
         } else {
             Write-Step "Downloading OSV advisory database (~250MB)..."
             try {
-                python -m scripts.sync_advisories --output data/advisories/ 2>&1 | Out-Null
+                & $PYTHON -m scripts.sync_advisories --output data/advisories/ 2>&1 | Out-Null
                 Write-Step "Advisory database downloaded"
             } catch {
                 Write-Warn "Advisory database download failed."
@@ -384,7 +483,7 @@ if (-not $SkipData -and -not $Offline) {
         } else {
             Write-Step "Downloading technology icons..."
             try {
-                python -m scripts.download_icons --output data/icons/ 2>&1 | Out-Null
+                & $PYTHON -m scripts.download_icons --output data/icons/ 2>&1 | Out-Null
                 Write-Step "Icons downloaded"
             } catch {
                 Write-Warn "Icons download failed. Diagrams will work without custom icons."
@@ -412,7 +511,7 @@ if (-not $SkipDB) {
     Push-Location $BACKEND
     try {
         $env:VRAGENT_DATABASE_URL = $connStr
-        python -m alembic upgrade head 2>&1 | Out-Null
+        & $PYTHON -m alembic upgrade head 2>&1 | Out-Null
         Write-Step "Migrations complete"
     } catch {
         Write-Warn "Migration failed for SQLite database: $dbFile"
@@ -455,7 +554,7 @@ Write-Host "      .\\start.ps1" -ForegroundColor DarkGray
 Write-Host "      Then open: http://localhost:8000" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "    Development mode (two processes):" -ForegroundColor White
-Write-Host "      Terminal 1: cd backend ; uvicorn app.main:app --host 0.0.0.0 --port 8000" -ForegroundColor DarkGray
+    Write-Host "      Terminal 1: cd backend ; ..\\.venv\\Scripts\\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000" -ForegroundColor DarkGray
 Write-Host "      Terminal 2: cd frontend ; npm run dev" -ForegroundColor DarkGray
 Write-Host "      Then open: http://localhost:3000" -ForegroundColor DarkGray
 Write-Host ""

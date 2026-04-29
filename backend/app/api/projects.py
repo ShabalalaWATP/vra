@@ -1,13 +1,13 @@
 import shutil
 import uuid
-from pathlib import Path
-
-from typing import List
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analysis.paths import DEFAULT_SKIP_DIRS
 from app.config import settings
 from app.database import get_db
 from app.models.project import Project
@@ -15,6 +15,83 @@ from app.models.scan import Scan
 from app.schemas.project import ProjectCreate, ProjectOut, ProjectUpdate
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+UPLOAD_SKIP_DIRS = {
+    *(name.casefold() for name in DEFAULT_SKIP_DIRS),
+    ".eggs",
+    ".npm",
+    ".pnpm-store",
+    ".yarn",
+    ".yarn-cache",
+    "htmlcov",
+    "jspm_packages",
+    "site-packages",
+}
+
+
+@dataclass(frozen=True)
+class UploadSaveResult:
+    saved: int
+    ignored: int
+
+
+def _safe_upload_relative_path(filename: str) -> Path | None:
+    """Return a safe relative path for a browser folder upload."""
+    normalised = filename.replace("\\", "/").strip()
+    if not normalised:
+        return None
+
+    rel = PurePosixPath(normalised)
+    if rel.is_absolute():
+        return None
+
+    parts = [part for part in rel.parts if part not in ("", ".")]
+    if not parts:
+        return None
+    if any(part == ".." or part.endswith(":") for part in parts):
+        return None
+    return Path(*parts)
+
+
+def _is_ignored_upload_path(rel_path: Path) -> bool:
+    """Return True when an uploaded file lives under generated/dependency dirs."""
+    return any(part.casefold() in UPLOAD_SKIP_DIRS for part in rel_path.parts)
+
+
+async def _save_uploaded_codebase_files(
+    upload_dir: Path,
+    files: list[UploadFile],
+) -> UploadSaveResult:
+    upload_root = upload_dir.resolve()
+    saved = 0
+    ignored = 0
+
+    for f in files:
+        if not f.filename:
+            continue
+
+        rel_path = _safe_upload_relative_path(f.filename)
+        if rel_path is None:
+            continue
+        if _is_ignored_upload_path(rel_path):
+            ignored += 1
+            continue
+
+        dest = (upload_root / rel_path).resolve()
+        try:
+            dest.relative_to(upload_root)
+        except ValueError:
+            continue
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            content = await f.read()
+            dest.write_bytes(content)
+            saved += 1
+        except Exception:
+            continue
+
+    return UploadSaveResult(saved=saved, ignored=ignored)
 
 
 def _project_out(project: Project, *, scan_count: int = 0) -> ProjectOut:
@@ -72,7 +149,7 @@ async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)
 @router.post("/upload-folder", response_model=ProjectOut, status_code=201)
 async def upload_folder(
     name: str = Form(...),
-    files: List[UploadFile] = File(...),
+    files: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
 ):
     """Upload an entire folder of source files and create a project."""
@@ -84,26 +161,16 @@ async def upload_folder(
     upload_dir = settings.upload_dir / "codebases" / str(project_id)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    file_count = 0
-    for f in files:
-        if not f.filename:
-            continue
-        # Preserve directory structure from webkitRelativePath
-        rel_path = Path(f.filename)
-        dest = (upload_dir / rel_path).resolve()
-        # Prevent path traversal — ensure dest stays within upload_dir
-        if not str(dest).startswith(str(upload_dir.resolve())):
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            content = await f.read()
-            dest.write_bytes(content)
-            file_count += 1
-        except Exception:
-            continue
+    save_result = await _save_uploaded_codebase_files(upload_dir, files)
 
-    if file_count == 0:
+    if save_result.saved == 0:
         shutil.rmtree(upload_dir, ignore_errors=True)
+        if save_result.ignored:
+            raise HTTPException(
+                400,
+                "No valid source files were uploaded; dependency/generated folders "
+                "such as node_modules are ignored.",
+            )
         raise HTTPException(400, "No valid files were uploaded")
 
     # Find the actual root — if all files share a common prefix directory, use that
@@ -112,12 +179,16 @@ async def upload_folder(
     if len(subdirs) == 1 and not any(upload_dir.glob("*.*")):
         repo_path = subdirs[0]  # Use the single subdirectory as root
 
+    description = f"Uploaded {save_result.saved} files via browser"
+    if save_result.ignored:
+        description += f" (ignored {save_result.ignored} dependency/generated files)"
+
     project = Project(
         id=project_id,
         name=name or f"Upload {project_id}",
         repo_path=str(repo_path),
         source_type="codebase",
-        description=f"Uploaded {file_count} files via browser",
+        description=description,
     )
     db.add(project)
     await db.flush()

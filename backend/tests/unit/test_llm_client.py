@@ -77,3 +77,96 @@ def test_chat_retries_transient_transport_errors(monkeypatch):
     assert calls["count"] == 2
 
     asyncio.run(client.close())
+
+
+def test_chat_json_retries_without_response_format_when_unsupported(monkeypatch):
+    client = LLMClient(
+        base_url="http://localhost:1234",
+        model_name="test-model",
+        context_window=4096,
+        max_output_tokens=256,
+    )
+    bodies = []
+
+    async def fake_resolve_chat_path(_headers):
+        return "/v1/chat/completions"
+
+    async def fake_post(path, *, headers=None, json=None):
+        bodies.append(dict(json or {}))
+        request = httpx.Request("POST", f"http://localhost:1234{path}")
+        if len(bodies) == 1:
+            return httpx.Response(
+                400,
+                request=request,
+                json={"error": {"message": "response_format is not supported by this model"}},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": '{"ok": true}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+                "model": "test-model",
+            },
+        )
+
+    monkeypatch.setattr(client, "_resolve_chat_path", fake_resolve_chat_path)
+    monkeypatch.setattr(client._client, "post", fake_post)
+
+    result = asyncio.run(client.chat_json("Return JSON.", "hello", max_tokens=64))
+
+    assert result == {"ok": True}
+    assert "response_format" in bodies[0]
+    assert "response_format" not in bodies[1]
+    assert client._response_format_supported is False
+
+    asyncio.run(client.close())
+
+
+def test_parse_json_response_ignores_visible_thinking_tokens():
+    content = """
+<think>
+I should inspect the architecture and then emit the requested JSON.
+</think>
+{
+  "app_summary": "A service",
+  "components": [{"name": "API"}]
+}
+"""
+
+    parsed = LLMClient._parse_json_response(content)
+
+    assert parsed == {
+        "app_summary": "A service",
+        "components": [{"name": "API"}],
+    }
+
+
+def test_parse_json_response_extracts_json_after_explanatory_text():
+    content = """Here is the JSON you requested:
+```json
+{"app_summary": "A service", "components": []}
+```
+Extra text from the model.
+"""
+
+    parsed = LLMClient._parse_json_response(content)
+
+    assert parsed == {"app_summary": "A service", "components": []}
+
+
+def test_parse_json_response_skips_non_json_braces_before_payload():
+    content = """
+The model thought about a pseudo object like {not json}
+and then finally answered:
+{"app_summary": "A service", "components": []}
+"""
+
+    parsed = LLMClient._parse_json_response(content)
+
+    assert parsed == {"app_summary": "A service", "components": []}

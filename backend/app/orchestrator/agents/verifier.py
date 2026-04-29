@@ -34,6 +34,13 @@ For each candidate finding, rigorously assess:
 7. MITIGATIONS: Are there other defensive layers (WAF, rate limiting, auth requirements)?
 8. EXPLOITATION DIFFICULTY: How difficult would actual exploitation be?
 
+Contextual false-positive policy:
+- Do not confirm a finding just because a suspicious API, keyword, or scanner rule appears in isolation.
+- For data-flow issues, confirm only when there is evidence of a reachable entry point, attacker-controlled source, sensitive sink, and no effective sanitisation on that path.
+- Dismiss or downgrade findings in tests, examples, fixtures, generated/demo code, unreachable code, or framework-protected paths unless the evidence shows they affect production behavior.
+- For secrets, placeholder/example values such as "password", "changeme", "example", "dummy", "${TOKEN}", "<API_KEY>", or "your_api_key" are not critical secrets. Dismiss them, or at most note them as hygiene issues if the surrounding production context makes that appropriate.
+- Always record counter-evidence in counter_evidence and explain context limits in verification_notes.
+
 ALSO: Look for EXPLOIT CHAINS — can multiple findings be combined?
 For example:
 - Information disclosure → CSRF → privilege escalation
@@ -71,6 +78,152 @@ Respond with JSON:
   ],
   "additional_observations": ["New observations from verification"]
 }"""
+
+PLACEHOLDER_SECRET_VALUES = {
+    "",
+    "password",
+    "password1",
+    "password123",
+    "passwd",
+    "pwd",
+    "secret",
+    "secretkey",
+    "secret_key",
+    "token",
+    "api_key",
+    "apikey",
+    "key",
+    "changeme",
+    "change_me",
+    "change-me",
+    "replace_me",
+    "replace-me",
+    "please_change_me",
+    "please-change-me",
+    "example",
+    "example_password",
+    "example-password",
+    "sample",
+    "sample_password",
+    "sample-password",
+    "dummy",
+    "dummy_password",
+    "dummy-password",
+    "fake",
+    "fake_password",
+    "fake-password",
+    "test",
+    "test_password",
+    "test-password",
+    "none",
+    "null",
+    "undefined",
+    "empty",
+    "default",
+    "insert",
+    "notasecret",
+    "not_a_secret",
+    "not-a-secret",
+}
+
+PLACEHOLDER_SECRET_PATTERNS = [
+    re.compile(r"(?i)^(your|my|example|sample|dummy|fake|test|demo|placeholder)[_-]?.*"),
+    re.compile(r"(?i)^(change|replace|insert)[_-]?(me|this|value|secret|password|token|key)$"),
+    re.compile(r"(?i)^(password|passwd|pwd|secret|token|key|api[_-]?key)(123|1|test|example|demo|dummy|changeme)?$"),
+    re.compile(r"^<[^>]+>$"),
+    re.compile(r"^\$\{[^}]+\}$"),
+    re.compile(r"^\{\{[^}]+\}\}$"),
+    re.compile(r"^\*{4,}$"),
+    re.compile(r"^x{4,}$", re.IGNORECASE),
+    re.compile(r"^\.{3,}$"),
+]
+
+SECRET_ASSIGNMENT_PATTERNS = [
+    re.compile(
+        r"""(?ix)
+        \b(password|passwd|pwd|secret(?:[_-]?key)?|token|api[_-]?key|apikey|client[_-]?secret|storePassword|keyPassword)\b
+        \s*[:=]\s*["']([^"'\s]{1,120})["']
+        """
+    ),
+    re.compile(
+        r"""(?ix)
+        \b(password|passwd|pwd|secret(?:[_-]?key)?|token|api[_-]?key|apikey|client[_-]?secret|storePassword|keyPassword)\b
+        \s*[:=]\s*([^\s#,"']{1,120})
+        """
+    ),
+]
+
+SECRET_RELATED_TERMS = (
+    "secret",
+    "credential",
+    "password",
+    "passwd",
+    "pwd",
+    "token",
+    "api key",
+    "api_key",
+    "apikey",
+    "client secret",
+)
+
+DATA_FLOW_REQUIRED_TERMS = (
+    "injection",
+    "xss",
+    "cross-site scripting",
+    "command exec",
+    "command execution",
+    "rce",
+    "path traversal",
+    "directory traversal",
+    "ssrf",
+    "server-side request forgery",
+    "template injection",
+    "deserial",
+    "xxe",
+    "open redirect",
+)
+
+CONTEXT_EVIDENCE_TERMS = (
+    "attacker",
+    "user-controlled",
+    "user controlled",
+    "request.",
+    "req.",
+    "request parameter",
+    "query parameter",
+    "route",
+    "endpoint",
+    "entry point",
+    "taint",
+    "source",
+    "sink",
+    "call graph",
+    "reachable",
+    "public",
+    "external",
+)
+
+LOW_CONTEXT_PATH_MARKERS = (
+    "/test/",
+    "/tests/",
+    "__tests__",
+    ".spec.",
+    "_spec.",
+    "/spec/",
+    "/mock/",
+    "/mocks/",
+    "/fixture/",
+    "/fixtures/",
+    "/example/",
+    "/examples/",
+    "/sample/",
+    "/samples/",
+    ".example",
+    ".sample",
+    "/docs/",
+    "/doc/",
+    ".md",
+)
 
 
 class VerifierAgent(BaseAgent):
@@ -1131,25 +1284,212 @@ Respond with JSON:
                 flows.append(flow)
         return flows
 
+    @classmethod
+    def _finding_raw_text(cls, finding: CandidateFinding) -> str:
+        parts: list[str] = [
+            str(finding.title or ""),
+            str(finding.category or ""),
+            str(finding.file_path or ""),
+            str(finding.code_snippet or ""),
+            str(finding.hypothesis or ""),
+            str(finding.verification_notes or ""),
+            str(finding.attack_scenario or ""),
+            " ".join(str(item or "") for item in finding.supporting_evidence or []),
+            " ".join(str(item or "") for item in finding.opposing_evidence or []),
+            " ".join(str(item or "") for item in finding.source_scanners or []),
+            " ".join(str(item or "") for item in finding.source_rules or []),
+        ]
+        for hit in finding.source_scanner_hits or []:
+            if not isinstance(hit, dict):
+                continue
+            parts.extend(
+                [
+                    str(hit.get("scanner") or ""),
+                    str(hit.get("rule_id") or ""),
+                    str(hit.get("message") or ""),
+                    str(hit.get("snippet") or ""),
+                    str(hit.get("metadata_summary") or ""),
+                    str(hit.get("metadata") or ""),
+                ]
+            )
+        return "\n".join(part for part in parts if part)
+
+    @classmethod
+    def _is_secret_related(cls, finding: CandidateFinding) -> bool:
+        text = cls._finding_raw_text(finding).lower()
+        if any(term in text for term in SECRET_RELATED_TERMS):
+            return True
+        if any(str(rule or "").lower().startswith("secrets/") for rule in finding.source_rules or []):
+            return True
+        return any(
+            isinstance(hit, dict) and str(hit.get("scanner") or "").lower() == "secrets"
+            for hit in finding.source_scanner_hits or []
+        )
+
+    @staticmethod
+    def _normalise_secret_value(value: str) -> str:
+        return str(value or "").strip().strip("'\"`").strip(" ,;")
+
+    @classmethod
+    def _is_placeholder_secret_value(cls, value: str) -> bool:
+        clean = cls._normalise_secret_value(value)
+        lower = clean.lower()
+        if lower in PLACEHOLDER_SECRET_VALUES:
+            return True
+        return any(pattern.match(clean) for pattern in PLACEHOLDER_SECRET_PATTERNS)
+
+    @classmethod
+    def _placeholder_secret_reason(cls, finding: CandidateFinding) -> str | None:
+        if not cls._is_secret_related(finding):
+            return None
+
+        text = cls._finding_raw_text(finding)
+        for pattern in SECRET_ASSIGNMENT_PATTERNS:
+            for match in pattern.finditer(text):
+                value = match.group(2)
+                if cls._is_placeholder_secret_value(value):
+                    safe_value = cls._normalise_secret_value(value)
+                    return (
+                        f"Secret candidate dismissed because the assigned value '{safe_value}' "
+                        "matches a placeholder/example pattern, not a production credential."
+                    )
+        return None
+
+    @classmethod
+    def _requires_data_flow_context(cls, finding: CandidateFinding) -> bool:
+        text = cls._finding_raw_text(finding).lower()
+        return any(term in text for term in DATA_FLOW_REQUIRED_TERMS)
+
+    @classmethod
+    def _is_low_context_path(cls, file_path: str | None) -> bool:
+        path = "/" + cls._normalise_path(file_path)
+        return any(marker in path for marker in LOW_CONTEXT_PATH_MARKERS)
+
+    def _has_contextual_exploit_evidence(self, ctx: ScanContext, finding: CandidateFinding) -> bool:
+        if finding.input_sources and finding.sinks:
+            return True
+        if finding.exploit_evidence or finding.exploit_template:
+            return True
+        if any(flow.graph_verified and not flow.sanitised for flow in self._relevant_taint_flows_for_finding(ctx, finding)):
+            return True
+
+        text = self._finding_raw_text(finding).lower()
+        has_entry_or_source = any(term in text for term in CONTEXT_EVIDENCE_TERMS)
+        has_path_language = any(
+            term in text
+            for term in (
+                "reaches",
+                "flows to",
+                "flows into",
+                "passed to",
+                "calls",
+                "called by",
+                "route",
+                "endpoint",
+                "sink",
+                "source",
+            )
+        )
+        return has_entry_or_source and has_path_language
+
+    def _contextual_evidence_gap_reason(
+        self,
+        ctx: ScanContext,
+        finding: CandidateFinding,
+    ) -> str | None:
+        if str(finding.status or "").lower() == "dismissed":
+            return None
+        if str(finding.severity or "").lower() not in {"critical", "high"}:
+            return None
+        if not self._requires_data_flow_context(finding):
+            return None
+        if self._has_contextual_exploit_evidence(ctx, finding):
+            return None
+        if self._is_low_context_path(finding.file_path):
+            return (
+                "Data-flow finding is in test/example/docs/fixture context and has no recorded "
+                "production reachability or attacker-controlled input path."
+            )
+        return (
+            "No explicit attacker-controlled source, reachable entry point, vulnerable sink path, "
+            "or unsanitised taint/call-graph evidence was recorded. The finding is treated as "
+            "context-limited rather than a high-confidence exploitable vulnerability."
+        )
+
+    @classmethod
+    def _append_finding_note(cls, finding: CandidateFinding, note: str) -> None:
+        finding.verification_notes = "\n\n".join(
+            cls._merge_string_lists(
+                [finding.verification_notes] if finding.verification_notes else [],
+                [note],
+            )
+        )
+
+    @classmethod
+    def _dismiss_finding(cls, finding: CandidateFinding, reason: str) -> None:
+        finding.status = "dismissed"
+        finding.verification_level = "dismissed"
+        finding.severity = "info"
+        finding.confidence = min(cls._candidate_confidence(finding), 0.1)
+        cls._append_finding_note(finding, reason)
+        finding.opposing_evidence = cls._merge_string_lists(
+            finding.opposing_evidence,
+            [reason],
+        )
+
+    def _strong_signal_count(self, ctx: ScanContext, finding: CandidateFinding) -> int:
+        strong_signals = 0
+        if finding.exploit_evidence or finding.exploit_template:
+            strong_signals += 1
+        if any(
+            str(advisory.get("evidence_strength") or "").lower() in {"strong", "medium"}
+            or "confirmed" in str(advisory.get("evidence_type") or "").lower()
+            for advisory in (finding.related_cves or [])
+            if isinstance(advisory, dict)
+        ):
+            strong_signals += 1
+        if any(flow.graph_verified and not flow.sanitised for flow in self._relevant_taint_flows_for_finding(ctx, finding)):
+            strong_signals += 1
+        if self._candidate_confidence(finding) >= 0.9:
+            strong_signals += 1
+        return strong_signals
+
+    def _apply_deterministic_guardrails(self, ctx: ScanContext) -> None:
+        for finding in ctx.candidate_findings:
+            if str(finding.status or "").lower() == "dismissed":
+                continue
+
+            placeholder_reason = self._placeholder_secret_reason(finding)
+            if placeholder_reason:
+                self._dismiss_finding(finding, placeholder_reason)
+                continue
+
+            context_reason = self._contextual_evidence_gap_reason(ctx, finding)
+            if not context_reason:
+                continue
+
+            if self._is_low_context_path(finding.file_path):
+                self._dismiss_finding(finding, context_reason)
+                continue
+
+            original = str(finding.severity or "").lower()
+            finding.severity = "medium"
+            finding.confidence = min(self._candidate_confidence(finding), 0.6)
+            note = f"Severity downgraded from {original}: {context_reason}"
+            self._append_finding_note(finding, note)
+            finding.opposing_evidence = self._merge_string_lists(
+                finding.opposing_evidence,
+                [context_reason],
+            )
+
     def _finalise_verified_findings(self, ctx: ScanContext) -> tuple[int, int]:
+        self._apply_deterministic_guardrails(ctx)
+
         confirmed = [finding for finding in ctx.candidate_findings if finding.status != "dismissed"]
         dismissed = [finding for finding in ctx.candidate_findings if finding.status == "dismissed"]
 
         for finding in confirmed:
-            strong_signals = 0
-            if finding.exploit_evidence or finding.exploit_template:
-                strong_signals += 1
-            if any(
-                str(advisory.get("evidence_strength") or "").lower() in {"strong", "medium"}
-                or "confirmed" in str(advisory.get("evidence_type") or "").lower()
-                for advisory in (finding.related_cves or [])
-                if isinstance(advisory, dict)
-            ):
-                strong_signals += 1
-            if any(flow.graph_verified and not flow.sanitised for flow in self._relevant_taint_flows_for_finding(ctx, finding)):
-                strong_signals += 1
-            if float(finding.confidence or 0.0) >= 0.9:
-                strong_signals += 1
+            strong_signals = self._strong_signal_count(ctx, finding)
 
             if self._verification_rank(finding.verification_level) < self._verification_rank("statically_verified"):
                 finding.verification_level = "statically_verified"
@@ -1159,7 +1499,7 @@ Respond with JSON:
             if (
                 str(finding.severity or "").lower() in {"critical", "high"}
                 and strong_signals == 0
-                and float(finding.confidence or 0.0) < 0.65
+                and self._candidate_confidence(finding) < 0.65
             ):
                 original = str(finding.severity or "").lower()
                 finding.severity = "high" if original == "critical" else "medium"
@@ -1405,6 +1745,53 @@ Respond with JSON:
             f"App: {ctx.app_summary[:800]}" if ctx.app_summary else "",
             f"Frameworks: {', '.join(ctx.frameworks)}",
         ]
+        if ctx.architecture_notes:
+            parts.append(f"Architecture notes: {ctx.architecture_notes[:1000]}")
+        if ctx.doc_intelligence:
+            parts.append(f"Documentation context: {ctx.doc_intelligence[:1000]}")
+        if ctx.components:
+            component_bits = []
+            for component in ctx.components[:8]:
+                if not isinstance(component, dict):
+                    continue
+                name = component.get("name") or component.get("component") or "component"
+                files = component.get("files") or component.get("paths") or []
+                file_hint = f" ({', '.join(str(item) for item in files[:3])})" if isinstance(files, list) and files else ""
+                component_bits.append(f"{name}{file_hint}")
+            if component_bits:
+                parts.append(f"Components: {'; '.join(component_bits)}")
+        if ctx.entry_points:
+            entry_bits = []
+            for entry in ctx.entry_points[:10]:
+                if not isinstance(entry, dict):
+                    continue
+                entry_bits.append(
+                    " ".join(
+                        str(part)
+                        for part in [
+                            entry.get("type"),
+                            entry.get("file"),
+                            entry.get("function"),
+                            entry.get("path"),
+                        ]
+                        if part
+                    )
+                )
+            if entry_bits:
+                parts.append(f"Entry points: {'; '.join(entry_bits)}")
+        if ctx.attack_surface:
+            parts.append(f"Attack surface: {'; '.join(str(item) for item in ctx.attack_surface[:12])}")
+        if ctx.trust_boundaries:
+            parts.append(f"Trust boundaries: {'; '.join(str(item) for item in ctx.trust_boundaries[:8])}")
+
+        parts.append(
+            "\n## Verification Policy\n"
+            "- Treat scanner hits and suspicious APIs as leads, not proof.\n"
+            "- Confirm data-flow vulnerabilities only with production reachability, attacker-controlled input, a sensitive sink, and no effective sanitisation/framework protection.\n"
+            "- Dismiss or downgrade candidates limited to tests, examples, fixtures, generated/demo code, docs, or unreachable/internal-only code unless production impact is evidenced.\n"
+            "- For secret findings, placeholder values such as password, changeme, example, dummy, ${TOKEN}, <API_KEY>, and your_api_key are not critical secrets.\n"
+            "- Put counter-evidence and context limitations in counter_evidence and verification_notes."
+        )
 
         if ctx.source_type in ("apk", "aab", "dex", "jar"):
             parts.append(
@@ -1439,6 +1826,21 @@ Respond with JSON:
                 parts.append(f"Source scanners: {'; '.join(f.source_scanners[:5])}")
             if f.source_rules:
                 parts.append(f"Source rules: {'; '.join(f.source_rules[:5])}")
+            if f.source_scanner_hits:
+                parts.append("Matched scanner evidence:")
+                for hit in f.source_scanner_hits[:3]:
+                    if not isinstance(hit, dict):
+                        continue
+                    parts.append(
+                        "- "
+                        f"{hit.get('scanner', 'scanner')}::{hit.get('rule_id', '')} "
+                        f"line {hit.get('line') or '?'} severity {hit.get('severity') or 'info'} "
+                        f"{hit.get('message') or ''}".strip()
+                    )
+                    if hit.get("metadata_summary"):
+                        parts.append(f"  Context: {hit['metadata_summary']}")
+                    if hit.get("snippet"):
+                        parts.append(f"  Snippet: {str(hit['snippet'])[:240]}")
             if f.input_sources:
                 parts.append(f"Input sources: {'; '.join(f.input_sources[:5])}")
             if f.sinks:

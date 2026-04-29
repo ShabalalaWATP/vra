@@ -2,7 +2,7 @@
 name = "vragent"
 version = "0.1.0"
 description = "Offline AI-assisted static vulnerability research platform"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
@@ -15,8 +15,8 @@ dependencies = [
     "httpx>=0.28.0",
     "python-multipart>=0.0.18",
     "jinja2>=3.1.0",
-    "tree-sitter>=0.24.0",
-    "tree-sitter-languages>=1.10.2",
+    "tree-sitter==0.20.4",
+    "tree-sitter-languages==1.10.2",
     "python-docx>=1.1.0",
     "weasyprint>=63.0",
     "cairosvg>=2.7.1",
@@ -42,7 +42,7 @@ include = ["app*", "scripts*"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]

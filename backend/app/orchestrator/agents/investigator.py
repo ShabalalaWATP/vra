@@ -13,8 +13,9 @@ Key improvements over naive single-pass:
 import logging
 from pathlib import Path
 
-from app.analysis.investigation_scope import should_investigate_file_path
 from app.analysis.dependency_context import dep_cache_entries, vulnerable_dependency_context_for_file
+from app.analysis.investigation_scope import should_investigate_file_path
+from sqlalchemy import select
 from app.scanners.registry import get_available_scanners
 
 from app.orchestrator.agents.base import BaseAgent
@@ -599,6 +600,9 @@ class InvestigatorAgent(BaseAgent):
                         "line": hit_start or None,
                         "end_line": hit_end or None,
                         "severity": str(hit.get("severity") or "").strip() or None,
+                        "snippet": str(hit.get("snippet") or "").strip(),
+                        "metadata_summary": str(hit.get("metadata_summary") or "").strip(),
+                        "metadata": hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {},
                     }
                 )
         return matched[:5]
@@ -1259,7 +1263,7 @@ class InvestigatorAgent(BaseAgent):
         if vuln_versions:
             relevant = [v for v in vuln_versions if v.get("file_path") == file_path]
             if relevant:
-                parts.append(f"\n### Vulnerable Technology Versions in This File")
+                parts.append("\n### Vulnerable Technology Versions in This File")
                 for v in relevant:
                     advisory_id = v.get("cve_id") or v.get("advisory_id") or "advisory"
                     parts.append(
@@ -1275,7 +1279,7 @@ class InvestigatorAgent(BaseAgent):
         # so it can check if vulnerable functions are actually called
         dep_context = dep_context if dep_context is not None else self._get_dep_context_for_file(ctx, file_path)
         if dep_context:
-            parts.append(f"\n### Vulnerable Dependencies Imported by This File")
+            parts.append("\n### Vulnerable Dependencies Imported by This File")
             for dc in dep_context:
                 cve = dc.get("cve_id") or dc.get("advisory_id", "")
                 parts.append(
@@ -1361,9 +1365,9 @@ class InvestigatorAgent(BaseAgent):
         # Obfuscation warning
         if file_path in ctx.obfuscated_files:
             parts.append(
-                f"\n**WARNING: This file appears to be obfuscated or minified. "
-                f"Variable names and structure may not reflect the original source. "
-                f"Lower your confidence for any findings in this file.**"
+                "\n**WARNING: This file appears to be obfuscated or minified. "
+                "Variable names and structure may not reflect the original source. "
+                "Lower your confidence for any findings in this file.**"
             )
 
         # Monorepo context

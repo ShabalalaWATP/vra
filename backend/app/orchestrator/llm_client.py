@@ -11,6 +11,7 @@ Key design decisions:
 
 import asyncio
 import logging
+import re
 import ssl
 import time
 
@@ -53,7 +54,7 @@ class LLMClient:
         *,
         api_key: str | None = None,
         cert_path: str | None = None,
-        timeout: int = 120,
+        timeout: int = 500,
         context_window: int = 131072,
         max_output_tokens: int = 4096,
         use_max_completion_tokens: bool = False,
@@ -81,6 +82,7 @@ class LLMClient:
 
         # Chat completions path — auto-detected on first call
         self._chat_path: str | None = None
+        self._response_format_supported: bool | None = None
 
         # Running token counters
         self.total_prompt_tokens = 0
@@ -223,7 +225,7 @@ class LLMClient:
         else:
             body["max_tokens"] = output_budget
 
-        if json_mode:
+        if json_mode and self._response_format_supported is not False:
             body["response_format"] = {"type": "json_object"}
         if tools:
             body["tools"] = tools
@@ -240,7 +242,7 @@ class LLMClient:
         async with self._request_semaphore:
             chat_path = await self._resolve_chat_path(headers)
             start = time.monotonic()
-            max_retries = 5
+            max_retries = 3
             resp = None
 
             for attempt in range(max_retries + 1):
@@ -277,6 +279,19 @@ class LLMClient:
                         resp.status_code, wait, attempt + 1, max_retries,
                     )
                     await _aio.sleep(wait)
+                    continue
+                if (
+                    json_mode
+                    and "response_format" in body
+                    and self._is_response_format_unsupported(resp)
+                ):
+                    logger.warning(
+                        "LLM endpoint does not support response_format; "
+                        "retrying JSON request without provider-enforced JSON mode."
+                    )
+                    self._response_format_supported = False
+                    body = dict(body)
+                    body.pop("response_format", None)
                     continue
                 break
 
@@ -441,7 +456,6 @@ class LLMClient:
         max_tokens: int | None = None,
     ) -> dict:
         """Convenience: send messages expecting JSON response, return parsed dict."""
-        import json
 
         result = await self.chat(
             [
@@ -452,14 +466,7 @@ class LLMClient:
             max_tokens=max_tokens,
             json_mode=True,
         )
-        content = result.get("content") or ""
-        # Strip markdown code fences if the model wraps JSON in ```json ... ```
-        content = content.strip()
-        if content.startswith("```"):
-            lines = content.split("\n")
-            # Remove first line (```json) and last line (```)
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            content = "\n".join(lines).strip()
+        content = (result.get("content") or "").strip()
         if not content:
             logger.warning(
                 "LLM returned empty content for JSON request. "
@@ -469,17 +476,149 @@ class LLMClient:
                 result.get("completion_tokens", 0),
             )
             return {}
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as e:
-            # If truncated (finish_reason=length), try to repair by closing brackets
-            if result.get("finish_reason") == "length":
-                logger.warning("JSON truncated (finish_reason=length). Attempting repair...")
-                repaired = self._repair_truncated_json(content)
-                if repaired is not None:
-                    return repaired
-            logger.error("LLM JSON parse error: %s — content preview: %.300s", e, content)
+
+        parsed = self._parse_json_response(
+            content,
+            allow_repair=result.get("finish_reason") == "length",
+        )
+        if parsed is not None:
+            return parsed
+
+        logger.error("LLM JSON parse error — content preview: %.300s", content)
+        return {}
+
+    @classmethod
+    def _parse_json_response(cls, content: str, *, allow_repair: bool = False) -> dict | None:
+        """Parse JSON from model output, tolerating visible reasoning wrappers.
+
+        Some OpenAI-compatible servers expose chain-of-thought in the content
+        stream before the actual JSON. We intentionally discard everything
+        outside the first parseable JSON value.
+        """
+        import json as _json
+
+        for candidate in cls._json_candidates(content):
+            try:
+                parsed = _json.loads(candidate)
+            except _json.JSONDecodeError:
+                if allow_repair:
+                    repaired = cls._repair_truncated_json(candidate)
+                    if repaired is not None:
+                        return repaired
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            logger.warning("LLM JSON response parsed to %s, expected object", type(parsed).__name__)
             return {}
+
+        if allow_repair:
+            cleaned = cls._strip_visible_reasoning(content)
+            repaired = cls._repair_truncated_json(cleaned)
+            if repaired is not None:
+                return repaired
+        return None
+
+    @classmethod
+    def _json_candidates(cls, content: str) -> list[str]:
+        """Return likely JSON substrings, most precise first."""
+        cleaned = cls._strip_visible_reasoning(content)
+        candidates: list[str] = []
+
+        for source in (cleaned, content):
+            for match in re.finditer(r"```(?:json)?\s*(.*?)```", source, re.DOTALL | re.IGNORECASE):
+                cls._append_unique(candidates, match.group(1).strip())
+
+        for source in (cleaned, content):
+            cls._append_unique(candidates, source.strip())
+            first_partial: str | None = None
+            for start, char in enumerate(source):
+                if char not in "{[":
+                    continue
+                balanced = cls._balanced_json_from(source, start)
+                if balanced:
+                    cls._append_unique(candidates, balanced)
+                    continue
+                if first_partial is None:
+                    first_partial = source[start:].strip()
+            if first_partial is not None:
+                cls._append_unique(candidates, first_partial)
+
+        return candidates
+
+    @staticmethod
+    def _strip_visible_reasoning(content: str) -> str:
+        """Remove common visible-reasoning blocks without touching JSON strings."""
+        text = content.strip()
+        if not text:
+            return text
+
+        text = re.sub(r"(?is)<think\b[^>]*>.*?</think>", "", text).strip()
+        text = re.sub(r"(?is)<thinking\b[^>]*>.*?</thinking>", "", text).strip()
+
+        # If a server emits an unterminated thinking tag, salvage from the first
+        # JSON opener after that tag.
+        if re.match(r"(?is)^\s*<think(?:ing)?\b", text):
+            starts = [idx for idx in (text.find("{"), text.find("[")) if idx >= 0]
+            if starts:
+                text = text[min(starts):].strip()
+
+        return text
+
+    @staticmethod
+    def _balanced_json_from(text: str, start: int) -> str | None:
+        stack: list[str] = []
+        in_string = False
+        escape = False
+
+        for idx in range(start, len(text)):
+            char = text[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char in "{[":
+                stack.append(char)
+            elif char in "}]":
+                if not stack:
+                    return None
+                opener = stack.pop()
+                if (opener, char) not in (("{", "}"), ("[", "]")):
+                    return None
+                if not stack:
+                    return text[start: idx + 1].strip()
+
+        return None
+
+    @staticmethod
+    def _append_unique(candidates: list[str], value: str) -> None:
+        if value and value not in candidates:
+            candidates.append(value)
+
+    @staticmethod
+    def _is_response_format_unsupported(resp: httpx.Response) -> bool:
+        if resp.status_code not in {400, 404, 422}:
+            return False
+        text = resp.text.lower()
+        if "response_format" not in text and "response format" not in text:
+            return False
+        unsupported_markers = (
+            "unsupported",
+            "not support",
+            "unknown",
+            "unrecognized",
+            "not permitted",
+            "forbidden",
+            "extra inputs are not permitted",
+            "invalid parameter",
+        )
+        return any(marker in text for marker in unsupported_markers)
 
     @staticmethod
     def _repair_truncated_json(content: str) -> dict | None:

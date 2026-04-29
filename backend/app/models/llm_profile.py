@@ -16,7 +16,7 @@ class LLMProfile(Base):
     api_key: Mapped[str | None] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(255))
     cert_path: Mapped[str | None] = mapped_column(Text)
-    timeout_seconds: Mapped[int] = mapped_column(Integer, default=120)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=500)
 
     # Context window = total tokens the model can handle (input + output combined)
     # Common values: 4096, 8192, 16384, 32768, 65536, 131072, 200000, 400000, 500000-1000000
