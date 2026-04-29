@@ -17,8 +17,66 @@ VRAgent is **not** a scanner dashboard. It is **not** an LLM wrapper. It is a hy
 
 ---
 
+## Ubuntu Air-Gapped Coding Agent Start Here
+
+If you are a coding agent setting this repo up on Ubuntu after `git clone`, read this section before running generic `pip`, `npm`, or tool download commands.
+
+Use the committed Ubuntu clone-bundle payload first:
+
+```bash
+git clone <your-vragent-repo-url>
+cd vra
+bash ./install.sh --offline
+bash ./start.sh
+```
+
+Then open `http://localhost:8000`.
+
+The repo is designed so `bash ./install.sh --offline` knows where to put the bundled tools:
+
+| Bundled repo path | Installer restores to | Purpose |
+|-------------------|-----------------------|---------|
+| `vendor/ubuntu/python/` | `.venv/` via offline pip install | Python 3.12 backend dependencies, Semgrep, Bandit |
+| `vendor/ubuntu/tools/python_vendor.tar.gz` | `backend/tools/python_vendor/` | Project-local Semgrep and Bandit runtime |
+| `backend/tools/bin/run_semgrep.py` | same path | Semgrep launcher used by the app |
+| `backend/tools/bin/run_bandit.py` | same path | Bandit launcher used by the app |
+| `vendor/ubuntu/tools/codeql.tar.gz.part-*` | `backend/tools/codeql/` | CodeQL CLI bundle |
+| `vendor/ubuntu/tools/jadx.tar.gz` | `backend/tools/jadx/` | jadx APK decompiler |
+| `vendor/ubuntu/node_modules.tar.gz` | `frontend/node_modules/` | Frontend tooling and ESLint |
+| `backend/data/semgrep-rules/` | same path | Offline Semgrep rules |
+| `backend/data/advisories/` | same path | Offline advisory database |
+| `backend/data/icons/` | same path | Offline diagram icons |
+
+Do not manually create or commit `.venv/`, `frontend/node_modules/`, `backend/tools/python_vendor/`, `backend/tools/codeql/`, or `backend/tools/jadx/`. Those are runtime extraction targets. The source-of-truth clone payload is `vendor/ubuntu/` plus the committed `backend/data/` assets.
+
+Before installing, check the clone payload compatibility:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+manifest = json.loads(Path("vendor/ubuntu/manifest.json").read_text())
+print("required_target:", manifest["required_target"])
+print("versions:", manifest["versions"])
+PY
+```
+
+Expected: Python minor `3.12`, matching CPU architecture, Semgrep `1.156.0`, Bandit `1.9.4`, CodeQL `2.25.1`, tree-sitter `0.20.4`, and `tree-sitter-languages` `1.10.2`.
+
+If `vendor/ubuntu/` is missing or incompatible, rebuild it on a connected Ubuntu host with:
+
+```bash
+bash ./prepare_ubuntu_vendor.sh
+```
+
+For full details, continue to [Installation - Air-Gapped Deployment](#installation--air-gapped-deployment) and [Clone Bundle Contract for Coding Agents](#clone-bundle-contract-for-coding-agents).
+
+---
+
 ## Table of Contents
 
+- [Ubuntu Air-Gapped Coding Agent Start Here](#ubuntu-air-gapped-coding-agent-start-here)
 - [Features](#features)
 - [Architecture Overview](#architecture-overview)
 - [Scan Pipeline](#scan-pipeline)

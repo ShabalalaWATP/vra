@@ -1,3 +1,26 @@
+# Ubuntu Clone-Bundle Payload - Coding Agent Start Here
+
+If you are a coding agent on the target Ubuntu machine, do not manually download CodeQL, Semgrep, Bandit, jadx, or npm packages first. Return to the repository root and run:
+
+```bash
+bash ./install.sh --offline
+bash ./start.sh
+```
+
+`install.sh --offline` reads this `vendor/ubuntu/` payload and restores the tools to the paths the app expects:
+
+| This payload path | Restored runtime path |
+|-------------------|-----------------------|
+| `vendor/ubuntu/python/` | `.venv/` via offline pip install |
+| `vendor/ubuntu/tools/python_vendor.tar.gz` | `backend/tools/python_vendor/` |
+| `vendor/ubuntu/tools/codeql.tar.gz.part-*` | `backend/tools/codeql/` |
+| `vendor/ubuntu/tools/jadx.tar.gz` | `backend/tools/jadx/` |
+| `vendor/ubuntu/node_modules.tar.gz` | `frontend/node_modules/` |
+
+The Semgrep rules, advisory database, icons, and built frontend are committed elsewhere in the repo under `backend/data/` and `frontend/dist/`. This directory only carries the Ubuntu-specific binary/runtime payload that should not be committed in extracted form.
+
+---
+
 Ubuntu-focused vendored assets live here when you want a plain `git clone` on Ubuntu to carry scanner/runtime dependencies with the repo.
 
 This directory is a clone-bundle payload. It must be generated on a connected Ubuntu/Linux host with the same CPU architecture and Python minor version as the air-gapped target.
