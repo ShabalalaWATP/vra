@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.llm_profile import LLMProfile
+from app.orchestrator.llm_client import LLMClient
 from app.schemas.llm import LLMProfileCreate, LLMProfileOut, LLMProfileUpdate, LLMTestResult
 
 router = APIRouter(prefix="/llm-profiles", tags=["llm"])
@@ -99,81 +100,41 @@ async def test_connection(profile_id: uuid.UUID, db: AsyncSession = Depends(get_
     if not profile:
         raise HTTPException(404, "Profile not found")
 
-    ssl_context = None
-    if profile.cert_path:
-        import ssl
-
-        ssl_context = ssl.create_default_context(cafile=profile.cert_path)
-
-    # Chat completion paths vary across providers
-    chat_paths = [
-        "/v1/chat/completions",
-        "/chat/completions",
-        "/api/v1/chat/completions",
-        "/api/chat/completions",
-    ]
-
-    token_field = "max_completion_tokens" if profile.use_max_completion_tokens else "max_tokens"
-    payload = {
-        "model": profile.model_name,
-        "messages": [{"role": "user", "content": "Say ok"}],
-        token_field: 5,
-    }
-
     start = time.monotonic()
+    client = LLMClient(
+        base_url=profile.base_url,
+        model_name=profile.model_name,
+        api_key=profile.api_key,
+        cert_path=profile.cert_path,
+        timeout=profile.timeout_seconds,
+        context_window=profile.context_window,
+        max_output_tokens=min(max(profile.max_output_tokens, 64), 256),
+        use_max_completion_tokens=profile.use_max_completion_tokens,
+        concurrency=1,
+    )
     try:
-        async with httpx.AsyncClient(
-            base_url=profile.base_url,
-            timeout=profile.timeout_seconds,
-            verify=ssl_context or True,
-        ) as client:
-            headers = {}
-            if profile.api_key:
-                headers["Authorization"] = f"Bearer {profile.api_key}"
-
-            import asyncio as _aio
-
-            last_error = None
-            for path in chat_paths:
-                for attempt in range(3):
-                    try:
-                        resp = await client.post(path, headers=headers, json=payload)
-                        if resp.status_code == 404:
-                            break  # Try next path
-                        if resp.status_code == 429 and attempt < 2:
-                            wait = 3 * (attempt + 1)
-                            await _aio.sleep(wait)
-                            continue
-                        resp.raise_for_status()
-                        elapsed_ms = int((time.monotonic() - start) * 1000)
-                        data = resp.json()
-                        return LLMTestResult(
-                            success=True,
-                            model_name=data.get("model", profile.model_name),
-                            response_time_ms=elapsed_ms,
-                        )
-                    except httpx.HTTPStatusError as e:
-                        if e.response.status_code == 404:
-                            break
-                        if e.response.status_code == 429 and attempt < 2:
-                            await _aio.sleep(3 * (attempt + 1))
-                            continue
-                        last_error = e
-                        break
-                    except Exception as e:
-                        last_error = e
-                        break
-                else:
-                    continue
-                if last_error:
-                    break
-
-            elapsed_ms = int((time.monotonic() - start) * 1000)
+        result = await client.chat_json(
+            "You are testing structured output compatibility.",
+            'Return exactly this JSON object and nothing else: {"ok": true}',
+            temperature=0,
+            max_tokens=64,
+        )
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        if result.get("ok") is True:
             return LLMTestResult(
-                success=False,
+                success=True,
+                model_name=profile.model_name,
                 response_time_ms=elapsed_ms,
-                error=str(last_error or "No chat completions endpoint found"),
             )
+        return LLMTestResult(
+            success=False,
+            model_name=profile.model_name,
+            response_time_ms=elapsed_ms,
+            error=(
+                "Endpoint responded, but it did not return parseable structured JSON. "
+                f"Parsed response: {result!r}"
+            ),
+        )
     except Exception as e:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         return LLMTestResult(
@@ -181,6 +142,11 @@ async def test_connection(profile_id: uuid.UUID, db: AsyncSession = Depends(get_
             response_time_ms=elapsed_ms,
             error=str(e),
         )
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
 
 
 # ── Model discovery helper ─────────────────────────────────────

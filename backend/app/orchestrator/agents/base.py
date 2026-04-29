@@ -1,9 +1,6 @@
 """Base agent interface for orchestrator agents."""
 
-import json
 import logging
-import time
-import uuid
 from abc import ABC, abstractmethod
 
 from app.database import async_session
@@ -276,13 +273,5 @@ class BaseAgent(ABC):
 
     @staticmethod
     def _parse_json_response(content: str) -> dict:
-        content = (content or "").strip()
-        if content.startswith("```"):
-            lines = [line for line in content.splitlines() if not line.strip().startswith("```")]
-            content = "\n".join(lines).strip()
-        if not content:
-            return {}
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            return {}
+        parsed = LLMClient._parse_json_response(content)
+        return parsed or {}

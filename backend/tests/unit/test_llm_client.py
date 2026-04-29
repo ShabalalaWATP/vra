@@ -128,6 +128,118 @@ def test_chat_json_retries_without_response_format_when_unsupported(monkeypatch)
     asyncio.run(client.close())
 
 
+def test_chat_json_retries_after_malformed_structured_output(monkeypatch):
+    client = LLMClient(
+        base_url="http://localhost:1234",
+        model_name="test-model",
+        context_window=4096,
+        max_output_tokens=256,
+    )
+    bodies = []
+
+    async def fake_resolve_chat_path(_headers):
+        return "/v1/chat/completions"
+
+    async def fake_post(path, *, headers=None, json=None):
+        bodies.append(dict(json or {}))
+        request = httpx.Request("POST", f"http://localhost:1234{path}")
+        if len(bodies) == 1:
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "choices": [
+                        {
+                            "message": {"content": "I think the answer is ok."},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 8},
+                    "model": "test-model",
+                },
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": '{"ok": true}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+                "model": "test-model",
+            },
+        )
+
+    monkeypatch.setattr(client, "_resolve_chat_path", fake_resolve_chat_path)
+    monkeypatch.setattr(client._client, "post", fake_post)
+
+    result = asyncio.run(client.chat_json("Return JSON.", "hello", max_tokens=64))
+
+    assert result == {"ok": True}
+    assert len(bodies) == 2
+    assert "Structured output contract" in bodies[0]["messages"][0]["content"]
+    assert "previous response was not accepted" in bodies[1]["messages"][1]["content"]
+
+    asyncio.run(client.close())
+
+
+def test_chat_normalises_provider_content_parts(monkeypatch):
+    client = LLMClient(
+        base_url="http://localhost:1234",
+        model_name="test-model",
+        context_window=4096,
+        max_output_tokens=256,
+    )
+
+    async def fake_resolve_chat_path(_headers):
+        return "/v1/chat/completions"
+
+    async def fake_post(path, *, headers=None, json=None):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", f"http://localhost:1234{path}"),
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "hello"},
+                                {"type": "text", "text": "world"},
+                            ]
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+                "model": "test-model",
+            },
+        )
+
+    monkeypatch.setattr(client, "_resolve_chat_path", fake_resolve_chat_path)
+    monkeypatch.setattr(client._client, "post", fake_post)
+
+    result = asyncio.run(client.chat([{"role": "user", "content": "hello"}]))
+
+    assert result["content"] == "hello\nworld"
+
+    asyncio.run(client.close())
+
+
+def test_full_chat_completions_url_is_accepted_as_base_url():
+    client = LLMClient(
+        base_url="https://example.internal/api/v1/chat/completions/",
+        model_name="test-model",
+    )
+
+    assert client.base_url == "https://example.internal"
+    assert client._chat_path == "/api/v1/chat/completions"
+
+    asyncio.run(client.close())
+
+
 def test_parse_json_response_ignores_visible_thinking_tokens():
     content = """
 <think>
@@ -170,3 +282,15 @@ and then finally answered:
     parsed = LLMClient._parse_json_response(content)
 
     assert parsed == {"app_summary": "A service", "components": []}
+
+
+def test_parse_json_response_prefers_final_object_after_visible_reasoning():
+    content = """
+Reasoning: an example object would be {"app_summary": "example", "components": []}.
+Final answer:
+{"app_summary": "Actual service", "components": [{"name": "API"}]}
+"""
+
+    parsed = LLMClient._parse_json_response(content)
+
+    assert parsed == {"app_summary": "Actual service", "components": [{"name": "API"}]}

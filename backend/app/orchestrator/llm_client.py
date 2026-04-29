@@ -14,6 +14,7 @@ import logging
 import re
 import ssl
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -26,6 +27,15 @@ CHARS_PER_TOKEN = 3.2
 
 # Reserve some tokens as safety margin (prompt overhead, special tokens, etc.)
 SAFETY_MARGIN_TOKENS = 200
+
+JSON_OUTPUT_CONTRACT = """
+
+Structured output contract:
+- Return exactly one valid JSON object.
+- Do not include markdown fences, prose, comments, XML tags, <think> blocks, reasoning text, or explanations.
+- Do not echo the schema or prompt.
+- If you need to reason, do it internally and output only the final JSON object.
+"""
 
 
 def estimate_tokens(text: str) -> int:
@@ -60,7 +70,7 @@ class LLMClient:
         use_max_completion_tokens: bool = False,
         concurrency: int = 2,
     ):
-        self.base_url = base_url.rstrip("/")
+        self.base_url, configured_chat_path = self._normalise_base_url(base_url)
         self.model_name = model_name
         self.api_key = api_key
         self.timeout = timeout
@@ -81,7 +91,7 @@ class LLMClient:
         )
 
         # Chat completions path — auto-detected on first call
-        self._chat_path: str | None = None
+        self._chat_path: str | None = configured_chat_path
         self._response_format_supported: bool | None = None
 
         # Running token counters
@@ -93,6 +103,24 @@ class LLMClient:
         self._last_request_time: float = 0
         self._min_request_interval: float = 0.5  # seconds between requests (adjustable)
         self._request_semaphore = asyncio.Semaphore(self.concurrency)
+
+    @staticmethod
+    def _normalise_base_url(base_url: str) -> tuple[str, str | None]:
+        """Accept either a server base URL or a full chat completions URL."""
+        clean = (base_url or "").strip().rstrip("/")
+        if not clean:
+            return clean, None
+
+        parsed = urlsplit(clean)
+        path = parsed.path.rstrip("/")
+        lower_path = path.lower()
+        chat_suffix = "/chat/completions"
+        if lower_path.endswith(chat_suffix):
+            chat_path = path
+            root = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+            return root.rstrip("/"), chat_path
+
+        return clean, None
 
     @property
     def max_input_tokens(self) -> int:
@@ -322,7 +350,9 @@ class LLMClient:
         self._last_request_time = time.monotonic()
 
         finish_reason = choice.get("finish_reason", "unknown")
-        content = message.get("content") or ""
+        content = self._content_to_text(message.get("content"))
+        if not content:
+            content = self._content_to_text(choice.get("text"))
         tool_calls = message.get("tool_calls") or []
 
         if not content and finish_reason != "stop":
@@ -330,6 +360,13 @@ class LLMClient:
                 "LLM returned empty content. finish_reason=%s, "
                 "prompt_tokens=%d, completion_tokens=%d, model=%s",
                 finish_reason, prompt_tokens, completion_tokens, self.model_name,
+            )
+        elif not content and any(
+            key in message for key in ("reasoning", "reasoning_content", "reasoning_text")
+        ):
+            logger.warning(
+                "LLM returned reasoning metadata but no final content. "
+                "The provider may be exposing thinking without a final answer."
             )
         elif finish_reason == "length":
             logger.warning(
@@ -457,34 +494,67 @@ class LLMClient:
     ) -> dict:
         """Convenience: send messages expecting JSON response, return parsed dict."""
 
-        result = await self.chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            json_mode=True,
-        )
-        content = (result.get("content") or "").strip()
-        if not content:
-            logger.warning(
-                "LLM returned empty content for JSON request. "
-                "finish_reason=%s, tokens: %d prompt + %d completion",
-                result.get("finish_reason", "?"),
-                result.get("prompt_tokens", 0),
-                result.get("completion_tokens", 0),
+        strict_system = system.rstrip() + JSON_OUTPUT_CONTRACT
+        prompts = [
+            user,
+            (
+                "Your previous response was not accepted because it was empty, "
+                "not valid JSON, or included reasoning/prose outside JSON.\n\n"
+                "Repeat the original task and return ONLY the final valid JSON object.\n\n"
+                "Original task:\n"
+                f"{user}"
+            ),
+        ]
+
+        last_content = ""
+        last_result: dict | None = None
+        for attempt, prompt in enumerate(prompts, start=1):
+            result = await self.chat(
+                [
+                    {"role": "system", "content": strict_system},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=True,
             )
-            return {}
+            last_result = result
+            content = self._content_to_text(result.get("content")).strip()
+            last_content = content
+            if not content:
+                logger.warning(
+                    "LLM returned empty content for JSON request attempt %d/%d. "
+                    "finish_reason=%s, tokens: %d prompt + %d completion",
+                    attempt,
+                    len(prompts),
+                    result.get("finish_reason", "?"),
+                    result.get("prompt_tokens", 0),
+                    result.get("completion_tokens", 0),
+                )
+                continue
 
-        parsed = self._parse_json_response(
-            content,
-            allow_repair=result.get("finish_reason") == "length",
-        )
-        if parsed is not None:
-            return parsed
+            parsed = self._parse_json_response(
+                content,
+                allow_repair=result.get("finish_reason") == "length",
+            )
+            if parsed is not None:
+                return parsed
 
-        logger.error("LLM JSON parse error — content preview: %.300s", content)
+            logger.warning(
+                "LLM JSON parse error on attempt %d/%d. content preview: %.300s",
+                attempt,
+                len(prompts),
+                content,
+            )
+
+        if last_result:
+            logger.error(
+                "LLM failed to produce parseable JSON after %d attempts. "
+                "finish_reason=%s, content preview: %.300s",
+                len(prompts),
+                last_result.get("finish_reason", "?"),
+                last_content,
+            )
         return {}
 
     @classmethod
@@ -497,6 +567,7 @@ class LLMClient:
         """
         import json as _json
 
+        parsed_objects: list[dict] = []
         for candidate in cls._json_candidates(content):
             try:
                 parsed = _json.loads(candidate)
@@ -507,9 +578,14 @@ class LLMClient:
                         return repaired
                 continue
             if isinstance(parsed, dict):
-                return parsed
+                parsed_objects.append(parsed)
+                continue
             logger.warning("LLM JSON response parsed to %s, expected object", type(parsed).__name__)
-            return {}
+        if parsed_objects:
+            # Visible reasoning can contain example/schema JSON and nested JSON
+            # objects before the final answer. The largest parsed object is the
+            # best deterministic approximation of the complete response.
+            return max(parsed_objects, key=lambda obj: len(_json.dumps(obj, sort_keys=True)))
 
         if allow_repair:
             cleaned = cls._strip_visible_reasoning(content)
@@ -552,17 +628,56 @@ class LLMClient:
         if not text:
             return text
 
-        text = re.sub(r"(?is)<think\b[^>]*>.*?</think>", "", text).strip()
-        text = re.sub(r"(?is)<thinking\b[^>]*>.*?</thinking>", "", text).strip()
+        for tag in (
+            "think",
+            "thinking",
+            "reasoning",
+            "analysis",
+            "scratchpad",
+            "thought",
+            "chain_of_thought",
+        ):
+            text = re.sub(rf"(?is)<{tag}\b[^>]*>.*?</{tag}>", "", text).strip()
+            text = re.sub(rf"(?is)\[{tag}\b[^\]]*\].*?\[/{tag}\]", "", text).strip()
 
         # If a server emits an unterminated thinking tag, salvage from the first
         # JSON opener after that tag.
-        if re.match(r"(?is)^\s*<think(?:ing)?\b", text):
-            starts = [idx for idx in (text.find("{"), text.find("[")) if idx >= 0]
+        if re.match(r"(?is)^\s*(<|\[)(think|thinking|reasoning|analysis|scratchpad|thought)", text):
+            starts = [idx for idx in (text.find("{"),) if idx >= 0]
+            array_match = re.search(
+                r"(?is)\[(?!(?:/?(?:think|thinking|reasoning|analysis|scratchpad|thought|chain_of_thought)\b))",
+                text,
+            )
+            if array_match:
+                starts.append(array_match.start())
             if starts:
                 text = text[min(starts):].strip()
 
         return text
+
+    @staticmethod
+    def _content_to_text(content) -> str:
+        """Normalise provider-specific message content shapes into text."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    value = item.get("text") or item.get("content") or item.get("value")
+                    if value is not None:
+                        parts.append(str(value))
+                elif item is not None:
+                    parts.append(str(item))
+            return "\n".join(part for part in parts if part)
+        if isinstance(content, dict):
+            value = content.get("text") or content.get("content") or content.get("value")
+            return str(value) if value is not None else ""
+        return str(content)
 
     @staticmethod
     def _balanced_json_from(text: str, start: int) -> str | None:
