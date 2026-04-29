@@ -153,11 +153,7 @@ async def test_connection(profile_id: uuid.UUID, db: AsyncSession = Depends(get_
 
 # OpenAI-compatible endpoints vary: some serve at /v1/models, some at /models,
 # some at /api/v1/models. We try all common paths in order.
-_MODEL_PATHS = [
-    "/v1/models",
-    "/models",
-    "/api/v1/models",
-    "/api/models",
+_MODEL_PATHS = LLMClient.model_path_candidates() + [
     "/",              # Some endpoints serve model list at root
 ]
 
@@ -180,15 +176,17 @@ async def _discover_models_from_endpoint(
 
     errors = []
 
+    normalized_base_url = LLMClient._normalise_base_url(base_url)
+
     async with httpx.AsyncClient(
-        base_url=base_url,
+        base_url=normalized_base_url,
         timeout=15,
         verify=ssl_context or True,
     ) as client:
         for path in _MODEL_PATHS:
             try:
                 resp = await client.get(path, headers=headers)
-                if resp.status_code == 404:
+                if resp.status_code in {404, 405}:
                     continue  # This path doesn't exist, try next
                 resp.raise_for_status()
                 data = resp.json()

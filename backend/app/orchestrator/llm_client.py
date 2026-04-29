@@ -37,6 +37,38 @@ Structured output contract:
 - If you need to reason, do it internally and output only the final JSON object.
 """
 
+CHAT_PATH_CANDIDATES = [
+    "/v1/chat/completions",
+    "/chat/completions",
+    "/api/v1/chat/completions",
+    "/api/chat/completions",
+    "/openai/v1/chat/completions",
+]
+
+MODEL_PATH_CANDIDATES = [
+    "/v1/models",
+    "/models",
+    "/api/v1/models",
+    "/api/models",
+    "/openai/v1/models",
+]
+
+OPENAI_URL_SUFFIXES_TO_STRIP = [
+    "/v1/chat/completions",
+    "/chat/completions",
+    "/api/v1/chat/completions",
+    "/api/chat/completions",
+    "/openai/v1/chat/completions",
+    "/v1/models",
+    "/models",
+    "/api/v1/models",
+    "/api/models",
+    "/openai/v1/models",
+    "/v1/chat",
+    "/chat",
+    "/v1",
+]
+
 
 def estimate_tokens(text: str) -> int:
     """Estimate the number of tokens in a text string.
@@ -70,7 +102,7 @@ class LLMClient:
         use_max_completion_tokens: bool = False,
         concurrency: int = 2,
     ):
-        self.base_url, configured_chat_path = self._normalise_base_url(base_url)
+        self.base_url = self._normalise_base_url(base_url)
         self.model_name = model_name
         self.api_key = api_key
         self.timeout = timeout
@@ -91,8 +123,9 @@ class LLMClient:
         )
 
         # Chat completions path — auto-detected on first call
-        self._chat_path: str | None = configured_chat_path
+        self._chat_path: str | None = None
         self._response_format_supported: bool | None = None
+        self._token_param: str | None = None
 
         # Running token counters
         self.total_prompt_tokens = 0
@@ -105,22 +138,43 @@ class LLMClient:
         self._request_semaphore = asyncio.Semaphore(self.concurrency)
 
     @staticmethod
-    def _normalise_base_url(base_url: str) -> tuple[str, str | None]:
-        """Accept either a server base URL or a full chat completions URL."""
+    def _normalise_base_url(base_url: str) -> str:
+        """Accept a server URL, /v1 URL, models URL, or full chat completions URL."""
         clean = (base_url or "").strip().rstrip("/")
         if not clean:
-            return clean, None
+            return clean
 
         parsed = urlsplit(clean)
         path = parsed.path.rstrip("/")
-        lower_path = path.lower()
-        chat_suffix = "/chat/completions"
-        if lower_path.endswith(chat_suffix):
-            chat_path = path
-            root = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
-            return root.rstrip("/"), chat_path
+        while path:
+            lower_path = path.lower()
+            stripped = path
+            for suffix in OPENAI_URL_SUFFIXES_TO_STRIP:
+                if lower_path.endswith(suffix):
+                    stripped = path[: -len(suffix)].rstrip("/")
+                    break
+            if stripped == path:
+                break
+            path = stripped
 
-        return clean, None
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+
+    @staticmethod
+    def chat_path_candidates() -> list[str]:
+        return list(CHAT_PATH_CANDIDATES)
+
+    @staticmethod
+    def model_path_candidates() -> list[str]:
+        return list(MODEL_PATH_CANDIDATES)
+
+    def _token_param_candidates(self) -> list[str]:
+        """Return completion-token field candidates, preferred first."""
+        preferred = (
+            self._token_param
+            or ("max_completion_tokens" if self.use_max_completion_tokens else "max_tokens")
+        )
+        fallback = "max_tokens" if preferred == "max_completion_tokens" else "max_completion_tokens"
+        return [preferred, fallback] if fallback != preferred else [preferred]
 
     @property
     def max_input_tokens(self) -> int:
@@ -144,41 +198,47 @@ class LLMClient:
     async def _resolve_chat_path(self, headers: dict) -> str:
         """Auto-detect the chat completions path on first call, then cache it.
 
-        Tries /v1/chat/completions, /chat/completions, /api/v1/chat/completions,
-        and /api/chat/completions. Sends a minimal OPTIONS or HEAD to check which
-        path doesn't 404, falling back to /v1/chat/completions if all fail.
+        Tries common OpenAI-compatible paths and caches the first endpoint that
+        produces a real JSON response. Some reverse proxies return HTML or auth
+        errors on plausible paths, so we avoid caching those as successful probes.
         """
         if self._chat_path is not None:
             return self._chat_path
 
-        candidates = [
-            "/v1/chat/completions",
-            "/chat/completions",
-            "/api/v1/chat/completions",
-            "/api/chat/completions",
-        ]
-
         # Quick probe: send a minimal request to find which path works.
-        # We use a tiny chat request rather than OPTIONS since many LLM
-        # servers don't support OPTIONS/HEAD properly.
-        token_field = "max_completion_tokens" if self.use_max_completion_tokens else "max_tokens"
-        probe_body = {
-            "model": self.model_name,
-            "messages": [{"role": "user", "content": "hi"}],
-            token_field: 1,
-        }
-
-        for path in candidates:
+        # We use tiny chat requests rather than OPTIONS since many LLM servers
+        # don't support OPTIONS/HEAD properly.
+        for path in self.chat_path_candidates():
             try:
-                resp = await self._client.post(
-                    path, headers=headers, json=probe_body
-                )
-                if resp.status_code == 404:
-                    continue
-                # Any non-404 response means this path exists
-                self._chat_path = path
-                logger.info("Auto-detected chat path: %s", path)
-                return path
+                for token_field in self._token_param_candidates():
+                    probe_body = {
+                        "model": self.model_name,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        token_field: 1,
+                    }
+                    resp = await self._client.post(path, headers=headers, json=probe_body)
+                    if resp.status_code in {404, 405}:
+                        break
+                    if self._is_token_param_unsupported(resp, token_field):
+                        continue
+                    if resp.status_code == 200:
+                        try:
+                            resp.json()
+                        except ValueError:
+                            continue
+                        self._chat_path = path
+                        self._token_param = token_field
+                        logger.info("Auto-detected chat path: %s", path)
+                        return path
+                    if resp.status_code in {401, 403}:
+                        self._chat_path = path
+                        logger.info("Auto-detected authenticated chat path: %s", path)
+                        return path
+                    # Other non-path errors mean the endpoint exists, but the
+                    # request is invalid for model/provider reasons. Let the
+                    # real call surface the useful provider error.
+                    self._chat_path = path
+                    return path
             except Exception:
                 continue
 
@@ -238,7 +298,7 @@ class LLMClient:
             truncated = True
 
         # ── Build request body ────────────────────────────────────
-        headers = {}
+        headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
@@ -248,10 +308,17 @@ class LLMClient:
             "temperature": temperature,
         }
 
-        if self.use_max_completion_tokens:
-            body["max_completion_tokens"] = output_budget
-        else:
-            body["max_tokens"] = output_budget
+        token_params = self._token_param_candidates()
+        token_param_index = 0
+
+        def apply_token_param() -> str:
+            token_param = token_params[token_param_index]
+            body.pop("max_tokens", None)
+            body.pop("max_completion_tokens", None)
+            body[token_param] = output_budget
+            return token_param
+
+        current_token_param = apply_token_param()
 
         if json_mode and self._response_format_supported is not False:
             body["response_format"] = {"type": "json_object"}
@@ -321,6 +388,19 @@ class LLMClient:
                     body = dict(body)
                     body.pop("response_format", None)
                     continue
+                if (
+                    self._is_token_param_unsupported(resp, current_token_param)
+                    and token_param_index < len(token_params) - 1
+                ):
+                    logger.warning(
+                        "LLM endpoint rejected %s; retrying with %s.",
+                        current_token_param,
+                        token_params[token_param_index + 1],
+                    )
+                    token_param_index += 1
+                    current_token_param = apply_token_param()
+                    self._token_param = None
+                    continue
                 break
 
             duration_ms = int((time.monotonic() - start) * 1000)
@@ -332,6 +412,8 @@ class LLMClient:
                 resp.status_code, body_text, chat_path, self.model_name,
             )
             resp.raise_for_status()
+
+        self._token_param = current_token_param
 
         data = resp.json()
         if not data.get("choices"):
@@ -730,6 +812,25 @@ class LLMClient:
             "unrecognized",
             "not permitted",
             "forbidden",
+            "extra inputs are not permitted",
+            "invalid parameter",
+        )
+        return any(marker in text for marker in unsupported_markers)
+
+    @staticmethod
+    def _is_token_param_unsupported(resp: httpx.Response, token_param: str) -> bool:
+        if resp.status_code not in {400, 422}:
+            return False
+        text = resp.text.lower()
+        param = token_param.lower()
+        if param not in text:
+            return False
+        unsupported_markers = (
+            "unsupported",
+            "not support",
+            "unknown",
+            "unrecognized",
+            "not permitted",
             "extra inputs are not permitted",
             "invalid parameter",
         )

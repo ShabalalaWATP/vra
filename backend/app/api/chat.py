@@ -14,6 +14,7 @@ from app.database import get_db
 from app.models.llm_profile import LLMProfile
 from app.models.report import Report
 from app.models.scan import Scan
+from app.orchestrator.llm_client import LLMClient
 
 router = APIRouter(prefix="/scans/{scan_id}", tags=["chat"])
 
@@ -42,13 +43,13 @@ def _build_system_prompt(
         "and reference the code content provided. If they ask to 'search' for something, "
         "scan through the provided file contents.",
         "",
-        f"## Application Summary",
+        "## Application Summary",
         report.app_summary or "Not available.",
         "",
     ]
 
     if report.risk_score is not None:
-        parts.append(f"## Risk Assessment")
+        parts.append("## Risk Assessment")
         parts.append(f"Risk Score: {report.risk_score}/100 (Grade: {report.risk_grade or '?'})")
         parts.append("")
 
@@ -81,12 +82,12 @@ def _build_system_prompt(
 
     # File index — list of all source files so the AI knows what's available
     if file_index:
-        parts.append(f"\n## Source File Index")
+        parts.append("\n## Source File Index")
         parts.append(file_index)
 
     # Currently viewed file
     if file_context:
-        parts.append(f"\n## Currently Viewing File")
+        parts.append("\n## Currently Viewing File")
         parts.append(file_context[:8000])
 
     return "\n".join(parts)
@@ -377,7 +378,7 @@ async def stream_chat(
                     for advisory in f.related_cves[:3]:
                         advisory_id = advisory.get("display_id") or advisory.get("cve_id") or advisory.get("advisory_id") or "advisory"
                         advisory_strs.append(f"{advisory_id}: {advisory.get('summary', '')[:80]}")
-                    parts.append(f"\nRelated Advisories:\n" + "\n".join(advisory_strs))
+                    parts.append("\nRelated Advisories:\n" + "\n".join(advisory_strs))
                 if f.evidence:
                     sup = [e for e in f.evidence if e.type == "supporting"]
                     opp = [e for e in f.evidence if e.type == "opposing"]
@@ -439,28 +440,30 @@ async def stream_chat(
         messages.append({"role": msg.role, "content": msg.content})
 
     # Resolve chat path
-    chat_paths = [
-        "/v1/chat/completions",
-        "/chat/completions",
-        "/api/v1/chat/completions",
-        "/api/chat/completions",
-    ]
+    chat_paths = LLMClient.chat_path_candidates()
 
-    headers = {}
+    headers = {"Content-Type": "application/json"}
     if profile.api_key:
         headers["Authorization"] = f"Bearer {profile.api_key}"
 
-    token_field = "max_completion_tokens" if profile.use_max_completion_tokens else "max_tokens"
+    preferred_token_field = "max_completion_tokens" if profile.use_max_completion_tokens else "max_tokens"
+    fallback_token_field = (
+        "max_tokens"
+        if preferred_token_field == "max_completion_tokens"
+        else "max_completion_tokens"
+    )
+    token_fields = [preferred_token_field, fallback_token_field]
 
-    def _make_payload(msgs, stream=True):
+    def _make_payload(msgs, *, stream=True, token_field=preferred_token_field, include_tools=True):
         p = {
             "model": profile.model_name,
             "messages": msgs,
             "temperature": 0.3,
             token_field: min(profile.max_output_tokens, 4096),
             "stream": stream,
-            "tools": tools,
         }
+        if include_tools:
+            p["tools"] = tools
         return p
 
     ssl_context = None
@@ -470,7 +473,7 @@ async def stream_chat(
 
     async def generate():
         async with httpx.AsyncClient(
-            base_url=profile.base_url,
+            base_url=LLMClient._normalise_base_url(profile.base_url),
             timeout=profile.timeout_seconds,
             verify=ssl_context or True,
         ) as client:
@@ -486,60 +489,75 @@ async def stream_chat(
                     tool_calls = None
                     for path in chat_paths:
                         try:
-                            resp = await client.post(
-                                path, headers=headers,
-                                json=_make_payload(current_messages, stream=False),
-                            )
-                            if resp.status_code == 404:
-                                continue
-                            request_succeeded = True
-                            if resp.status_code != 200:
-                                last_error = f"LLM error {resp.status_code}: {resp.text[:200]}"
+                            for token_field in token_fields:
+                                resp = await client.post(
+                                    path, headers=headers,
+                                    json=_make_payload(
+                                        current_messages,
+                                        stream=False,
+                                        token_field=token_field,
+                                    ),
+                                )
+                                if resp.status_code in {404, 405}:
+                                    break
+                                request_succeeded = True
+                                if LLMClient._is_token_param_unsupported(resp, token_field):
+                                    last_error = (
+                                        f"LLM rejected {token_field}: {resp.text[:200]}"
+                                    )
+                                    continue
+                                if resp.status_code != 200:
+                                    last_error = f"LLM error {resp.status_code}: {resp.text[:200]}"
+                                    break
+
+                                last_error = None
+                                data = resp.json()
+                                choice = data.get("choices", [{}])[0]
+                                msg = choice.get("message", {})
+                                tool_calls = msg.get("tool_calls")
+
+                                if tool_calls:
+                                    # Execute tool calls and add results to messages
+                                    current_messages.append(msg)  # Add assistant's tool call message
+                                    yield f"data: {json.dumps({'content': '*Searching codebase...*\\n\\n', 'done': False})}\n\n"
+
+                                    for tc in tool_calls:
+                                        func_name = tc["function"]["name"]
+                                        try:
+                                            func_args = json.loads(tc["function"]["arguments"])
+                                        except Exception:
+                                            func_args = {}
+
+                                        executor = tool_executors.get(func_name)
+                                        if executor:
+                                            result = executor(func_args)
+                                        else:
+                                            result = f"Unknown tool: {func_name}"
+
+                                        current_messages.append({
+                                            "role": "tool",
+                                            "tool_call_id": tc["id"],
+                                            "content": result[:6000],
+                                        })
+                                    # Continue loop — will call LLM again with tool results
+                                    break
+                                else:
+                                    # No tool calls — model wants to respond directly
+                                    # Stream this response
+                                    content = LLMClient._content_to_text(msg.get("content"))
+                                    if content:
+                                        # Send in chunks for smooth streaming feel
+                                        chunk_size = 20
+                                        for i in range(0, len(content), chunk_size):
+                                            yield f"data: {json.dumps({'content': content[i:i+chunk_size], 'done': False})}\n\n"
+                                    yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
+                                    return
+                                if tool_calls:
+                                    break
+                            if last_error is not None or tool_calls:
                                 break
-
-                            data = resp.json()
-                            choice = data.get("choices", [{}])[0]
-                            msg = choice.get("message", {})
-                            tool_calls = msg.get("tool_calls")
-
-                            if tool_calls:
-                                # Execute tool calls and add results to messages
-                                current_messages.append(msg)  # Add assistant's tool call message
-                                yield f"data: {json.dumps({'content': '*Searching codebase...*\\n\\n', 'done': False})}\n\n"
-
-                                for tc in tool_calls:
-                                    func_name = tc["function"]["name"]
-                                    try:
-                                        func_args = json.loads(tc["function"]["arguments"])
-                                    except Exception:
-                                        func_args = {}
-
-                                    executor = tool_executors.get(func_name)
-                                    if executor:
-                                        result = executor(func_args)
-                                    else:
-                                        result = f"Unknown tool: {func_name}"
-
-                                    current_messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": tc["id"],
-                                        "content": result[:6000],
-                                    })
-                                # Continue loop — will call LLM again with tool results
-                                break
-                            else:
-                                # No tool calls — model wants to respond directly
-                                # Stream this response
-                                content = msg.get("content", "")
-                                if content:
-                                    # Send in chunks for smooth streaming feel
-                                    chunk_size = 20
-                                    for i in range(0, len(content), chunk_size):
-                                        yield f"data: {json.dumps({'content': content[i:i+chunk_size], 'done': False})}\n\n"
-                                yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
-                                return
                         except httpx.HTTPStatusError as e:
-                            if e.response.status_code == 404:
+                            if e.response.status_code in {404, 405}:
                                 continue
                             last_error = str(e)
                             break
@@ -559,36 +577,49 @@ async def stream_chat(
                     # Max tool rounds reached — do final streaming call without tools
                     for path in chat_paths:
                         try:
-                            final_payload = _make_payload(current_messages, stream=True)
-                            del final_payload["tools"]  # No more tools
-                            async with client.stream(
-                                "POST", path, headers=headers, json=final_payload
-                            ) as resp:
-                                if resp.status_code == 404:
-                                    continue
-                                if resp.status_code != 200:
-                                    yield f"data: {json.dumps({'error': f'LLM error {resp.status_code}'})}\n\n"
-                                    return
-                                async for line in resp.aiter_lines():
-                                    if not line.startswith("data: "):
-                                        continue
-                                    data_str = line[6:].strip()
-                                    if data_str == "[DONE]":
-                                        yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
+                            for token_field in token_fields:
+                                final_payload = _make_payload(
+                                    current_messages,
+                                    stream=True,
+                                    token_field=token_field,
+                                    include_tools=False,
+                                )
+                                async with client.stream(
+                                    "POST", path, headers=headers, json=final_payload
+                                ) as resp:
+                                    if resp.status_code in {404, 405}:
+                                        break
+                                    if resp.status_code != 200:
+                                        await resp.aread()
+                                        if LLMClient._is_token_param_unsupported(resp, token_field):
+                                            continue
+                                        yield f"data: {json.dumps({'error': f'LLM error {resp.status_code}'})}\n\n"
                                         return
-                                    try:
-                                        chunk_data = json.loads(data_str)
-                                        delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                                        c = delta.get("content", "")
-                                        if c:
-                                            yield f"data: {json.dumps({'content': c, 'done': False})}\n\n"
-                                    except json.JSONDecodeError:
-                                        continue
-                                yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
-                                return
+                                    async for line in resp.aiter_lines():
+                                        if not line.startswith("data: "):
+                                            continue
+                                        data_str = line[6:].strip()
+                                        if data_str == "[DONE]":
+                                            yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
+                                            return
+                                        try:
+                                            chunk_data = json.loads(data_str)
+                                            delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                                            c = LLMClient._content_to_text(delta.get("content"))
+                                            if c:
+                                                yield f"data: {json.dumps({'content': c, 'done': False})}\n\n"
+                                        except json.JSONDecodeError:
+                                            continue
+                                    yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
+                                    return
+                            else:
+                                continue
+                            continue
                         except Exception as e:
                             yield f"data: {json.dumps({'error': str(e)})}\n\n"
                             return
+                    yield f"data: {json.dumps({'error': 'No chat endpoint found'})}\n\n"
+                    return
 
     return StreamingResponse(
         generate(),

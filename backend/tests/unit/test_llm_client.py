@@ -128,6 +128,56 @@ def test_chat_json_retries_without_response_format_when_unsupported(monkeypatch)
     asyncio.run(client.close())
 
 
+def test_chat_retries_with_alternate_token_parameter(monkeypatch):
+    client = LLMClient(
+        base_url="http://localhost:1234",
+        model_name="test-model",
+        context_window=4096,
+        max_output_tokens=256,
+        use_max_completion_tokens=False,
+    )
+    bodies = []
+
+    async def fake_resolve_chat_path(_headers):
+        return "/v1/chat/completions"
+
+    async def fake_post(path, *, headers=None, json=None):
+        bodies.append(dict(json or {}))
+        request = httpx.Request("POST", f"http://localhost:1234{path}")
+        if len(bodies) == 1:
+            return httpx.Response(
+                400,
+                request=request,
+                json={"error": {"message": "max_tokens is not supported by this endpoint"}},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+                "model": "test-model",
+            },
+        )
+
+    monkeypatch.setattr(client, "_resolve_chat_path", fake_resolve_chat_path)
+    monkeypatch.setattr(client._client, "post", fake_post)
+
+    result = asyncio.run(client.chat([{"role": "user", "content": "hello"}], max_tokens=64))
+
+    assert result["content"] == "ok"
+    assert "max_tokens" in bodies[0]
+    assert "max_completion_tokens" in bodies[1]
+    assert client._token_param == "max_completion_tokens"
+
+    asyncio.run(client.close())
+
+
 def test_chat_json_retries_after_malformed_structured_output(monkeypatch):
     client = LLMClient(
         base_url="http://localhost:1234",
@@ -228,16 +278,42 @@ def test_chat_normalises_provider_content_parts(monkeypatch):
     asyncio.run(client.close())
 
 
-def test_full_chat_completions_url_is_accepted_as_base_url():
+def test_full_chat_completions_url_is_normalised_to_provider_root():
     client = LLMClient(
         base_url="https://example.internal/api/v1/chat/completions/",
         model_name="test-model",
     )
 
-    assert client.base_url == "https://example.internal"
-    assert client._chat_path == "/api/v1/chat/completions"
+    assert client.base_url == "https://example.internal/api"
+    assert client._chat_path is None
 
     asyncio.run(client.close())
+
+
+def test_v1_base_url_is_normalised_to_provider_root():
+    client = LLMClient(
+        base_url="https://example.internal/v1/",
+        model_name="test-model",
+    )
+
+    assert client.base_url == "https://example.internal"
+
+    asyncio.run(client.close())
+
+
+def test_subpath_v1_base_url_preserves_gateway_prefix():
+    client = LLMClient(
+        base_url="https://example.internal/api/v1/",
+        model_name="test-model",
+    )
+
+    assert client.base_url == "https://example.internal/api"
+
+    asyncio.run(client.close())
+
+
+def test_chat_path_candidates_include_openai_prefixed_gateways():
+    assert "/openai/v1/chat/completions" in LLMClient.chat_path_candidates()
 
 
 def test_parse_json_response_ignores_visible_thinking_tokens():
