@@ -454,7 +454,14 @@ async def stream_chat(
     )
     token_fields = [preferred_token_field, fallback_token_field]
 
-    def _make_payload(msgs, *, stream=True, token_field=preferred_token_field, include_tools=True):
+    def _make_payload(
+        msgs,
+        *,
+        stream=True,
+        token_field=preferred_token_field,
+        include_tools=True,
+        tools_supported=True,
+    ):
         p = {
             "model": profile.model_name,
             "messages": msgs,
@@ -462,9 +469,41 @@ async def stream_chat(
             token_field: min(profile.max_output_tokens, 4096),
             "stream": stream,
         }
-        if include_tools:
+        if include_tools and tools_supported:
             p["tools"] = tools
+            p["tool_choice"] = "auto"
         return p
+
+    def _messages_without_native_tool_protocol(msgs: list[dict]) -> list[dict]:
+        """Convert OpenAI tool protocol messages into ordinary chat context."""
+        clean: list[dict] = []
+        tool_results: list[str] = []
+
+        for msg in msgs:
+            role = msg.get("role", "")
+            content = LLMClient._content_to_text(msg.get("content")).strip()
+            if role == "tool":
+                tool_id = msg.get("tool_call_id") or "tool"
+                if content:
+                    tool_results.append(f"[{tool_id}]\n{content}")
+                continue
+            if msg.get("tool_calls"):
+                if content:
+                    clean.append({"role": "assistant", "content": content})
+                continue
+            if role in {"system", "user", "assistant"} and content:
+                clean.append({"role": role, "content": content})
+
+        if tool_results:
+            clean.append({
+                "role": "user",
+                "content": (
+                    "Local code-inspection tool results are available below. "
+                    "Use them as context when answering; do not call tools.\n\n"
+                    + "\n\n---\n\n".join(tool_results)
+                ),
+            })
+        return clean
 
     ssl_context = None
     if profile.cert_path:
@@ -479,6 +518,7 @@ async def stream_chat(
         ) as client:
             current_messages = list(messages)
             max_tool_rounds = 3  # Prevent infinite tool call loops
+            tools_supported = True
 
             for tool_round in range(max_tool_rounds + 1):
                 # First, try a non-streaming call to check for tool calls
@@ -496,11 +536,19 @@ async def stream_chat(
                                         current_messages,
                                         stream=False,
                                         token_field=token_field,
+                                        tools_supported=tools_supported,
                                     ),
                                 )
                                 if resp.status_code in {404, 405}:
                                     break
                                 request_succeeded = True
+                                if tools_supported and LLMClient._is_tools_unsupported(resp):
+                                    tools_supported = False
+                                    current_messages = _messages_without_native_tool_protocol(
+                                        current_messages
+                                    )
+                                    last_error = None
+                                    continue
                                 if LLMClient._is_token_param_unsupported(resp, token_field):
                                     last_error = (
                                         f"LLM rejected {token_field}: {resp.text[:200]}"
@@ -583,6 +631,7 @@ async def stream_chat(
                                     stream=True,
                                     token_field=token_field,
                                     include_tools=False,
+                                    tools_supported=tools_supported,
                                 )
                                 async with client.stream(
                                     "POST", path, headers=headers, json=final_payload
@@ -591,6 +640,12 @@ async def stream_chat(
                                         break
                                     if resp.status_code != 200:
                                         await resp.aread()
+                                        if LLMClient._is_tools_unsupported(resp):
+                                            tools_supported = False
+                                            current_messages = _messages_without_native_tool_protocol(
+                                                current_messages
+                                            )
+                                            continue
                                         if LLMClient._is_token_param_unsupported(resp, token_field):
                                             continue
                                         yield f"data: {json.dumps({'error': f'LLM error {resp.status_code}'})}\n\n"

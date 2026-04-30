@@ -126,6 +126,7 @@ class LLMClient:
         self._chat_path: str | None = None
         self._response_format_supported: bool | None = None
         self._token_param: str | None = None
+        self._tools_supported: bool | None = None
 
         # Running token counters
         self.total_prompt_tokens = 0
@@ -322,8 +323,11 @@ class LLMClient:
 
         if json_mode and self._response_format_supported is not False:
             body["response_format"] = {"type": "json_object"}
-        if tools:
+        tools_requested = bool(tools)
+        tools_enabled = tools_requested and self._tools_supported is not False
+        if tools_enabled:
             body["tools"] = tools
+            body["tool_choice"] = "auto"
 
         # ── Proactive pacing to avoid rate limits ──────────────────────
         import asyncio as _aio
@@ -387,6 +391,17 @@ class LLMClient:
                     self._response_format_supported = False
                     body = dict(body)
                     body.pop("response_format", None)
+                    continue
+                if tools_enabled and self._is_tools_unsupported(resp):
+                    logger.warning(
+                        "LLM endpoint does not support OpenAI tool calling; "
+                        "retrying without native tools."
+                    )
+                    self._tools_supported = False
+                    tools_enabled = False
+                    body = dict(body)
+                    body.pop("tools", None)
+                    body.pop("tool_choice", None)
                     continue
                 if (
                     self._is_token_param_unsupported(resp, current_token_param)
@@ -468,6 +483,9 @@ class LLMClient:
             "model": data.get("model", self.model_name),
             "truncated": truncated,
             "finish_reason": finish_reason,
+            "tools_requested": tools_requested,
+            "tools_enabled": tools_enabled,
+            "tooling_degraded": tools_requested and not tools_enabled,
         }
 
     async def chat_with_tools(
@@ -833,6 +851,40 @@ class LLMClient:
             "not permitted",
             "extra inputs are not permitted",
             "invalid parameter",
+        )
+        return any(marker in text for marker in unsupported_markers)
+
+    @staticmethod
+    def _is_tools_unsupported(resp: httpx.Response) -> bool:
+        if resp.status_code not in {400, 404, 405, 422, 501}:
+            return False
+        text = resp.text.lower()
+        tool_markers = (
+            "tools",
+            "tool_choice",
+            "tool call",
+            "tool_calls",
+            "role: tool",
+            '"tool"',
+            "'tool'",
+            "function calling",
+            "function_call",
+            "functions",
+        )
+        if not any(marker in text for marker in tool_markers):
+            return False
+        unsupported_markers = (
+            "unsupported",
+            "not support",
+            "unknown",
+            "unrecognized",
+            "not permitted",
+            "forbidden",
+            "extra inputs are not permitted",
+            "invalid parameter",
+            "invalid role",
+            "expected",
+            "failed to deserialize",
         )
         return any(marker in text for marker in unsupported_markers)
 

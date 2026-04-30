@@ -178,6 +178,70 @@ def test_chat_retries_with_alternate_token_parameter(monkeypatch):
     asyncio.run(client.close())
 
 
+def test_chat_retries_without_tools_when_unsupported(monkeypatch):
+    client = LLMClient(
+        base_url="http://localhost:1234",
+        model_name="test-model",
+        context_window=4096,
+        max_output_tokens=256,
+    )
+    bodies = []
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    async def fake_resolve_chat_path(_headers):
+        return "/v1/chat/completions"
+
+    async def fake_post(path, *, headers=None, json=None):
+        bodies.append(dict(json or {}))
+        request = httpx.Request("POST", f"http://localhost:1234{path}")
+        if len(bodies) == 1:
+            return httpx.Response(
+                400,
+                request=request,
+                json={"error": {"message": "tools is not supported by this model"}},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": "plain answer"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+                "model": "test-model",
+            },
+        )
+
+    monkeypatch.setattr(client, "_resolve_chat_path", fake_resolve_chat_path)
+    monkeypatch.setattr(client._client, "post", fake_post)
+
+    result = asyncio.run(
+        client.chat([{"role": "user", "content": "hello"}], max_tokens=64, tools=tools)
+    )
+
+    assert result["content"] == "plain answer"
+    assert result["tooling_degraded"] is True
+    assert client._tools_supported is False
+    assert "tools" in bodies[0]
+    assert bodies[0]["tool_choice"] == "auto"
+    assert "tools" not in bodies[1]
+    assert "tool_choice" not in bodies[1]
+
+    asyncio.run(client.close())
+
+
 def test_chat_json_retries_after_malformed_structured_output(monkeypatch):
     client = LLMClient(
         base_url="http://localhost:1234",
@@ -314,6 +378,20 @@ def test_subpath_v1_base_url_preserves_gateway_prefix():
 
 def test_chat_path_candidates_include_openai_prefixed_gateways():
     assert "/openai/v1/chat/completions" in LLMClient.chat_path_candidates()
+
+
+def test_tools_unsupported_detector_accepts_role_tool_errors():
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "http://localhost/v1/chat/completions"),
+        json={
+            "error": {
+                "message": "Invalid role 'tool': expected system, user, or assistant"
+            }
+        },
+    )
+
+    assert LLMClient._is_tools_unsupported(response) is True
 
 
 def test_parse_json_response_ignores_visible_thinking_tokens():
