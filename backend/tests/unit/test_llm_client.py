@@ -235,9 +235,187 @@ def test_chat_retries_without_tools_when_unsupported(monkeypatch):
     assert result["tooling_degraded"] is True
     assert client._tools_supported is False
     assert "tools" in bodies[0]
-    assert bodies[0]["tool_choice"] == "auto"
     assert "tools" not in bodies[1]
-    assert "tool_choice" not in bodies[1]
+
+    asyncio.run(client.close())
+
+
+def test_chat_with_tools_repairs_tool_name_case_and_dict_arguments(monkeypatch):
+    client = LLMClient(
+        base_url="http://localhost:1234",
+        model_name="test-model",
+        context_window=4096,
+        max_output_tokens=256,
+    )
+    bodies = []
+    executed = []
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    async def fake_resolve_chat_path(_headers):
+        return "/v1/chat/completions"
+
+    async def fake_post(path, *, headers=None, json=None):
+        bodies.append(dict(json or {}))
+        request = httpx.Request("POST", f"http://localhost:1234{path}")
+        if len(bodies) == 1:
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "Read_File",
+                                            "arguments": {"file_path": "app.py"},
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+                    "model": "test-model",
+                },
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": '{"ok": true}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+                "model": "test-model",
+            },
+        )
+
+    async def fake_tool_executor(name, args):
+        executed.append((name, args))
+        return {"content": "file contents"}
+
+    monkeypatch.setattr(client, "_resolve_chat_path", fake_resolve_chat_path)
+    monkeypatch.setattr(client._client, "post", fake_post)
+
+    result = asyncio.run(
+        client.chat_with_tools(
+            [{"role": "user", "content": "read app.py"}],
+            tools=tools,
+            tool_executor=fake_tool_executor,
+            max_tokens=64,
+        )
+    )
+
+    assert result["content"] == '{"ok": true}'
+    assert executed == [("read_file", {"file_path": "app.py"})]
+    assert bodies[1]["messages"][1]["tool_calls"][0]["function"]["name"] == "read_file"
+
+    asyncio.run(client.close())
+
+
+def test_final_tool_history_request_includes_noop_compat_tool(monkeypatch):
+    client = LLMClient(
+        base_url="http://localhost:1234",
+        model_name="test-model",
+        context_window=4096,
+        max_output_tokens=256,
+    )
+    bodies = []
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    async def fake_resolve_chat_path(_headers):
+        return "/v1/chat/completions"
+
+    async def fake_post(path, *, headers=None, json=None):
+        bodies.append(dict(json or {}))
+        request = httpx.Request("POST", f"http://localhost:1234{path}")
+        if len(bodies) == 1:
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+                    "model": "test-model",
+                },
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": "final"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+                "model": "test-model",
+            },
+        )
+
+    async def fake_tool_executor(_name, _args):
+        return "tool result"
+
+    monkeypatch.setattr(client, "_resolve_chat_path", fake_resolve_chat_path)
+    monkeypatch.setattr(client._client, "post", fake_post)
+
+    result = asyncio.run(
+        client.chat_with_tools(
+            [{"role": "user", "content": "read"}],
+            tools=tools,
+            tool_executor=fake_tool_executor,
+            max_tokens=64,
+            max_tool_rounds=0,
+        )
+    )
+
+    assert result["content"] == "final"
+    assert bodies[1]["tools"][0]["function"]["name"] == "_noop"
 
     asyncio.run(client.close())
 

@@ -471,7 +471,12 @@ async def stream_chat(
         }
         if include_tools and tools_supported:
             p["tools"] = tools
-            p["tool_choice"] = "auto"
+        elif (
+            not include_tools
+            and tools_supported
+            and LLMClient._messages_have_tool_history(msgs)
+        ):
+            p["tools"] = [LLMClient._noop_tool()]
         return p
 
     def _messages_without_native_tool_protocol(msgs: list[dict]) -> list[dict]:
@@ -565,18 +570,42 @@ async def stream_chat(
                                 tool_calls = msg.get("tool_calls")
 
                                 if tool_calls:
+                                    normalised_tool_calls = []
+                                    for tc in tool_calls:
+                                        repaired_tc = dict(tc)
+                                        repaired_function = dict(repaired_tc.get("function") or {})
+                                        tool_name = str(repaired_function.get("name", ""))
+                                        if (
+                                            tool_name not in tool_executors
+                                            and tool_name.lower() in tool_executors
+                                        ):
+                                            repaired_function["name"] = tool_name.lower()
+                                        repaired_tc["function"] = repaired_function
+                                        normalised_tool_calls.append(repaired_tc)
+                                    tool_calls = normalised_tool_calls
+                                    msg = dict(msg)
+                                    msg["tool_calls"] = tool_calls
                                     # Execute tool calls and add results to messages
                                     current_messages.append(msg)  # Add assistant's tool call message
                                     yield f"data: {json.dumps({'content': '*Searching codebase...*\\n\\n', 'done': False})}\n\n"
 
                                     for tc in tool_calls:
                                         func_name = tc["function"]["name"]
+                                        raw_arguments = tc["function"].get("arguments") or {}
                                         try:
-                                            func_args = json.loads(tc["function"]["arguments"])
+                                            if isinstance(raw_arguments, dict):
+                                                func_args = raw_arguments
+                                            else:
+                                                func_args = json.loads(str(raw_arguments) or "{}")
                                         except Exception:
                                             func_args = {}
 
                                         executor = tool_executors.get(func_name)
+                                        if not executor:
+                                            lower_executor = tool_executors.get(func_name.lower())
+                                            if lower_executor:
+                                                func_name = func_name.lower()
+                                                executor = lower_executor
                                         if executor:
                                             result = executor(func_args)
                                         else:

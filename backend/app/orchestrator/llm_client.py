@@ -37,6 +37,24 @@ Structured output contract:
 - If you need to reason, do it internally and output only the final JSON object.
 """
 
+NOOP_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "_noop",
+        "description": (
+            "Do not call this tool. It exists only for API compatibility when "
+            "previous messages contain tool results."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Unused."},
+            },
+            "additionalProperties": False,
+        },
+    },
+}
+
 CHAT_PATH_CANDIDATES = [
     "/v1/chat/completions",
     "/chat/completions",
@@ -176,6 +194,20 @@ class LLMClient:
         )
         fallback = "max_tokens" if preferred == "max_completion_tokens" else "max_completion_tokens"
         return [preferred, fallback] if fallback != preferred else [preferred]
+
+    @staticmethod
+    def _noop_tool() -> dict:
+        return {
+            "type": NOOP_TOOL["type"],
+            "function": dict(NOOP_TOOL["function"]),
+        }
+
+    @staticmethod
+    def _messages_have_tool_history(messages: list[dict]) -> bool:
+        return any(
+            message.get("role") == "tool" or bool(message.get("tool_calls"))
+            for message in messages
+        )
 
     @property
     def max_input_tokens(self) -> int:
@@ -325,9 +357,15 @@ class LLMClient:
             body["response_format"] = {"type": "json_object"}
         tools_requested = bool(tools)
         tools_enabled = tools_requested and self._tools_supported is not False
+        tools_sent = False
+        tool_compat_noop = False
         if tools_enabled:
             body["tools"] = tools
-            body["tool_choice"] = "auto"
+            tools_sent = True
+        elif self._tools_supported is not False and self._messages_have_tool_history(messages):
+            body["tools"] = [self._noop_tool()]
+            tools_sent = True
+            tool_compat_noop = True
 
         # ── Proactive pacing to avoid rate limits ──────────────────────
         import asyncio as _aio
@@ -392,16 +430,17 @@ class LLMClient:
                     body = dict(body)
                     body.pop("response_format", None)
                     continue
-                if tools_enabled and self._is_tools_unsupported(resp):
+                if tools_sent and self._is_tools_unsupported(resp):
                     logger.warning(
                         "LLM endpoint does not support OpenAI tool calling; "
                         "retrying without native tools."
                     )
                     self._tools_supported = False
                     tools_enabled = False
+                    tools_sent = False
+                    tool_compat_noop = False
                     body = dict(body)
                     body.pop("tools", None)
-                    body.pop("tool_choice", None)
                     continue
                 if (
                     self._is_token_param_unsupported(resp, current_token_param)
@@ -485,6 +524,7 @@ class LLMClient:
             "finish_reason": finish_reason,
             "tools_requested": tools_requested,
             "tools_enabled": tools_enabled,
+            "tool_compat_noop": tool_compat_noop,
             "tooling_degraded": tools_requested and not tools_enabled,
         }
 
@@ -504,6 +544,12 @@ class LLMClient:
         current_messages = list(messages)
         total_tokens = 0
         requests_made = 0
+        canonical_tool_names = {
+            tool.get("function", {}).get("name", ""): tool.get("function", {}).get("name", "")
+            for tool in tools
+        }
+        canonical_tool_names = {name: name for name in canonical_tool_names if name}
+        tool_names_by_lower = {name.lower(): name for name in canonical_tool_names}
 
         for _ in range(max_tool_rounds + 1):
             result = await self.chat(
@@ -521,30 +567,59 @@ class LLMClient:
                 result["requests_made"] = requests_made
                 return result
 
-            assistant_message = {
-                "role": "assistant",
-                "content": result.get("content", ""),
-                "tool_calls": tool_calls,
-            }
-            current_messages.append(assistant_message)
+            normalised_tool_calls = []
 
             for tool_call in tool_calls:
                 func = tool_call.get("function", {})
+                raw_func_name = func.get("name", "")
+                func_name = (
+                    canonical_tool_names.get(raw_func_name)
+                    or tool_names_by_lower.get(str(raw_func_name).lower())
+                    or raw_func_name
+                )
+                repaired_tool_call = dict(tool_call)
+                repaired_func = dict(func)
+                repaired_func["name"] = func_name
+                repaired_tool_call["function"] = repaired_func
+                normalised_tool_calls.append(repaired_tool_call)
+
+            assistant_message = {
+                "role": "assistant",
+                "content": result.get("content", ""),
+                "tool_calls": normalised_tool_calls,
+            }
+            current_messages.append(assistant_message)
+
+            for tool_call in normalised_tool_calls:
+                func = tool_call.get("function", {})
                 func_name = func.get("name", "")
+                raw_arguments = func.get("arguments") or {}
                 try:
-                    func_args = json.loads(func.get("arguments") or "{}")
-                except json.JSONDecodeError:
+                    if isinstance(raw_arguments, dict):
+                        func_args = raw_arguments
+                    else:
+                        func_args = json.loads(str(raw_arguments) or "{}")
+                except (TypeError, json.JSONDecodeError):
                     func_args = {}
 
-                tool_result = await tool_executor(func_name, func_args)
-                if hasattr(tool_result, "success"):
-                    payload = {
-                        "success": tool_result.success,
-                        "data": tool_result.data,
-                        "error": tool_result.error,
-                    }
+                if func_name in canonical_tool_names:
+                    tool_result = await tool_executor(func_name, func_args)
+                    if hasattr(tool_result, "success"):
+                        payload = {
+                            "success": tool_result.success,
+                            "data": tool_result.data,
+                            "error": tool_result.error,
+                        }
+                    else:
+                        payload = tool_result
                 else:
-                    payload = tool_result
+                    payload = {
+                        "success": False,
+                        "error": (
+                            f"Unknown tool: {func_name}. "
+                            f"Available tools: {', '.join(sorted(canonical_tool_names))}"
+                        ),
+                    }
 
                 current_messages.append(
                     {
